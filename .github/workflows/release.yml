@@ -1,0 +1,160 @@
+name: Release
+
+# Publishing is driven purely by tags.  A normal push or pull request never
+# creates a Release - it only runs CI.
+#
+#   git tag v1.03 && git push origin v1.03
+#
+# runs: version gate -> tests -> Windows build -> package -> publish.
+# Every stage is a hard dependency of the next one, so a failing test, a
+# failing build, a failing secret scan or a version mismatch stops the
+# Release from ever being created.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Version gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.derive.outputs.version }}
+      tag: ${{ steps.derive.outputs.tag }}
+      prerelease: ${{ steps.derive.outputs.prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Derive the version from the tag
+        id: derive
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          core="${tag#v}"
+          core="${core%%-*}"
+          if [[ ! "$core" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+            echo "::error::Tag '$tag' 不是合法的 vX.Y 形式版本号"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$core" >> "$GITHUB_OUTPUT"
+          if [[ "$tag" == "v$core" ]]; then
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          else
+            # e.g. v1.03-rc1 -> a pre-release, so it can never be mistaken for
+            # the finished build.
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Tag $tag -> version $core"
+
+      # The tag is the request; the sources are the truth.  If they disagree
+      # the Release is abandoned instead of shipping a mislabelled binary.
+      - name: Check every declared version matches the tag
+        run: python packaging/sync_version.py --check "${{ steps.derive.outputs.version }}"
+
+      - name: Secret scan (repository)
+        run: python packaging/ci_guard.py
+
+  build:
+    name: Build
+    needs: preflight
+    uses: ./.github/workflows/build.yml
+
+  publish:
+    name: Publish GitHub Release
+    needs: [preflight, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Download artefacts
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-release
+          path: release-assets
+
+      - name: Verify artefacts and checksums
+        env:
+          SETUP_NAME: ${{ needs.build.outputs.setup_name }}
+          PORTABLE_NAME: ${{ needs.build.outputs.portable_name }}
+        run: |
+          set -euo pipefail
+          ls -l release-assets
+          for name in "$SETUP_NAME" "$PORTABLE_NAME" SHA256SUMS.txt; do
+            if [ ! -s "release-assets/$name" ]; then
+              echo "::error::缺少产物 $name，放弃发布"
+              exit 1
+            fi
+          done
+          ( cd release-assets && sha256sum -c SHA256SUMS.txt )
+
+      - name: Generate release notes
+        env:
+          TAG: ${{ needs.preflight.outputs.tag }}
+          SETUP_NAME: ${{ needs.build.outputs.setup_name }}
+          PORTABLE_NAME: ${{ needs.build.outputs.portable_name }}
+        run: |
+          set -euo pipefail
+          python packaging/make_release_notes.py \
+            --version "${TAG#v}" \
+            --output release-assets/RELEASE_NOTES.md \
+            --checksums release-assets/SHA256SUMS.txt \
+            --setup-name "$SETUP_NAME" \
+            --portable-name "$PORTABLE_NAME"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.preflight.outputs.tag }}
+          PRERELEASE: ${{ needs.preflight.outputs.prerelease }}
+          SETUP_NAME: ${{ needs.build.outputs.setup_name }}
+          PORTABLE_NAME: ${{ needs.build.outputs.portable_name }}
+        run: |
+          set -euo pipefail
+          title="Video Downloader $TAG"
+          assets=("release-assets/$SETUP_NAME" "release-assets/$PORTABLE_NAME")
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # Re-running a failed job must be idempotent, not an error.
+            echo "Release $TAG 已存在，更新标题、说明与资产"
+            gh release edit "$TAG" --title "$title" --notes-file release-assets/RELEASE_NOTES.md
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            flags=(--title "$title" --notes-file release-assets/RELEASE_NOTES.md)
+            if [ "$PRERELEASE" = "true" ]; then
+              flags+=(--prerelease)
+            fi
+            gh release create "$TAG" "${flags[@]}" "${assets[@]}"
+          fi
+
+          echo "Release 已发布："
+          gh release view "$TAG" --json url,isPrerelease,assets \
+            --jq '{url: .url, prerelease: .isPrerelease, assets: [.assets[].name]}'

@@ -1,0 +1,67 @@
+name: CI
+
+# Runs on every pull request and on every push to main.
+#
+# The release workflow calls this file too (``workflow_call``), so the tests
+# that gate a release are byte-for-byte the same ones that gate a merge.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows / Python 3.12
+    runs-on: windows-latest
+    timeout-minutes: 40
+    env:
+      # The suite drives PySide6, so Qt has to run headless on a CI machine.
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python 3.12
+        run: uv python install 3.12
+
+      # ``--locked`` installs exactly what uv.lock pins and fails if the lock
+      # has drifted away from pyproject.toml.
+      - name: Install locked dependencies
+        run: uv sync --dev --locked --python 3.12
+
+      - name: Secret scan (repository)
+        run: uv run --no-sync python packaging/ci_guard.py
+
+      - name: Ruff
+        run: uv run --no-sync ruff check .
+
+      - name: Mypy
+        run: uv run --no-sync mypy .
+
+      - name: Pytest
+        shell: pwsh
+        run: |
+          # A proxy exported by the host would be picked up by Settings() and
+          # would change what the proxy tests observe.  Make the environment
+          # explicit instead of inheriting whatever the runner happens to set.
+          foreach ($name in 'HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy') {
+            Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+          }
+          uv run --no-sync pytest -q -p no:cacheprovider

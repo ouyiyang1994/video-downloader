@@ -31,6 +31,7 @@
 - [项目目录结构](#项目目录结构)
 - [测试与质量](#测试与质量)
 - [Windows EXE 打包](#windows-exe-打包)
+- [自动发布](#自动发布)
 - [常见问题](#常见问题)
 - [License](#license)
 
@@ -417,7 +418,8 @@ video-downloader/
 │   ├── youtube/{urls,api,adapter}.py
 │   └── instagram/{urls,graph,adapter}.py
 ├── storage/metadata.py         # .info.json 侧车文件
-├── packaging/                  # Windows PyInstaller 打包脚本与 spec
+├── packaging/                  # Windows 打包脚本、spec、版本同步与敏感信息扫描
+├── .github/workflows/          # GitHub Actions：CI 测试 / Windows 构建 / 自动发布
 ├── tests/                      # pytest 用例
 ├── tools/ffmpeg/bin/           # 本地 ffmpeg（不入库）
 ├── downloads/                  # 输出与数据库（不入库）
@@ -460,6 +462,62 @@ uv run mypy .          # 类型检查
 ```
 
 > `packaging/build.ps1` 含中文，必须以 **UTF-8 with BOM** 保存，否则 Windows PowerShell 5.1 会按 ANSI 解码导致语法错误。
+
+---
+
+## 自动发布
+
+测试、构建与发布全部由 **GitHub Actions** 完成，本地无需安装 Inno Setup，也不需要手工打包。
+
+| 工作流 | 触发条件 | 作用 |
+| --- | --- | --- |
+| [`ci.yml`](.github/workflows/ci.yml) | Pull Request、push 到 `main` | Windows + Python 3.12，按 `uv.lock` 安装锁定依赖，执行 `pytest`、`ruff`、`mypy` 与敏感信息扫描 |
+| [`build.yml`](.github/workflows/build.yml) | 手动触发，或被 `release.yml` 调用 | 复用 `packaging/build.ps1` 做 PyInstaller 构建 → 复用 `packaging/build-installer.ps1` 生成 Inno Setup 安装包 → 生成 Portable ZIP → 生成 SHA-256 |
+| [`release.yml`](.github/workflows/release.yml) | 推送 `v*` Tag | 版本号一致性闸门 → 调用 `ci.yml` → 调用 `build.yml` → 创建 GitHub Release 并上传两个安装包 |
+
+发布一个新版本，只需三步：
+
+```bash
+# 1. 同步版本号（一次性改好 4 处：pyproject.toml / installer.iss / version_info.txt / uv.lock）
+python packaging/sync_version.py 1.03
+
+# 2. 提交并推送
+git add -A
+git commit -m "release: v1.03"
+git push origin main
+
+# 3. 打 Tag 并推送 —— 这一步自动触发测试、构建与发布
+git tag v1.03
+git push origin v1.03
+```
+
+推送 Tag 之后，Actions 会自动完成：
+
+**测试 → Windows 构建 → 安装包 → Portable → Release**
+
+1. 校验 Tag 版本号与 `pyproject.toml`、`packaging/installer.iss`、`packaging/version_info.txt`、`uv.lock` 完全一致；
+2. 运行完整测试、代码风格 / 类型检查与敏感信息扫描；
+3. 在 Windows Runner 上用 PyInstaller 构建，再用 Inno Setup 生成安装包，并生成 Portable ZIP；
+4. 计算 SHA-256，创建 Release **`Video Downloader v1.03`**，上传 `VideoDownloader-1.03-Setup.exe` 与 `VideoDownloader-1.03-portable-win64.zip`。
+
+**任一环节失败都不会发布。** 测试失败、构建失败、打包失败、敏感信息扫描失败、版本号不一致、安装包或 Portable 包缺失，都会直接中止发布。
+
+> 普通 `push` 或 Pull Request **不会**创建 Release，只会跑 CI 测试。
+
+### 普通用户：请从 Releases 下载
+
+普通用户**不需要下载源码**，也**不需要**安装 Python、uv、PyInstaller 或任何开发环境。请直接前往 GitHub Releases：
+
+**<https://github.com/ouyiyang1994/video-downloader/releases>**
+
+下载最新版本中的两个文件之一即可，二者都已内置 `ffmpeg` / `ffprobe`：
+
+| 文件 | 适用人群 | 说明 |
+| --- | --- | --- |
+| `VideoDownloader-<版本>-Setup.exe` | 普通用户 | 双击安装，自动创建开始菜单与桌面快捷方式 |
+| `VideoDownloader-<版本>-portable-win64.zip` | 免安装用户 | 解压到任意可写目录，双击 `VideoDownloader.exe` 运行 |
+
+> 直接下载源码（Code → Download ZIP）只会得到源代码，**无法直接运行**。
 
 ---
 

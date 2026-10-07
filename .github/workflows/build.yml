@@ -1,0 +1,245 @@
+name: Windows Build
+
+# Packages the Windows release.  This file is the single source of truth for
+# how a build is produced:
+#
+#   * ``workflow_dispatch`` - build on demand from the Actions tab.
+#   * ``workflow_call``     - called by release.yml when a ``v*`` tag is pushed.
+#
+# Everything is delegated to the scripts that already built 1.02
+# (``packaging/build.ps1`` and ``packaging/build-installer.ps1``); this file
+# only supplies the environment they expect and checks the result.
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    outputs:
+      version:
+        description: Version that was built (from pyproject.toml)
+        value: ${{ jobs.windows.outputs.version }}
+      setup_name:
+        description: File name of the installer inside the artifact
+        value: ${{ jobs.windows.outputs.setup_name }}
+      portable_name:
+        description: File name of the portable ZIP inside the artifact
+        value: ${{ jobs.windows.outputs.portable_name }}
+
+permissions:
+  contents: read
+
+env:
+  # A full ffmpeg build, pinned to an exact release so that two builds of the
+  # same tag produce the same binaries.  Bump these two values together to
+  # move to a newer build; the cache key follows the version automatically.
+  FFMPEG_ARCHIVE: ffmpeg-9.0.2-full_build.7z
+  FFMPEG_URL: https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.2-full_build.7z
+  FFMPEG_CACHE_VERSION: ffmpeg-9.0.2-full-v1
+
+jobs:
+  test:
+    name: Tests
+    uses: ./.github/workflows/ci.yml
+
+  windows:
+    name: Package (PyInstaller + Inno Setup)
+    needs: test
+    runs-on: windows-latest
+    timeout-minutes: 90
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      setup_name: ${{ steps.meta.outputs.setup_name }}
+      portable_name: ${{ steps.meta.outputs.portable_name }}
+    env:
+      # Filenames in the project are Chinese; pin the interpreter to UTF-8 so
+      # the runner never falls back to a legacy code page.
+      PYTHONUTF8: '1'
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # Full history so the release notes can be diffed against the
+          # previous tag.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python 3.12
+        run: uv python install 3.12
+
+      - name: Install locked dependencies
+        run: uv sync --dev --locked --python 3.12
+
+      - name: Resolve version and asset names
+        id: meta
+        run: |
+          $version = (uv run --no-sync python packaging/sync_version.py --print).Trim()
+          if (-not $version) { throw '无法从 pyproject.toml 读取版本号' }
+          "version=$version" | Add-Content -Path $env:GITHUB_OUTPUT
+          "VERSION=$version" | Add-Content -Path $env:GITHUB_ENV
+          "SETUP_NAME=VideoDownloader-$version-Setup.exe" | Add-Content -Path $env:GITHUB_ENV
+          "PORTABLE_NAME=VideoDownloader-$version-portable-win64.zip" | Add-Content -Path $env:GITHUB_ENV
+          Write-Host "版本: $version"
+
+      # ------------------------------------------------------------------
+      # ffmpeg.  build.ps1 copies tools\ffmpeg\bin into the bundle, so the
+      # binaries have to be in place *before* it runs.  They are ~330 MB, so
+      # they are cached between runs.
+      # ------------------------------------------------------------------
+      - name: Restore ffmpeg from cache
+        id: ffmpeg-cache
+        uses: actions/cache@v6
+        with:
+          path: tools/ffmpeg/bin
+          key: ${{ env.FFMPEG_CACHE_VERSION }}
+
+      - name: Fetch ffmpeg
+        if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "下载 $env:FFMPEG_URL"
+          $archive = Join-Path $env:RUNNER_TEMP $env:FFMPEG_ARCHIVE
+          Invoke-WebRequest -Uri $env:FFMPEG_URL -OutFile $archive -UseBasicParsing
+
+          $staging = Join-Path $env:RUNNER_TEMP 'ffmpeg-extract'
+          if (Test-Path $staging) { Remove-Item -LiteralPath $staging -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          7z x $archive "-o$staging" -y -bso0 -bsp0
+          if ($LASTEXITCODE -ne 0) { throw "解压 ffmpeg 失败（退出码 $LASTEXITCODE）" }
+
+          $found = Get-ChildItem -Path $staging -Recurse -Filter 'ffmpeg.exe' -File | Select-Object -First 1
+          if (-not $found) { throw 'ffmpeg 压缩包中找不到 ffmpeg.exe' }
+          $sourceDir = $found.Directory.FullName
+
+          $destination = 'tools/ffmpeg/bin'
+          New-Item -ItemType Directory -Force -Path $destination | Out-Null
+          foreach ($tool in 'ffmpeg.exe', 'ffprobe.exe') {
+            $source = Join-Path $sourceDir $tool
+            if (-not (Test-Path -LiteralPath $source)) { throw "ffmpeg 压缩包中缺少 $tool" }
+            Copy-Item -LiteralPath $source -Destination $destination -Force
+          }
+          Remove-Item -LiteralPath $archive -Force
+          Remove-Item -LiteralPath $staging -Recurse -Force
+
+      - name: Verify ffmpeg is present
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($tool in 'ffmpeg.exe', 'ffprobe.exe') {
+            $path = "tools/ffmpeg/bin/$tool"
+            if (-not (Test-Path -LiteralPath $path)) {
+              throw "缺少 $path —— Release 必须内置 ffmpeg，否则用户无法合并高清音视频"
+            }
+          }
+          & 'tools/ffmpeg/bin/ffmpeg.exe' -version | Select-Object -First 1
+
+      # ------------------------------------------------------------------
+      # Build.  Both scripts are the ones that produced 1.02; they already run
+      # the secret scan over dist\ and refuse to continue when it fails.
+      # ------------------------------------------------------------------
+      - name: Build with PyInstaller
+        run: ./packaging/build.ps1 -Console false -SkipTests
+
+      - name: Install Inno Setup
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $iscc)) {
+            choco install innosetup --no-progress -y
+          }
+          if (-not (Test-Path -LiteralPath $iscc)) { throw 'Inno Setup 安装失败' }
+          Write-Host "ISCC: $iscc"
+
+      - name: Build installer
+        run: ./packaging/build-installer.ps1
+
+      # ------------------------------------------------------------------
+      # Assemble dist\release\ - the exact set of files that becomes the
+      # GitHub Release assets.
+      # ------------------------------------------------------------------
+      - name: Assemble release assets
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $release = 'dist/release'
+          New-Item -ItemType Directory -Force -Path $release | Out-Null
+
+          $setup = Get-ChildItem -Path 'dist/installer' -Filter '*.exe' -File |
+            Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $setup) { throw '未找到 Inno Setup 生成的安装包' }
+          Copy-Item -LiteralPath $setup.FullName -Destination (Join-Path $release $env:SETUP_NAME) -Force
+          Write-Host ("安装包 -> {0} ({1} MB)" -f $env:SETUP_NAME, [math]::Round($setup.Length / 1MB, 1))
+
+          if (-not (Test-Path -LiteralPath 'dist/VideoDownloader/VideoDownloader.exe')) {
+            throw 'dist/VideoDownloader 不完整：缺少 VideoDownloader.exe'
+          }
+          # Compress-Archive on Windows PowerShell 5.1 writes backslash entry
+          # names, which is invalid ZIP; this script always writes "/".
+          uv run --no-sync python packaging/make_portable_zip.py `
+            --source dist/VideoDownloader `
+            --output (Join-Path $release $env:PORTABLE_NAME)
+
+      - name: Generate SHA-256 checksums
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $release = 'dist/release'
+          $lines = foreach ($name in @($env:SETUP_NAME, $env:PORTABLE_NAME)) {
+            $path = Join-Path $release $name
+            if (-not (Test-Path -LiteralPath $path)) { throw "缺少产物 $path" }
+            $hash = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+            Write-Host "$hash  $name"
+            "$hash  $name"
+          }
+          # utf8NoBOM keeps `sha256sum -c` working on the Linux publish job.
+          Set-Content -LiteralPath (Join-Path $release 'SHA256SUMS.txt') -Value $lines -Encoding utf8NoBOM
+
+      - name: Verify the portable archive
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zipPath = Join-Path 'dist/release' $env:PORTABLE_NAME
+          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $zipPath))
+          try {
+            $names = $zip.Entries | ForEach-Object { $_.FullName }
+            $forbidden = $names | Where-Object {
+              $_ -match '(^|/)(\.env|secrets|cookies\.txt)(/|$)' -or
+              $_ -match '_cookies\.txt$' -or
+              $_ -match '\.(db|db-wal|db-shm|log|part|sqlite|sqlite3)$'
+            }
+            if ($forbidden) {
+              $forbidden | ForEach-Object { Write-Host "禁止项: $_" }
+              throw 'Portable 包中包含 .env / secrets / cookies / 数据库 / 日志'
+            }
+            $required = @(
+              'VideoDownloader/VideoDownloader.exe',
+              'VideoDownloader/.env.example',
+              'VideoDownloader/tools/ffmpeg/bin/ffmpeg.exe',
+              'VideoDownloader/tools/ffmpeg/bin/ffprobe.exe'
+            )
+            foreach ($entry in $required) {
+              if ($names -notcontains $entry) { throw "Portable 包中缺少 $entry" }
+            }
+            Write-Host "Portable 包共 $($names.Count) 个条目，结构校验通过"
+          }
+          finally {
+            $zip.Dispose()
+          }
+
+      - name: Scan artefacts for secrets
+        run: |
+          $ErrorActionPreference = 'Stop'
+          uv run --no-sync python packaging/ci_guard.py
+          uv run --no-sync python packaging/scan_secrets.py --dist dist/VideoDownloader --project .
+          uv run --no-sync python packaging/scan_secrets.py --file (Join-Path 'dist/release' $env:SETUP_NAME) --project .
+
+      - name: Upload release artefacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-release
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 7
