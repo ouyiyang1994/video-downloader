@@ -24,6 +24,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import re
 import subprocess
 import sys
@@ -151,6 +152,22 @@ MAX_SCAN_BYTES = 10 * 1024 * 1024
 _NUL = b"\x00"
 
 
+def use_utf8_output() -> None:
+    """Make the Chinese diagnostics safe on a legacy Windows code page.
+
+    A runner (or a plain ``cmd.exe``) can hand Python a cp1252 stdout, where
+    printing any of the messages below raises UnicodeEncodeError and fails the
+    step for the wrong reason.
+    """
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        with contextlib.suppress(ValueError, OSError):
+            reconfigure(encoding="utf-8", errors="replace")
+
+
 def tracked_files(root: Path) -> list[str]:
     """Repository-relative paths known to git (empty list outside a repo)."""
 
@@ -216,6 +233,7 @@ def content_problems(relative: str, root: Path) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    use_utf8_output()
     parser = argparse.ArgumentParser(description="扫描仓库中是否混入敏感信息")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
     args = parser.parse_args(argv)

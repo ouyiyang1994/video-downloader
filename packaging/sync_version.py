@@ -31,6 +31,7 @@ never be allowed to produce a release.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import re
 import sys
 from pathlib import Path
@@ -63,6 +64,22 @@ _STRING_RE = re.compile(
 
 #: Keys reported by :func:`snapshot`, in a stable order.
 QUAD_KEY = "packaging/version_info.txt (quad)"
+
+
+def use_utf8_output() -> None:
+    """Make the Chinese diagnostics safe on a legacy Windows code page.
+
+    ``python packaging/sync_version.py`` is meant to be run from a plain
+    PowerShell window, where stdout is often cp1252 and printing any of the
+    messages below would raise UnicodeEncodeError.
+    """
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        with contextlib.suppress(ValueError, OSError):
+            reconfigure(encoding="utf-8", errors="replace")
 
 
 class VersionError(RuntimeError):
@@ -256,6 +273,7 @@ def apply(version: str) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    use_utf8_output()
     parser = argparse.ArgumentParser(description="同步 / 校验项目各处的版本号")
     parser.add_argument("version", nargs="?", help="目标版本号，例如 1.03")
     parser.add_argument("--check", action="store_true", help="只校验，不写入")

@@ -36,11 +36,25 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import contextlib
+import sys
 import zipfile
 from pathlib import Path
 
 #: Name of the single top-level folder inside the archive.
 ARCHIVE_ROOT = "VideoDownloader"
+
+
+def use_utf8_output() -> None:
+    """Make the Chinese diagnostics safe on a legacy Windows code page."""
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        with contextlib.suppress(ValueError, OSError):
+            reconfigure(encoding="utf-8", errors="replace")
+
 
 #: Exact file names that must never be packaged.
 FORBIDDEN_NAMES: frozenset[str] = frozenset({".env", "cookies.txt"})
@@ -128,6 +142,7 @@ def verify(output: Path) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    use_utf8_output()
     parser = argparse.ArgumentParser(description="生成 Portable ZIP")
     parser.add_argument(
         "--source", type=Path, required=True, help="待打包目录，例如 dist/VideoDownloader"

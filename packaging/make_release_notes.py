@@ -24,9 +24,11 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import re
 import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -51,6 +53,17 @@ COMPLIANCE_NOTE = (
     "不绕过 CAPTCHA、登录限制、DRM、付费墙或任何访问控制；"
     "无法公开访问的内容会直接报错退出。请遵守当地法律与各平台服务条款。"
 )
+
+
+def use_utf8_output() -> None:
+    """Make the Chinese diagnostics safe on a legacy Windows code page."""
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        with contextlib.suppress(ValueError, OSError):
+            reconfigure(encoding="utf-8", errors="replace")
 
 
 def git(*arguments: str) -> str:
@@ -208,6 +221,7 @@ def render(
 
 
 def main(argv: list[str] | None = None) -> int:
+    use_utf8_output()
     parser = argparse.ArgumentParser(description="生成 GitHub Release 说明")
     parser.add_argument("--version", required=True, help="版本号，例如 1.03")
     parser.add_argument("--output", type=Path, required=True, help="输出 Markdown 路径")
