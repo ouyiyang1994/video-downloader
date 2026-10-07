@@ -138,7 +138,9 @@ jobs:
             --output release-assets/RELEASE_NOTES.md \
             --checksums release-assets/SHA256SUMS.txt \
             --setup-name "$SETUP_NAME" \
-            --portable-name "$PORTABLE_NAME"
+            --portable-name "$PORTABLE_NAME" \
+            --build-os Windows \
+            --build-arch x64
 
       - name: Publish release
         env:

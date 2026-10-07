@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import os
 import re
 import subprocess
 import sys
@@ -128,12 +127,8 @@ def read_checksums(path: Path | None) -> list[tuple[str, str]]:
     return rows
 
 
-def build_info(version: str, reference: str) -> list[str]:
+def build_info(version: str, reference: str, build_os: str, build_arch: str) -> list[str]:
     commit = git("rev-parse", "--short", "HEAD") or "unknown"
-    # GitHub Actions exports this variable as "ImageOS" (mixed case) on every
-    # platform; renaming it would stop it from being found on Linux runners.
-    runner = os.environ.get("RUNNER_OS") or os.environ.get("ImageOS") or "Windows"  # noqa: SIM112
-    arch = os.environ.get("RUNNER_ARCH") or "X64"
     timestamp = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     previous = reference or "（首个版本）"
     return [
@@ -143,7 +138,7 @@ def build_info(version: str, reference: str) -> list[str]:
         f"| 提交 | `{commit}` |",
         f"| 上一个版本 | `{previous}` |",
         f"| 构建时间 | {timestamp} |",
-        f"| 构建环境 | GitHub Actions · {runner} · {arch} |",
+        f"| 构建环境 | GitHub Actions · {build_os} · {build_arch} |",
         "| 构建方式 | PyInstaller（Windows onedir）→ Inno Setup 安装包 → Portable ZIP |",
         "| 运行依赖 | 已内置 `ffmpeg` / `ffprobe`，用户无需安装 Python、uv 或任何开发环境 |",
     ]
@@ -156,6 +151,8 @@ def render(
     checksums: list[tuple[str, str]],
     setup_name: str,
     portable_name: str,
+    build_os: str,
+    build_arch: str,
 ) -> str:
     lines: list[str] = [
         f"# Video Downloader v{version}",
@@ -193,7 +190,7 @@ def render(
     if not sections:
         lines.extend(["## 本次更新", "", "- 维护性发布，无用户可见变更。", ""])
 
-    lines.extend(["## 构建信息", "", *build_info(version, reference), ""])
+    lines.extend(["## 构建信息", "", *build_info(version, reference, build_os, build_arch), ""])
 
     lines.extend(["## 校验值（SHA-256）", "", "```"])
     if checksums:
@@ -229,6 +226,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--from-tag", default=None, help="起始 Tag（默认自动推断上一个 v* Tag）")
     parser.add_argument("--setup-name", required=True, help="安装包在 Release 中的文件名")
     parser.add_argument("--portable-name", required=True, help="Portable 包在 Release 中的文件名")
+    parser.add_argument(
+        "--build-os",
+        default="Windows",
+        help="产出二进制的操作系统（默认 Windows，本流水线在 windows-latest 上打包）",
+    )
+    parser.add_argument("--build-arch", default="x64", help="产出二进制的架构")
     args = parser.parse_args(argv)
 
     reference = args.from_tag if args.from_tag is not None else previous_tag()
@@ -243,6 +246,8 @@ def main(argv: list[str] | None = None) -> int:
         checksums=checksums,
         setup_name=args.setup_name,
         portable_name=args.portable_name,
+        build_os=args.build_os,
+        build_arch=args.build_arch,
     )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
