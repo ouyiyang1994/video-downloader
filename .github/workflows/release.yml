@@ -156,8 +156,14 @@ jobs:
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             # Re-running a failed job must be idempotent, not an error.
+            # --draft=false is essential: if the first attempt died between
+            # "create" and "upload", the release is still an unpublished draft
+            # and editing it alone would never make it public.
             echo "Release $TAG 已存在，更新标题、说明与资产"
-            gh release edit "$TAG" --title "$title" --notes-file release-assets/RELEASE_NOTES.md
+            gh release edit "$TAG" \
+              --title "$title" \
+              --notes-file release-assets/RELEASE_NOTES.md \
+              --draft=false
             gh release upload "$TAG" "${assets[@]}" --clobber
           else
             flags=(--title "$title" --notes-file release-assets/RELEASE_NOTES.md)
