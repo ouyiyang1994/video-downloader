@@ -1,0 +1,85 @@
+# ============================================================================
+#  Secrets & credentials  —  NEVER commit these
+# ============================================================================
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+
+# Exported browser cookies (Netscape cookies.txt) — login sessions
+secrets/
+cookies.txt
+*_cookies.txt
+
+# ============================================================================
+#  User data  —  downloads, database, logs
+# ============================================================================
+downloads/
+logs/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Partial / in-progress downloads
+*.part
+*.part.*
+*.tmp
+*.temp
+
+# ============================================================================
+#  Python / tooling caches
+# ============================================================================
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.uv-cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# ============================================================================
+#  Build artefacts
+# ============================================================================
+build/
+dist/
+*.egg-info/
+*.spec.bak
+
+# Vendored ffmpeg binaries (~500 MB unpacked) — downloaded, not source
+tools/
+
+# ============================================================================
+#  Editors & OS
+# ============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ============================================================================
+#  Local deployment overrides (never commit a real .env or compose override)
+# ============================================================================
+docker-compose.override.yml
+.env.docker

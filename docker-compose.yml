@@ -1,0 +1,45 @@
+# ============================================================================
+#  Video Downloader — Docker Compose (single service)
+# ----------------------------------------------------------------------------
+#  The project has exactly ONE component: the downloader itself. There is no
+#  database server (history is a local SQLite file), no cache and no web
+#  front-end, so a single service is the correct topology.
+#
+#  It is a CLI, not a daemon: it does NOT listen on any port. "Running" the
+#  service means executing one download command and exiting.
+#
+#  Usage:
+#      cp .env.example .env              # optional — all values are optional
+#      docker compose build
+#      docker compose run --rm video-downloader "https://www.bilibili.com/video/BV1GJ411x7h7"
+#
+#  Or simply use the one-click script:  ./scripts/deploy.sh   (Windows: .\scripts\deploy.ps1)
+# ============================================================================
+
+services:
+  video-downloader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: video-downloader:latest
+    container_name: video-downloader
+
+    # CLI tool: run to completion, do not restart.
+    restart: "no"
+
+    # Configuration is read from .env (create it from .env.example).
+    # `required: false` keeps `docker compose up` working even before you
+    # create one — every setting has a sane default.
+    env_file:
+      - path: .env
+        required: false
+
+    # Persist downloads, logs and the SQLite history on the host.
+    volumes:
+      - ./downloads:/app/downloads
+      - ./logs:/app/logs
+      # Mount your own secrets read-only when you have them (Instagram cookies):
+      # - ./secrets:/app/secrets:ro
+
+    # NOTE: no `ports:` on purpose — this container binds no port.
+    # It only makes outbound HTTPS requests and writes files.

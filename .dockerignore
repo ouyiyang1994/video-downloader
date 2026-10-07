@@ -1,0 +1,52 @@
+# ============================================================================
+#  Build context for the headless CLI image.
+#  Keep the context tiny: never send secrets, user data or build artefacts.
+# ============================================================================
+
+# Secrets & credentials
+.env
+.env.*
+!.env.example
+secrets/
+cookies.txt
+*_cookies.txt
+*.pem
+*.key
+
+# User data
+downloads/
+logs/
+*.db
+*.sqlite
+*.sqlite3
+*.part
+
+# Python / tooling caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.uv-cache/
+
+# Build artefacts & vendored binaries (ffmpeg comes from apt, not the repo)
+build/
+dist/
+tools/
+*.egg-info/
+
+# Tests, packaging scripts and docs are not needed to run the CLI
+tests/
+packaging/
+docs/
+scripts/
+
+# VCS / editors / OS
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

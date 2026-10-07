@@ -1,0 +1,68 @@
+[project]
+name = "video-downloader"
+version = "1.02"
+description = "Multi-platform public video downloader (YouTube / Instagram / Bilibili)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx[http2]>=0.28.1",
+    "aiofiles>=24.1.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",
+    "tenacity>=9.0.0",
+    "typer>=0.15.0",
+    "rich>=13.9.0",
+    "selectolax>=0.3.27",
+    "yt-dlp>=2025.1.1",
+    "pyside6>=6.8.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.0",
+    "pytest-asyncio>=0.25.0",
+    "respx>=0.22.0",
+    "mypy>=1.14.0",
+    "ruff>=0.9.0",
+    "pytest-qt>=4.4.0",
+    "pyinstaller>=6.11",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["tools", ".venv", ".uv-cache"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "SIM"]
+ignore = [
+    # We intentionally perform small synchronous filesystem calls (rename,
+    # stat) inside async code; offloading every one of them to a thread adds
+    # latency without a measurable benefit for single-file downloads.
+    "ASYNC240",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Typer/Click requires option objects in argument defaults.
+"main.py" = ["B008"]
+
+[tool.mypy]
+python_version = "3.12"
+disallow_untyped_defs = true
+warn_unused_ignores = true
+ignore_missing_imports = true
+exclude = ["tools/", "\\.venv/", "tests/"]
+
+[[tool.mypy.overrides]]
+module = ["tests", "tests.*"]
+disallow_untyped_defs = false
+disable_error_code = ["arg-type", "var-annotated", "call-arg"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["."]
