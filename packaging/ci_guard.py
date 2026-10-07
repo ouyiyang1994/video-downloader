@@ -127,13 +127,18 @@ CONTENT_PATTERNS: tuple[tuple[str, re.Pattern[str], Callable[[str], bool] | None
 
 # --- rule 3: local absolute paths --------------------------------------------
 
+#: A user name is restricted to characters that can actually appear in one.
+#: The looser ``[^/\s"'<>]+`` also matched the regex literals in this very file
+#: (``/Users/(?P<user>...`` looked like a path with the user ``(?P``).
+_USER = r"(?P<user>[A-Za-z0-9._-]+)"
+
 LOCAL_PATH_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"[A-Za-z]:\\{1,2}Users\\{1,2}(?P<user>[^\\/\s\"'<>]+)"),
-    re.compile(r"[A-Za-z]:/Users/(?P<user>[^/\s\"'<>]+)"),
+    re.compile(r"[A-Za-z]:\\{1,2}Users\\{1,2}" + _USER),
+    re.compile(r"[A-Za-z]:/Users/" + _USER),
     # The lookbehind keeps URL paths such as ``https://host/home/guide`` from
     # being mistaken for a real home directory.
-    re.compile(r"(?<![\w.:/])/(?:c|C)/Users/(?P<user>[^/\s\"'<>]+)"),
-    re.compile(r"(?<![\w.:/])/(?:home|Users)/(?P<user>[^/\s\"'<>]+)"),
+    re.compile(r"(?<![\w.:/])/(?:c|C)/Users/" + _USER),
+    re.compile(r"(?<![\w.:/])/(?:home|Users)/" + _USER),
 )
 
 #: Placeholder user names that legitimately appear in fixtures and docs.
