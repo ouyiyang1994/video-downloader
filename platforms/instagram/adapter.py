@@ -12,6 +12,7 @@ they are resolved through yt-dlp and require ``--confirm-rights``.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import httpx
 
@@ -19,25 +20,61 @@ from config.settings import Settings
 from core import selection
 from core.engine_ytdlp import YtDlpEngine
 from core.exceptions import NotDownloadableError, UnsupportedUrlError, VideoDownloaderError
+from core.http import load_cookie_header
 from core.interfaces import PlatformAdapter
+from core.login import LoginState, SessionStatus, header_has_cookie
 from core.models import DownloadPlan, MediaStream, Platform, VideoInfo
+from core.session_store import session_file
 from platforms.instagram import graph, urls
 
 logger = logging.getLogger(__name__)
 
 PUBLIC_REFERER = "https://www.instagram.com/"
 
+#: Official sign-in page, opened in the user's own browser.
+LOGIN_URL = "https://www.instagram.com/accounts/login/"
+#: Registrable domain the session cookies belong to.
+SESSION_DOMAIN = "instagram.com"
+#: ``sessionid`` is the cookie yt-dlp's own Instagram extractor treats as the
+#: authentication token (``InstagramBaseIE._AUTH_COOKIE_NAME``).
+SESSION_COOKIE_NAMES = ("sessionid",)
+
+#: Endpoint and headers taken from yt-dlp's Instagram extractor, so the status
+#: probe speaks to the site exactly the way the downloader does.
+PROFILE_INFO_API = "https://www.instagram.com/api/v1/users/web_profile_info/"
+#: A long-lived official account, used only as a "can this session read the
+#: API at all" probe.
+PROBE_USERNAME = "instagram"
+APP_ID = "936619743392459"
+#: A status probe should answer quickly; the download timeout (30 s by default)
+#: would leave the settings row on "检测中…" for far too long.
+SESSION_CHECK_TIMEOUT = 10.0
+API_HEADERS = {
+    "X-IG-App-ID": APP_ID,
+    "X-ASBD-ID": "359341",
+    "X-IG-WWW-Claim": "0",
+    "Origin": "https://www.instagram.com",
+    "Accept": "*/*",
+}
+
 
 class InstagramAdapter(PlatformAdapter):
     platform = Platform.INSTAGRAM
     display_name = "Instagram"
     requires_rights_confirmation = True
+    login_url = LOGIN_URL
+    session_domain = SESSION_DOMAIN
+    session_cookie_names = SESSION_COOKIE_NAMES
 
     def __init__(self, settings: Settings, client: httpx.AsyncClient) -> None:
         super().__init__(settings, client)
         # Public Instagram posts also answer only to a logged-in browser
         # session; the Graph API path above stays the preferred route.
-        self.engine = YtDlpEngine(settings, use_browser_cookies=True)
+        self.engine = YtDlpEngine(
+            settings,
+            use_browser_cookies=True,
+            managed_session_file=session_file(settings, self.platform),
+        )
         if settings.instagram_access_token and settings.instagram_user_id:
             # Graph API results are, by construction, the authorised account's
             # own media, so no additional rights confirmation is required.
@@ -46,6 +83,91 @@ class InstagramAdapter(PlatformAdapter):
     @property
     def graph_enabled(self) -> bool:
         return bool(self.settings.instagram_access_token and self.settings.instagram_user_id)
+
+    # -- sign-in ------------------------------------------------------------
+    def session_cookie_header(self) -> str | None:
+        """Cookie header for the Instagram session, or ``None``.
+
+        ``YtDlpEngine.cookie_file`` already resolves the managed ``secrets/``
+        session ahead of ``YTDLP_COOKIEFILE``, so both the download path and
+        this probe agree on which session is in use.
+        """
+
+        return load_cookie_header(self.engine.cookie_file, domain_suffix=SESSION_DOMAIN)
+
+    async def check_session(self, cookie_header: str | None) -> SessionStatus:
+        """Probe the session with the same API call yt-dlp relies on.
+
+        Instagram has no "who am I" endpoint that does not need a username, so
+        the probe asks for one well-known public account. A login wall (redirect
+        to ``/accounts/login``), a 401/403, or a JSON error body all mean the
+        session is no longer valid; a network failure means we simply cannot
+        tell, which is reported as ``UNKNOWN`` rather than as a verdict.
+
+        A header without ``sessionid`` is treated as "not signed in" before any
+        request is made: if the profile endpoint ever answers an anonymous
+        caller, that must not be mistaken for a signed-in session.
+        """
+
+        if not header_has_cookie(cookie_header, SESSION_COOKIE_NAMES):
+            return SessionStatus(platform=self.platform, state=LoginState.LOGGED_OUT)
+
+        headers = dict(API_HEADERS)
+        headers["Cookie"] = cookie_header
+        headers["User-Agent"] = self.settings.user_agent
+        headers["Referer"] = PUBLIC_REFERER
+
+        try:
+            response = await self.client.get(
+                PROFILE_INFO_API,
+                params={"username": PROBE_USERNAME},
+                headers=headers,
+                follow_redirects=False,
+                timeout=SESSION_CHECK_TIMEOUT,
+            )
+        except httpx.HTTPError as exc:
+            logger.info("检查 Instagram 登录状态失败：%s", type(exc).__name__)
+            return SessionStatus(
+                platform=self.platform,
+                state=LoginState.UNKNOWN,
+                detail="网络异常，暂时无法确认登录状态",
+            )
+
+        if response.is_redirect:
+            location = response.headers.get("location", "")
+            if "accounts/login" in location or location.rstrip("/") in {
+                "https://www.instagram.com",
+                "https://www.instagram.com/",
+            }:
+                return _expired()
+            return SessionStatus(
+                platform=self.platform,
+                state=LoginState.UNKNOWN,
+                detail="Instagram 返回了未预期的跳转，无法确认登录状态",
+            )
+
+        if response.status_code in (401, 403):
+            return _expired()
+        if response.status_code >= 400:
+            return SessionStatus(
+                platform=self.platform,
+                state=LoginState.UNKNOWN,
+                detail=f"Instagram 返回 HTTP {response.status_code}，无法确认登录状态",
+            )
+
+        try:
+            payload: Any = response.json()
+        except ValueError:
+            return SessionStatus(
+                platform=self.platform,
+                state=LoginState.UNKNOWN,
+                detail="Instagram 返回了非 JSON 内容，无法确认登录状态",
+            )
+
+        user = (payload.get("data") or {}).get("user") if isinstance(payload, dict) else None
+        if isinstance(user, dict) and user.get("username"):
+            return SessionStatus(platform=self.platform, state=LoginState.LOGGED_IN)
+        return _expired()
 
     def matches(self, url: str) -> bool:
         return urls.matches(url)
@@ -137,3 +259,13 @@ class InstagramAdapter(PlatformAdapter):
 
     def select_streams(self, info: VideoInfo, quality: str) -> DownloadPlan:
         return selection.select_streams(info, quality)
+
+
+def _expired() -> SessionStatus:
+    """The single "this session no longer works" verdict."""
+
+    return SessionStatus(
+        platform=Platform.INSTAGRAM,
+        state=LoginState.EXPIRED,
+        detail="Instagram 判定该会话未登录，请重新登录",
+    )

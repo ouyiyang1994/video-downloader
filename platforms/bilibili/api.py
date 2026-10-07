@@ -78,6 +78,26 @@ async def fetch_view(
     return _check_payload(response.json(), context="获取视频信息")
 
 
+async def fetch_nav(
+    client: httpx.AsyncClient,
+    *,
+    headers: dict[str, str],
+    timeout: float | None = None,  # noqa: ASYNC109 - a probe, not a long download
+) -> dict[str, Any]:
+    """``x/web-interface/nav`` - who, if anyone, is signed in on this session.
+
+    This is the same call the web player makes on every page load. Unlike the
+    other endpoints it answers ``code = -101`` ("账号未登录") for an anonymous
+    caller, which is a normal answer here rather than a failure, so the payload
+    is handed back untouched for the caller to interpret.
+    """
+
+    response = await client.get(NAV_API, headers=headers, timeout=timeout)
+    _raise_for_code(response, context="检查登录状态")
+    payload = response.json()
+    return payload if isinstance(payload, dict) else {}
+
+
 async def fetch_playurl(
     client: httpx.AsyncClient,
     *,

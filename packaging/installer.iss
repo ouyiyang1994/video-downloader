@@ -14,7 +14,7 @@
 ;   %LOCALAPPDATA%\VideoDownloader anyway).
 
 #define AppName "Video Downloader"
-#define AppVersion "1.02"
+#define AppVersion "1.03"
 #define AppPublisher "Video Downloader"
 #define AppExeName "VideoDownloader.exe"
 

@@ -21,6 +21,7 @@
 - [各平台的实际能力](#各平台的实际能力)
 - [系统依赖](#系统依赖)
 - [本地运行](#本地运行)
+- [账号登录](#账号登录)
 - [Docker 部署](#docker-部署)
 - [一键部署](#一键部署)
 - [启动 / 停止 / 更新脚本](#启动--停止--更新脚本)
@@ -65,6 +66,7 @@
 - **下载历史**：GUI 表格展示，CLI 用 `--history` 查看。
 - **文件名清洗**：非法字符、Windows 保留名、结尾空格与点自动处理。
 - **网络代理**：支持 HTTP 代理，并可按平台绕过（B 站走直连以避开风控 412）。
+- **账号登录**：哔哩哔哩与 Instagram 可用**系统默认浏览器**完成官方网页登录，会话按平台隔离保存；不接收密码、验证码，不用内嵌 WebView，不装浏览器扩展。
 - **主题**：明亮 / 暗色。
 
 ---
@@ -209,6 +211,46 @@ GUI 只是现有下载核心的界面层，**不复制任何下载逻辑**：它
 
 ---
 
+## 账号登录
+
+GUI 的「账号登录」分组可以为 **哔哩哔哩** 与 **Instagram** 分别保存登录状态，两个平台的会话完全隔离。
+
+![账号登录](docs/gui-login.png)
+
+点击「登录」之后：
+
+1. 用 **Windows 默认浏览器**打开该平台的**官方登录页面**；
+2. 你在浏览器里自行完成登录（包括两步验证）；
+3. 回到软件点击「我已登录，检测会话」，程序读取该会话并向平台官方接口确认登录状态；
+4. 确认有效后，才把该平台的 Cookie 写入 `secrets/<平台>_cookies.txt`。
+
+设置界面会显示 `未登录 [登录]`、`已登录 [退出登录]`、`登录已过期 [重新登录]`；下载时自动使用对应平台的会话，需要登录却没有会话时会提示你去登录。
+
+### 安全边界
+
+本功能**不做**以下任何一件事：
+
+- 不使用内嵌 WebView，不要求特定浏览器，不安装浏览器扩展；
+- 不接收、不保存你的密码、验证码或两步验证信息；
+- 不修改、不删除、也不导出浏览器里的其他 Cookie；
+- 不绕过平台登录验证或任何安全机制。
+
+读取浏览器会话走的是 yt-dlp 官方支持的 `--cookies-from-browser` 机制，且只保留属于该平台的 Cookie。「退出登录」只删除本程序保存的 `secrets/<平台>_cookies.txt`，浏览器完全不受影响。
+
+### 已知限制：Chromium 的 App-Bound Encryption
+
+**Chrome / Edge 127 及以上**用 App-Bound Encryption（v20）加密 Cookie，密钥由浏览器自身保护，**yt-dlp 无法解密**。因此在默认浏览器是 Chrome 或 Edge 的机器上，第 3 步的自动读取会失败。
+
+程序会**在你点登录之前**就检测到这一点（只读浏览器的 `Local State` 标记，不接触 Cookie 数据库），并在登录窗口顶部直接说明；万一仍然尝试失败，也不会静默失败——它会明确告诉你原因（加密 / 浏览器占用 / 未安装）、列出尝试过的每个浏览器及各自结果，并引导你使用**「手动填写会话」**：
+
+> 在已登录的浏览器中按 `F12` → `Application`（应用）→ `Cookies` → 该平台域名 → 复制 `SESSDATA`（B 站）或 `sessionid`（Instagram）粘贴进来。程序会**先向平台校验**，通过后才写入 `secrets/`。
+
+希望全自动的话，把登录用的浏览器换成 **Firefox** 即可（Firefox 的 Cookie 不加密，yt-dlp 可以直接读取）。
+
+> `.env` 中已有的 `BILIBILI_COOKIEFILE` / `YTDLP_COOKIEFILE` / `YTDLP_COOKIES_FROM_BROWSER` 配置**仍然有效**；优先级为 `BILIBILI_COOKIE` / `BILIBILI_SESSDATA` > 本窗口保存的会话 > 上述 `.env` 文件路径。
+
+---
+
 ## Docker 部署
 
 本项目的容器镜像面向 **无界面 CLI**。桌面 GUI 需要显示设备，无法在无显示的容器中运行，因此镜像只打包 CLI（`main.py`），并自动安装 ffmpeg。
@@ -326,6 +368,7 @@ docker compose run --rm video-downloader "https://www.bilibili.com/video/BV1GJ41
 | `OUTPUT_DIR` | `downloads` | 下载输出目录 |
 | `DATABASE_PATH` | `downloads/downloads.db` | SQLite 历史数据库路径 |
 | `LOG_DIR` | `logs` | 日志目录 |
+| `SESSION_DIR` | `secrets` | 账号登录保存的会话目录，每个平台一个 `cookies.txt` |
 | `DIR_TEMPLATE` | `{platform}/{author}/{date}` | 输出目录模板，支持 `{platform}` `{author}` `{date}` `{year}` `{month}` `{day}` |
 | `MAX_FILENAME_LENGTH` | `120` | 文件名主干最大长度 |
 | `SKIP_EXISTING` | `true` | 命中记录且文件存在时跳过 |
@@ -411,6 +454,9 @@ video-downloader/
 │   ├── database.py             # SQLite
 │   ├── naming.py               # 文件名清洗 + 目录模板
 │   ├── engine_ytdlp.py         # yt-dlp 抽取引擎（只取直链，不下载）
+│   ├── login.py                # 登录状态模型 + 手动会话值解析
+│   ├── session_store.py        # 账号登录保存的按平台隔离的 cookies.txt
+│   ├── browser_cookies.py      # 默认浏览器检测 + 用 yt-dlp 读取会话（含失败分类）
 │   ├── service.py              # 编排：元数据 → 校验 → 下载 → 合并 → 入库
 │   └── logging_setup.py
 ├── platforms/

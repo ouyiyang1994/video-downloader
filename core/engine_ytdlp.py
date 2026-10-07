@@ -164,11 +164,20 @@ def build_media_streams(formats: list[dict[str, Any]]) -> list[MediaStream]:
 class YtDlpEngine:
     """Async wrapper around :class:`yt_dlp.YoutubeDL` metadata extraction."""
 
-    def __init__(self, settings: Settings, *, use_browser_cookies: bool = False) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        use_browser_cookies: bool = False,
+        managed_session_file: Path | None = None,
+    ) -> None:
         self.settings = settings
         #: Only platforms that genuinely need a logged-in session opt in, so
         #: YouTube and Bilibili keep working exactly as before.
         self.use_browser_cookies = use_browser_cookies
+        #: Session the GUI's sign-in flow stored under ``secrets/``. When it
+        #: exists it is the most specific source and wins over ``.env``.
+        self.managed_session_file = managed_session_file
 
     @property
     def browser_cookie_source(self) -> str | None:
@@ -181,10 +190,16 @@ class YtDlpEngine:
 
     @property
     def cookie_file(self) -> Path | None:
-        """Resolved path of a Netscape cookies.txt, if one is configured."""
+        """Resolved path of a Netscape cookies.txt, if one is configured.
+
+        Precedence: the GUI-managed session under ``secrets/`` first (it is what
+        the sign-in flow just wrote), then ``YTDLP_COOKIEFILE`` from ``.env``.
+        """
 
         if not self.use_browser_cookies:
             return None
+        if self.managed_session_file is not None and self.managed_session_file.is_file():
+            return self.managed_session_file
         raw = (self.settings.ytdlp_cookiefile or "").strip()
         if not raw:
             return None

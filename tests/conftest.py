@@ -25,6 +25,9 @@ def settings(tmp_path: Path) -> Settings:
         output_dir=tmp_path / "downloads",
         database_path=tmp_path / "downloads" / "test.db",
         log_dir=tmp_path / "logs",
+        # Keep the sign-in flow's session files inside tmp_path: a test must
+        # never read or overwrite the developer's real secrets/ folder.
+        session_dir=tmp_path / "secrets",
         max_retries=2,
         request_timeout=5.0,
     )

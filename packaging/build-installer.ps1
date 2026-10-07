@@ -21,7 +21,7 @@ $OutDir = Join-Path $ProjectRoot 'dist\installer'
 $Python = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
 $Script = Join-Path $PackagingDir 'installer.iss'
 $Scanner = Join-Path $PackagingDir 'scan_secrets.py'
-# The setup name carries the version (e.g. "video DL_1.02.exe"), so it is read
+# The setup name carries the version (e.g. "video DL_1.03.exe"), so it is read
 # back from the compiler output instead of being duplicated here.
 
 function Write-Step([string]$Text) {

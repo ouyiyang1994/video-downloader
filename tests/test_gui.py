@@ -20,10 +20,12 @@ import gui
 from config import settings as settings_module
 from config.constants import QUALITY_AUDIO_ONLY, QUALITY_PRESETS
 from config.settings import Settings
+from core import browser_cookies, session_store
 from core.database import DownloadDatabase
 from core.downloader import ProgressUpdate
 from core.exceptions import (
     AuthRequiredError,
+    BrowserCookieError,
     CookieAccessError,
     DatabaseError,
     DownloadCancelled,
@@ -33,8 +35,10 @@ from core.exceptions import (
     MetadataError,
     NotDownloadableError,
     RateLimitedError,
+    SessionValueError,
     UnsupportedUrlError,
 )
+from core.login import LoginState, SessionStatus, parse_session_text
 from core.models import DownloadRecord, DownloadResult, DownloadStatus, Platform
 from core.registry import PlatformRegistry, build_registry
 
@@ -121,8 +125,23 @@ def test_friendly_error_messages(exc: BaseException, expected: str) -> None:
 
 
 def test_friendly_error_for_expired_instagram_login() -> None:
-    message = gui.friendly_error(AuthRequiredError("login required"), platform=Platform.INSTAGRAM)
-    assert message == "Instagram 登录状态已失效，请重新更新 Cookie。"
+    message = gui.friendly_error(
+        AuthRequiredError("login required"),
+        platform=Platform.INSTAGRAM,
+        session_present=True,
+    )
+    assert "登录已过期" in message
+    assert "账号登录" in message
+
+
+def test_friendly_error_for_missing_instagram_login() -> None:
+    message = gui.friendly_error(
+        AuthRequiredError("login required"),
+        platform=Platform.INSTAGRAM,
+        session_present=False,
+    )
+    assert "需要登录" in message
+    assert "账号登录" in message
 
 
 def test_friendly_error_mentions_proxy() -> None:
@@ -715,3 +734,446 @@ def test_emit_survives_a_windowed_build_without_stdout(monkeypatch, capsys) -> N
 
     monkeypatch.setattr(gui.sys, "stdout", None)
     gui.emit("无控制台输出")  # must not raise AttributeError
+
+
+# --- sign-in panel ----------------------------------------------------------
+
+
+def test_login_panel_lists_only_sign_in_platforms(window: gui.MainWindow) -> None:
+    assert set(window.login_rows) == {Platform.BILIBILI, Platform.INSTAGRAM}
+    for state_label, button in window.login_rows.values():
+        assert state_label.text() == "检测中…"
+        assert button.text() == "登录"
+        assert not button.isEnabled()
+
+
+def test_login_row_shows_a_logged_in_session(window: gui.MainWindow, settings: Settings) -> None:
+    session_store.write_session(
+        settings,
+        Platform.BILIBILI,
+        [session_store.make_cookie("SESSDATA", "v", domain=".bilibili.com")],
+        domain_suffix="bilibili.com",
+    )
+    window.login_status[Platform.BILIBILI] = SessionStatus(
+        platform=Platform.BILIBILI, state=LoginState.LOGGED_IN, account="某人"
+    )
+    window._refresh_login_row(Platform.BILIBILI)
+
+    state_label, button = window.login_rows[Platform.BILIBILI]
+    assert "已登录" in state_label.text()
+    assert "某人" in state_label.text()
+    assert button.text() == "退出登录"
+    assert button.isEnabled()
+
+
+def test_login_row_shows_an_expired_session(window: gui.MainWindow) -> None:
+    window.login_status[Platform.INSTAGRAM] = SessionStatus(
+        platform=Platform.INSTAGRAM, state=LoginState.EXPIRED
+    )
+    window._refresh_login_row(Platform.INSTAGRAM)
+
+    state_label, button = window.login_rows[Platform.INSTAGRAM]
+    assert "登录已过期" in state_label.text()
+    assert button.text() == "重新登录"
+
+
+def test_login_row_flags_a_session_that_came_from_env(
+    window: gui.MainWindow, settings: Settings
+) -> None:
+    """A session in .env is not one this application stored, and says so."""
+
+    window.login_status[Platform.BILIBILI] = SessionStatus(
+        platform=Platform.BILIBILI, state=LoginState.LOGGED_IN
+    )
+    window._refresh_login_row(Platform.BILIBILI)
+
+    state_label, _button = window.login_rows[Platform.BILIBILI]
+    assert ".env" in state_label.text()
+
+
+def test_logout_removes_only_this_application_session(
+    window: gui.MainWindow, settings: Settings, monkeypatch
+) -> None:
+    for platform, name, domain in (
+        (Platform.BILIBILI, "SESSDATA", ".bilibili.com"),
+        (Platform.INSTAGRAM, "sessionid", ".instagram.com"),
+    ):
+        session_store.write_session(
+            settings,
+            platform,
+            [session_store.make_cookie(name, "v", domain=domain)],
+            domain_suffix=domain.lstrip("."),
+        )
+
+    monkeypatch.setattr(
+        gui.QMessageBox, "question", lambda *a, **k: gui.QMessageBox.StandardButton.Yes
+    )
+    monkeypatch.setattr(window, "refresh_login_status", lambda: None)
+
+    window._logout(window.login_adapters[Platform.BILIBILI])
+
+    assert not session_store.has_session(settings, Platform.BILIBILI)
+    assert session_store.has_session(settings, Platform.INSTAGRAM), "另一个平台必须保留"
+    assert window.login_status[Platform.BILIBILI] is not None
+    assert window.login_status[Platform.BILIBILI].state is LoginState.LOGGED_OUT
+
+
+def test_logout_can_be_cancelled(window: gui.MainWindow, settings: Settings, monkeypatch) -> None:
+    session_store.write_session(
+        settings,
+        Platform.BILIBILI,
+        [session_store.make_cookie("SESSDATA", "v", domain=".bilibili.com")],
+        domain_suffix="bilibili.com",
+    )
+    monkeypatch.setattr(
+        gui.QMessageBox, "question", lambda *a, **k: gui.QMessageBox.StandardButton.No
+    )
+
+    window._logout(window.login_adapters[Platform.BILIBILI])
+
+    assert session_store.has_session(settings, Platform.BILIBILI)
+
+
+def test_wait_for_thread_tolerates_a_destroyed_worker() -> None:
+    """Closing the window after a worker was deleteLater'd must not raise."""
+
+    gui.wait_for_thread(None)
+    worker = gui.ProxyTestWorker("http://127.0.0.1:9")
+    worker.finished.connect(worker.deleteLater)
+    worker.start()
+    assert worker.wait(10000)
+    QApplication.processEvents()  # let deleteLater run
+
+    gui.wait_for_thread(worker)  # must not raise RuntimeError
+
+
+@pytest.mark.parametrize(
+    ("state", "refused"),
+    [
+        (LoginState.EXPIRED, True),
+        (LoginState.LOGGED_OUT, True),
+        (LoginState.LOGGED_IN, False),
+        # The platform could not be reached: storing the session the user just
+        # produced is better than throwing it away over a transient failure.
+        (LoginState.UNKNOWN, False),
+    ],
+)
+def test_only_an_explicit_rejection_refuses_a_session(state: LoginState, refused: bool) -> None:
+    status = SessionStatus(platform=Platform.BILIBILI, state=state)
+
+    if refused:
+        with pytest.raises(SessionValueError):
+            gui.LoginWorker._reject_only_when_the_platform_says_no(status, source="测试")
+    else:
+        gui.LoginWorker._reject_only_when_the_platform_says_no(status, source="测试")
+
+
+def test_login_worker_never_logs_the_pasted_value(caplog) -> None:
+    """A session value must not reach the log, whatever the outcome."""
+
+    secret = "SUPERSECRETSESSIONVALUE"
+    with caplog.at_level("DEBUG"), pytest.raises(SessionValueError):
+        parse_session_text(
+            f"sessionid={secret}", cookie_names=("SESSDATA",), domain=".bilibili.com"
+        )
+
+    assert secret not in caplog.text
+
+
+# --- sign-in progress, duplicate clicks, and browser advice ------------------
+
+
+class _StubWorker:
+    """Stands in for a LoginWorker so UI state can be tested without any I/O."""
+
+    def __init__(self, running: bool = True) -> None:
+        self._running = running
+
+    def isRunning(self) -> bool:  # noqa: N802 - Qt API
+        return self._running
+
+    def wait(self, _timeout: int = 0) -> bool:  # noqa: N802 - Qt API
+        return True
+
+
+def _outlook(*, default: str | None, readable: tuple[str, ...], installed: bool = True):
+    blocked = ("chrome", "edge") if default in {"chrome", "edge"} else ()
+    return browser_cookies.AutomaticReadOutlook(
+        default_browser=default,
+        readable_browsers=readable,
+        blocked_browsers=blocked,
+        any_installed=installed,
+    )
+
+
+@pytest.fixture
+def login_dialog(qtbot, settings: Settings, registry: PlatformRegistry, monkeypatch):
+    """A dialog that never touches a real browser."""
+
+    monkeypatch.setattr(gui.webbrowser, "open", lambda *a, **k: True)
+    dialog = gui.LoginDialog(settings, registry.get(Platform.BILIBILI))
+    qtbot.addWidget(dialog)
+    return dialog
+
+
+def test_login_row_shows_progress_while_a_check_runs(window: gui.MainWindow) -> None:
+    window.login_status[Platform.BILIBILI] = SessionStatus(
+        platform=Platform.BILIBILI, state=LoginState.LOGGED_IN, account="某人"
+    )
+    window.login_workers[Platform.BILIBILI] = _StubWorker()  # type: ignore[assignment]
+
+    window._refresh_login_row(Platform.BILIBILI)
+
+    state_label, button = window.login_rows[Platform.BILIBILI]
+    assert button.text() == gui.LOGIN_BUSY_TEXT
+    assert not button.isEnabled(), "检测期间必须禁用，避免重复点击"
+    assert "已登录" in state_label.text(), "检测中仍应显示上一次的结论"
+
+
+def test_refresh_button_tracks_the_running_checks(window: gui.MainWindow) -> None:
+    assert window.login_refresh_button.isEnabled()
+
+    window.login_workers[Platform.BILIBILI] = _StubWorker()  # type: ignore[assignment]
+    window._refresh_login_controls()
+    assert not window.login_refresh_button.isEnabled()
+
+    window.login_workers.clear()
+    window._refresh_login_controls()
+    assert window.login_refresh_button.isEnabled()
+
+
+def test_login_summary_explains_an_unsure_verdict(window: gui.MainWindow) -> None:
+    window.login_status[Platform.INSTAGRAM] = SessionStatus(
+        platform=Platform.INSTAGRAM,
+        state=LoginState.UNKNOWN,
+        detail="Instagram 返回 HTTP 429，无法确认登录状态",
+    )
+    window.login_status[Platform.BILIBILI] = SessionStatus(
+        platform=Platform.BILIBILI, state=LoginState.LOGGED_IN, account="某人"
+    )
+
+    text = window._login_summary()
+
+    assert "状态未知" in text
+    assert "429" in text, "必须说明为什么无法确认"
+    assert "已登录（某人）" in text
+
+
+def test_dialog_pre_shows_manual_entry_when_auto_read_is_impossible(
+    qtbot, settings: Settings, registry: PlatformRegistry, monkeypatch
+) -> None:
+    """The user must learn this before logging in, not after."""
+
+    monkeypatch.setattr(
+        gui, "automatic_read_outlook", lambda: _outlook(default="chrome", readable=())
+    )
+    monkeypatch.setattr(gui.webbrowser, "open", lambda *a, **k: True)
+
+    dialog = gui.LoginDialog(settings, registry.get(Platform.BILIBILI))
+    qtbot.addWidget(dialog)
+
+    assert not dialog.manual_box.isHidden()
+    assert "App-Bound" in dialog.advice_label.text()
+    assert "手动填写会话" in dialog.advice_label.text()
+
+
+def test_dialog_keeps_manual_entry_hidden_when_the_default_is_readable(
+    qtbot, settings: Settings, registry: PlatformRegistry, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        gui, "automatic_read_outlook", lambda: _outlook(default="firefox", readable=("firefox",))
+    )
+    monkeypatch.setattr(gui.webbrowser, "open", lambda *a, **k: True)
+
+    dialog = gui.LoginDialog(settings, registry.get(Platform.BILIBILI))
+    qtbot.addWidget(dialog)
+
+    assert dialog.manual_box.isHidden()
+    assert "可以直接读取" in dialog.advice_label.text()
+
+
+def test_dialog_offers_firefox_when_it_is_installed(
+    qtbot, settings: Settings, registry: PlatformRegistry, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        gui,
+        "automatic_read_outlook",
+        lambda: _outlook(default="chrome", readable=("firefox",)),
+    )
+    monkeypatch.setattr(gui.webbrowser, "open", lambda *a, **k: True)
+
+    dialog = gui.LoginDialog(settings, registry.get(Platform.BILIBILI))
+    qtbot.addWidget(dialog)
+
+    assert not dialog.manual_box.isHidden()
+    assert "Firefox" in dialog.advice_label.text()
+
+
+def test_dialog_shows_progress_and_blocks_a_second_click(login_dialog) -> None:
+    login_dialog._set_busy(True, action=gui.LoginAction.ACQUIRE)
+
+    assert login_dialog.detect_button.text() == gui.DETECT_BUSY_TEXT
+    for widget in (
+        login_dialog.detect_button,
+        login_dialog.save_button,
+        login_dialog.reopen_button,
+        login_dialog.paste_edit,
+    ):
+        assert not widget.isEnabled()
+
+    login_dialog._set_busy(False)
+
+    assert login_dialog.detect_button.text() == gui.DETECT_BUTTON_TEXT
+    assert login_dialog.save_button.text() == gui.PASTE_BUTTON_TEXT
+    assert login_dialog.detect_button.isEnabled()
+    assert login_dialog.paste_edit.isEnabled()
+
+
+def test_dialog_labels_the_button_that_is_actually_working(login_dialog) -> None:
+    login_dialog._set_busy(True, action=gui.LoginAction.PASTE)
+
+    assert login_dialog.save_button.text() == gui.PASTE_BUSY_TEXT
+    assert login_dialog.detect_button.text() == gui.DETECT_BUTTON_TEXT
+
+
+def test_dialog_refuses_to_start_a_second_check(login_dialog, monkeypatch) -> None:
+    login_dialog.worker = _StubWorker()  # type: ignore[assignment]
+    started: list[object] = []
+    monkeypatch.setattr(gui.LoginWorker, "start", lambda self: started.append(self))
+
+    login_dialog._start(gui.LoginAction.ACQUIRE)
+
+    assert started == [], "已有任务在跑时不得再起一个"
+
+
+def test_dialog_tells_the_user_when_no_browser_could_be_started(
+    qtbot, settings: Settings, registry: PlatformRegistry, monkeypatch
+) -> None:
+    monkeypatch.setattr(gui.webbrowser, "open", lambda *a, **k: False)
+
+    dialog = gui.LoginDialog(settings, registry.get(Platform.BILIBILI))
+    qtbot.addWidget(dialog)
+
+    assert "无法自动打开浏览器" in dialog.status_label.text()
+    assert "passport.bilibili.com" in dialog.status_label.text()
+
+
+def test_dialog_survives_a_browser_that_raises(
+    qtbot, settings: Settings, registry: PlatformRegistry, monkeypatch
+) -> None:
+    def _boom(*args: object, **kwargs: object) -> bool:
+        raise OSError("no browser registered")
+
+    monkeypatch.setattr(gui.webbrowser, "open", _boom)
+
+    dialog = gui.LoginDialog(settings, registry.get(Platform.BILIBILI))
+    qtbot.addWidget(dialog)
+
+    assert "无法自动打开浏览器" in dialog.status_label.text()
+
+
+def test_login_worker_failure_never_logs_the_pasted_value(
+    settings: Settings, registry: PlatformRegistry, caplog
+) -> None:
+    """A rejected session must not leak its value into the log or the message."""
+
+    secret = "SUPERSECRETSESSIONVALUE"
+    worker = gui.LoginWorker(
+        settings,
+        registry.get(Platform.BILIBILI),
+        gui.LoginAction.PASTE,
+        f"wrongcookie={secret}",
+    )
+    failures: list[tuple[str, str]] = []
+    worker.failed.connect(lambda message, detail: failures.append((message, detail)))
+
+    with caplog.at_level("DEBUG"):
+        worker.run()  # runs in this thread; the value is rejected before any I/O
+
+    assert failures, "无效的会话值应触发失败信号"
+    assert secret not in caplog.text
+    for message, detail in failures:
+        assert secret not in message
+        assert secret not in detail
+
+
+def test_login_worker_reports_a_browser_it_cannot_read(
+    settings: Settings, registry: PlatformRegistry, monkeypatch
+) -> None:
+    error = BrowserCookieError(
+        "无法解密 Chrome 的 Cookie（App-Bound Encryption）",
+        reason=browser_cookies.BrowserFailure.ENCRYPTED.value,
+        browser="chrome",
+        detail="首选方案：改用 Firefox 登录",
+    )
+    monkeypatch.setattr(gui, "extract_session", lambda domain: (_ for _ in ()).throw(error))
+
+    worker = gui.LoginWorker(settings, registry.get(Platform.BILIBILI), gui.LoginAction.ACQUIRE)
+    reported: list[object] = []
+    worker.browser_unavailable.connect(reported.append)
+
+    worker.run()
+
+    assert reported == [error]
+
+
+def test_a_stale_worker_finish_does_not_untrack_the_live_one(
+    window: gui.MainWindow,
+) -> None:
+    """A queued ``finished`` from an older worker must not evict its successor.
+
+    ``refresh_login_status`` can replace the tracked worker before the previous
+    one's ``finished`` slot runs; popping unconditionally would leave the live
+    worker untracked, so nothing would wait for it when the window closes.
+    """
+
+    stale = _StubWorker(running=False)
+    live = _StubWorker()
+    window.login_workers[Platform.BILIBILI] = live  # type: ignore[assignment]
+
+    window._on_login_worker_finished(window.login_adapters[Platform.BILIBILI], stale)  # type: ignore[arg-type]
+
+    assert window.login_workers.get(Platform.BILIBILI) is live
+
+
+def test_a_matching_worker_finish_clears_the_tracking(window: gui.MainWindow) -> None:
+    live = _StubWorker(running=False)
+    window.login_workers[Platform.BILIBILI] = live  # type: ignore[assignment]
+
+    window._on_login_worker_finished(window.login_adapters[Platform.BILIBILI], live)  # type: ignore[arg-type]
+
+    assert Platform.BILIBILI not in window.login_workers
+
+
+def test_the_open_dialog_is_tracked_and_released(window: gui.MainWindow, monkeypatch) -> None:
+    """``closeEvent`` needs a handle on the dialog to wait for its worker."""
+
+    monkeypatch.setattr(gui.webbrowser, "open", lambda *a, **k: True)
+    seen: dict[str, object] = {}
+
+    def _exec(self: gui.LoginDialog) -> int:
+        seen["during"] = window._login_dialog
+        return 0
+
+    monkeypatch.setattr(gui.LoginDialog, "exec", _exec)
+
+    window._on_login_button(window.login_adapters[Platform.BILIBILI])
+
+    assert seen["during"] is not None
+    assert window._login_dialog is None, "对话框关闭后必须释放引用"
+
+
+def test_close_waits_for_a_worker_running_inside_the_dialog(
+    window: gui.MainWindow, monkeypatch
+) -> None:
+    dialog = gui.LoginDialog(window.settings, window.login_adapters[Platform.BILIBILI], window)
+    dialog.worker = _StubWorker()  # type: ignore[assignment]
+    window._login_dialog = dialog
+
+    waited: list[object] = []
+    monkeypatch.setattr(gui, "wait_for_thread", lambda thread, *a, **k: waited.append(thread))
+
+    window.close()
+
+    assert dialog.worker in waited, "关闭窗口必须等待对话框里仍在运行的检测线程"
+    window._login_dialog = None

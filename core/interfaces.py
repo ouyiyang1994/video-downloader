@@ -7,13 +7,17 @@ imports anything platform specific.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import ClassVar
 
 import httpx
 
 from config.settings import Settings
 from core.exceptions import NotDownloadableError
+from core.http import load_cookie_header
+from core.login import LoginState, SessionStatus
 from core.models import DownloadPlan, Platform, VideoInfo
+from core.session_store import session_file
 
 
 class PlatformAdapter(ABC):
@@ -28,9 +32,65 @@ class PlatformAdapter(ABC):
     #: once official credentials are configured.
     requires_rights_confirmation: bool = True
 
+    #: Official sign-in page, opened in the user's own browser. ``None`` means
+    #: the platform has no sign-in concept in this application.
+    login_url: ClassVar[str | None] = None
+    #: Registrable domain the session cookies belong to (``bilibili.com``).
+    session_domain: ClassVar[str] = ""
+    #: Cookies that must be present for a session to be usable. The first entry
+    #: is the value the user is asked for when a manual paste is needed.
+    session_cookie_names: ClassVar[tuple[str, ...]] = ()
+
     def __init__(self, settings: Settings, client: httpx.AsyncClient) -> None:
         self.settings = settings
         self.client = client
+
+    # -- 0. Sign-in ---------------------------------------------------------
+    @property
+    def login_supported(self) -> bool:
+        """True when this platform can be signed in to from the GUI."""
+
+        return self.login_url is not None and bool(self.session_domain)
+
+    @property
+    def managed_session_file(self) -> Path:
+        """Where the GUI-managed session for this platform lives."""
+
+        return session_file(self.settings, self.platform)
+
+    def reload_session(self) -> None:  # noqa: B027 - a no-op default is correct here
+        """Drop any cached session so the next lookup re-reads its sources.
+
+        Adapters may cache the resolved cookie header because they are rebuilt
+        per download; the sign-in flow, however, changes the session behind a
+        long-lived adapter's back, so it has to say so explicitly. Most adapters
+        cache nothing and inherit this no-op.
+        """
+
+    def session_cookie_header(self) -> str | None:
+        """Cookie header taken from the managed session file, if any.
+
+        Adapters with additional ``.env``-configured sources override this to
+        put them in the right precedence order.
+        """
+
+        if not self.session_domain:
+            return None
+        return load_cookie_header(self.managed_session_file, domain_suffix=self.session_domain)
+
+    async def check_session(self, cookie_header: str | None) -> SessionStatus:
+        """Ask the platform whether ``cookie_header`` is a live session.
+
+        The default answer is "this platform cannot be checked", which keeps
+        YouTube - and any future adapter that has not opted in - working exactly
+        as before.
+        """
+
+        return SessionStatus(
+            platform=self.platform,
+            state=LoginState.UNKNOWN,
+            detail="该平台暂不支持登录状态检查",
+        )
 
     # -- 1. URL recognition -------------------------------------------------
     @abstractmethod

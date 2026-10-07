@@ -16,21 +16,34 @@ from typing import Any
 import httpx
 
 from core import selection
-from core.exceptions import MetadataError, NotDownloadableError
+from core.exceptions import MetadataError, NotDownloadableError, RateLimitedError
 from core.http import load_cookie_header
 from core.interfaces import PlatformAdapter
+from core.login import LoginState, SessionStatus, header_has_cookie
 from core.models import DownloadPlan, MediaStream, Platform, VideoInfo
 from platforms.bilibili import api, urls
 
 logger = logging.getLogger(__name__)
 
 WEB_ROOT = "https://www.bilibili.com"
+#: Official sign-in page, opened in the user's own browser.
+LOGIN_URL = "https://passport.bilibili.com/login"
+#: Registrable domain the session cookies belong to.
+SESSION_DOMAIN = "bilibili.com"
+#: A status probe should answer quickly; the download timeout (30 s by default)
+#: would leave the settings row on "检测中…" for far too long.
+SESSION_CHECK_TIMEOUT = 10.0
 
 
 class BilibiliAdapter(PlatformAdapter):
     platform = Platform.BILIBILI
     display_name = "哔哩哔哩"
     requires_rights_confirmation = False
+    login_url = LOGIN_URL
+    session_domain = SESSION_DOMAIN
+    #: SESSDATA alone is what authenticates every request this project makes;
+    #: bili_jct and the rest ride along when the user pastes a whole header.
+    session_cookie_names = ("SESSDATA",)
 
     def __init__(self, settings: Any, client: httpx.AsyncClient) -> None:
         super().__init__(settings, client)
@@ -57,34 +70,117 @@ class BilibiliAdapter(PlatformAdapter):
             "Origin": WEB_ROOT,
             "User-Agent": self.settings.user_agent,
         }
-        cookie = self._request_cookie()
+        cookie = self.session_cookie_header()
         if cookie:
             headers["Cookie"] = cookie
         return headers
 
-    def _request_cookie(self) -> str | None:
+    def session_cookie_header(self) -> str | None:
         """The Bilibili cookie to send, or ``None`` for an anonymous session.
 
-        An explicit ``BILIBILI_COOKIE`` / ``BILIBILI_SESSDATA`` wins; otherwise
-        the exported ``www.bilibili.com_cookies.txt`` is used. A missing or
-        unreadable file simply means "stay anonymous" - never an error. The
-        value is cached per adapter (one adapter is built per download) and is
-        never logged.
+        Precedence, most specific first:
+
+        1. ``BILIBILI_COOKIE`` / ``BILIBILI_SESSDATA`` from ``.env`` - a value
+           the user typed themselves, so it always wins;
+        2. the session the GUI stored under ``secrets/`` (the v1.03 sign-in);
+        3. ``BILIBILI_COOKIEFILE`` from ``.env`` - the pre-1.03 exported file.
+
+        A missing or unreadable file simply means "stay anonymous" - never an
+        error. The value is cached per adapter (one adapter is built per
+        download) and is never logged.
         """
 
         if not self._cookie_loaded:
             self._cookie_loaded = True
-            explicit = self.settings.bilibili_cookie_header()
-            self._cookie_header = explicit or load_cookie_header(
-                self.settings.bilibili_cookie_file,
-                domain_suffix="bilibili.com",
-            )
+            self._cookie_header, source = self._resolve_cookie()
             if self._cookie_header:
-                logger.debug(
-                    "Bilibili 请求将携带登录 Cookie（来源：%s）",
-                    "配置项" if explicit else "cookies.txt",
-                )
+                logger.debug("Bilibili 请求将携带登录 Cookie（来源：%s）", source)
         return self._cookie_header
+
+    def reload_session(self) -> None:
+        """Forget the cached cookie header.
+
+        The GUI signs in and out against a long-lived adapter, so a stale
+        cache would keep reporting the session that was just deleted.
+        """
+
+        self._cookie_loaded = False
+        self._cookie_header = None
+
+    def _resolve_cookie(self) -> tuple[str | None, str]:
+        explicit = self.settings.bilibili_cookie_header()
+        if explicit:
+            return explicit, "配置项"
+        managed = load_cookie_header(self.managed_session_file, domain_suffix=SESSION_DOMAIN)
+        if managed:
+            return managed, "secrets/ 托管会话"
+        configured = load_cookie_header(
+            self.settings.bilibili_cookie_file, domain_suffix=SESSION_DOMAIN
+        )
+        if configured:
+            return configured, "cookies.txt"
+        return None, "匿名"
+
+    async def check_session(self, cookie_header: str | None) -> SessionStatus:
+        """Ask Bilibili who this session belongs to, via the official nav API.
+
+        ``x/web-interface/nav`` is the call the web player itself makes on every
+        page load, so this adds no capability the site does not already expose.
+        A ``412`` means this machine's exit IP is being rate-limited, which says
+        nothing about the session - hence ``UNKNOWN`` rather than a verdict.
+
+        A header without ``SESSDATA`` is "not signed in" without asking at all,
+        and any code other than the two documented answers is reported as
+        ``UNKNOWN`` rather than being read as "expired".
+        """
+
+        if not header_has_cookie(cookie_header, self.session_cookie_names):
+            return SessionStatus(platform=self.platform, state=LoginState.LOGGED_OUT)
+
+        headers = {
+            "Referer": f"{WEB_ROOT}/",
+            "Origin": WEB_ROOT,
+            "User-Agent": self.settings.user_agent,
+            "Cookie": cookie_header,
+        }
+        try:
+            payload = await api.fetch_nav(
+                self.client, headers=headers, timeout=SESSION_CHECK_TIMEOUT
+            )
+        except RateLimitedError:
+            return SessionStatus(
+                platform=self.platform,
+                state=LoginState.UNKNOWN,
+                detail="Bilibili 触发风控（HTTP 412），暂时无法确认登录状态",
+            )
+        except (httpx.HTTPError, MetadataError) as exc:
+            logger.info("检查 Bilibili 登录状态失败：%s", type(exc).__name__)
+            return SessionStatus(
+                platform=self.platform,
+                state=LoginState.UNKNOWN,
+                detail="网络异常，暂时无法确认登录状态",
+            )
+
+        code = payload.get("code")
+        data = payload.get("data") or {}
+        if code == 0:
+            if data.get("isLogin"):
+                return SessionStatus(
+                    platform=self.platform,
+                    state=LoginState.LOGGED_IN,
+                    account=data.get("uname") or None,
+                )
+            return _expired()
+        if code == -101:
+            # The documented "账号未登录" answer for an anonymous caller.
+            return _expired()
+        # Anything else is an answer we cannot interpret, so it must not be
+        # turned into a claim about the session either way.
+        return SessionStatus(
+            platform=self.platform,
+            state=LoginState.UNKNOWN,
+            detail=f"Bilibili 返回了未预期的状态码 {code}，无法确认登录状态",
+        )
 
     async def _resolve_identity(self, url: str) -> tuple[str, str, str]:
         """Return ``(kind, value, resolved_url)`` handling b23.tv short links."""
@@ -191,7 +287,7 @@ class BilibiliAdapter(PlatformAdapter):
                 "page_title": page.get("part"),
                 "quality_map": quality_desc,
                 "accept_quality": play.get("accept_quality"),
-                "requires_login_for_hd": self._request_cookie() is None,
+                "requires_login_for_hd": self.session_cookie_header() is None,
                 "dynamic": view.get("dynamic"),
                 "stat": view.get("stat"),
                 "source": "bilibili-web-api",
@@ -278,6 +374,16 @@ class BilibiliAdapter(PlatformAdapter):
         super().check_downloadable(info)
         if info.extra.get("is_upower_exclusive"):
             raise NotDownloadableError("该内容为充电专属，跳过", detail=info.video_id)
+
+
+def _expired() -> SessionStatus:
+    """The single "this session no longer works" verdict."""
+
+    return SessionStatus(
+        platform=Platform.BILIBILI,
+        state=LoginState.EXPIRED,
+        detail="Bilibili 判定该会话未登录，请重新登录",
+    )
 
 
 def _https(url: str | None) -> str | None:

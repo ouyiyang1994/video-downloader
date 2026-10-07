@@ -257,7 +257,7 @@ def test_adapter_cookie_header_is_never_logged(
     with caplog.at_level("DEBUG"):
         client = httpx.AsyncClient()
         try:
-            BilibiliAdapter(settings, client)._request_cookie()
+            BilibiliAdapter(settings, client).session_cookie_header()
         finally:
             import asyncio
 

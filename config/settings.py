@@ -208,6 +208,9 @@ class Settings(BaseSettings):
     output_dir: Path = Field(default=Path("downloads"))
     database_path: Path = Field(default=Path("downloads/downloads.db"))
     log_dir: Path = Field(default=Path("logs"))
+    #: Where the GUI's sign-in flow stores the per-platform sessions. Relative
+    #: paths resolve against the data root, and the folder is git-ignored.
+    session_dir: Path = Field(default=Path("secrets"))
     dir_template: str = "{platform}/{author}/{date}"
 
     # --- Networking --------------------------------------------------------

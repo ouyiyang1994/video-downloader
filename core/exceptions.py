@@ -90,6 +90,39 @@ class CookieAccessError(VideoDownloaderError):
     exit_code = 11
 
 
+class BrowserCookieError(VideoDownloaderError):
+    """The login flow could not obtain a session from the browser.
+
+    ``reason`` is a :class:`core.browser_cookies.BrowserFailure` value so the
+    caller can offer the right next step - retry after closing the browser, use
+    a different browser, or ask the user for the session value directly.
+    """
+
+    exit_code = 12
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        browser: str = "",
+        detail: str | None = None,
+    ) -> None:
+        super().__init__(message, detail=detail)
+        self.reason = reason
+        self.browser = browser
+
+
+class SessionValueError(VideoDownloaderError):
+    """A manually supplied session value could not be used.
+
+    Raised when the pasted text is empty, malformed, or rejected by the
+    platform. Never carries the value itself.
+    """
+
+    exit_code = 13
+
+
 class DownloadCancelled(VideoDownloaderError):
     """The caller asked to stop an in-flight download.
 
