@@ -82,11 +82,21 @@ jobs:
         run: |
           $version = (uv run --no-sync python packaging/sync_version.py --print).Trim()
           if (-not $version) { throw '无法从 pyproject.toml 读取版本号' }
+          $setup = "VideoDownloader-$version-Setup.exe"
+          $portable = "VideoDownloader-$version-portable-win64.zip"
+
+          # Both sinks are needed: GITHUB_OUTPUT feeds the workflow outputs that
+          # release.yml consumes, GITHUB_ENV feeds the steps in this job.
           "version=$version" | Add-Content -Path $env:GITHUB_OUTPUT
+          "setup_name=$setup" | Add-Content -Path $env:GITHUB_OUTPUT
+          "portable_name=$portable" | Add-Content -Path $env:GITHUB_OUTPUT
           "VERSION=$version" | Add-Content -Path $env:GITHUB_ENV
-          "SETUP_NAME=VideoDownloader-$version-Setup.exe" | Add-Content -Path $env:GITHUB_ENV
-          "PORTABLE_NAME=VideoDownloader-$version-portable-win64.zip" | Add-Content -Path $env:GITHUB_ENV
-          Write-Host "版本: $version"
+          "SETUP_NAME=$setup" | Add-Content -Path $env:GITHUB_ENV
+          "PORTABLE_NAME=$portable" | Add-Content -Path $env:GITHUB_ENV
+
+          Write-Host "版本      : $version"
+          Write-Host "安装包    : $setup"
+          Write-Host "Portable  : $portable"
 
       # ------------------------------------------------------------------
       # ffmpeg.  build.ps1 copies tools\ffmpeg\bin into the bundle, so the

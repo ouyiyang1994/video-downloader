@@ -111,9 +111,15 @@ jobs:
           PORTABLE_NAME: ${{ needs.build.outputs.portable_name }}
         run: |
           set -euo pipefail
+          if [ -z "$SETUP_NAME" ] || [ -z "$PORTABLE_NAME" ]; then
+            echo "::error::构建工作流没有回传产物文件名（SETUP_NAME / PORTABLE_NAME 为空），放弃发布"
+            exit 1
+          fi
           ls -l release-assets
           for name in "$SETUP_NAME" "$PORTABLE_NAME" SHA256SUMS.txt; do
-            if [ ! -s "release-assets/$name" ]; then
+            # -f (not just -s): a directory would also satisfy -s, and an empty
+            # name would silently expand to "release-assets/" and pass.
+            if [ ! -f "release-assets/$name" ]; then
               echo "::error::缺少产物 $name，放弃发布"
               exit 1
             fi
