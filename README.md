@@ -230,22 +230,74 @@ GUI 的「账号登录」分组可以为 **哔哩哔哩** 与 **Instagram** 分�
 
 本功能**不做**以下任何一件事：
 
-- 不使用内嵌 WebView，不要求特定浏览器，不安装浏览器扩展；
+- 不使用内嵌 WebView，不要求你把密码交给本程序；
 - 不接收、不保存你的密码、验证码或两步验证信息；
 - 不修改、不删除、也不导出浏览器里的其他 Cookie；
 - 不绕过平台登录验证或任何安全机制。
 
-读取浏览器会话走的是 yt-dlp 官方支持的 `--cookies-from-browser` 机制，且只保留属于该平台的 Cookie。「退出登录」只删除本程序保存的 `secrets/<平台>_cookies.txt`，浏览器完全不受影响。
+读取浏览器会话有三条路，程序会按当前机器的情况自动选一条并**在登录窗口里说明**：
 
-### 已知限制：Chromium 的 App-Bound Encryption
+| 方式 | 适用情况 | 说明 |
+| --- | --- | --- |
+| 直接读取浏览器 Cookie | 默认浏览器是 Firefox | 走 yt-dlp 官方支持的 `--cookies-from-browser`，只保留属于该平台的 Cookie。全自动。 |
+| **Chrome 登录助手扩展** | Chrome / Edge（默认） | 由 **Chrome 自己解密**并把会话交给本机程序，见下一节。 |
+| 手动填写会话 | 任何情况 | 从开发者工具复制 `SESSDATA` / `sessionid` 粘贴进来。 |
 
-**Chrome / Edge 127 及以上**用 App-Bound Encryption（v20）加密 Cookie，密钥由浏览器自身保护，**yt-dlp 无法解密**。因此在默认浏览器是 Chrome 或 Edge 的机器上，第 3 步的自动读取会失败。
+「退出登录」只删除本程序保存的 `secrets/<平台>_cookies.txt`，浏览器完全不受影响。
 
-程序会**在你点登录之前**就检测到这一点（只读浏览器的 `Local State` 标记，不接触 Cookie 数据库），并在登录窗口顶部直接说明；万一仍然尝试失败，也不会静默失败——它会明确告诉你原因（加密 / 浏览器占用 / 未安装）、列出尝试过的每个浏览器及各自结果，并引导你使用**「手动填写会话」**：
+### Chrome / Edge：App-Bound Encryption 与登录助手扩展
 
-> 在已登录的浏览器中按 `F12` → `Application`（应用）→ `Cookies` → 该平台域名 → 复制 `SESSDATA`（B 站）或 `sessionid`（Instagram）粘贴进来。程序会**先向平台校验**，通过后才写入 `secrets/`。
+**Chrome / Edge 127 及以上**用 App-Bound Encryption（v20）加密 Cookie，密钥由浏览器自身保护，**任何外部程序都无法解密**——这不是本程序的缺陷，也不打算通过破解、注入或提取主密钥来绕过。
 
-希望全自动的话，把登录用的浏览器换成 **Firefox** 即可（Firefox 的 Cookie 不加密，yt-dlp 可以直接读取）。
+Chrome 官方为此提供的接口是扩展的 **`chrome.cookies` API**：由浏览器自己完成解密。所以本程序带一个可选的登录助手扩展：
+
+```
+Chrome 扩展 (chrome.cookies)
+        │  Chrome 自己解密
+        ▼
+Native Messaging ──（被系统拒绝时）──▶ 本机回环 127.0.0.1:8765
+        ▼
+VideoDownloaderNativeHost.exe → secrets/<平台>_cookies.txt → 现有下载链路
+```
+
+一次性安装步骤（GUI 里点「Chrome 登录助手 → 安装 / 更新登录助手」会带你走完）：
+
+1. 程序把宿主程序登记到 `HKCU\Software\Google\Chrome\NativeMessagingHosts`（**当前用户**，不需要管理员权限）；
+2. 程序打开 `chrome://extensions`，对话框里的「打开扩展文件夹」会定位到扩展目录；
+3. 你打开右上角的「开发者模式」，点「加载已解压的扩展程序」，选择该文件夹；
+4. 登录平台后点浏览器工具栏上的扩展图标 → 选平台 → 「发送到 Video Downloader」；
+5. 回到软件点「我已登录，检测会话」。
+
+安装包自带宿主程序（`native_host\VideoDownloaderNativeHost\`）与扩展文件夹（`chrome-extension\`）。注册表项**只由程序在运行时写入当前用户**——安装程序本身不写，否则提权后可能写进管理员账户的注册表；卸载时会把 `Chrome`、`Edge`、`Chromium`、`Brave` 四处属于本程序的键和 `%LOCALAPPDATA%\VideoDownloader\native_host\` 一并清理，其他扩展的注册项一律不动。升级安装时旧版卸载程序可能清掉注册项，打开「Chrome 登录助手」对话框会自动重新登记。
+
+扩展的权限被压到最小：只申请 `cookies`、`nativeMessaging`、`activeTab`，并且 `host_permissions` **只包含 `bilibili.com`、`instagram.com` 与 `http://127.0.0.1/*`**——其他网站的 Cookie 它连读都读不到（这是 Chrome 强制的，不是本程序的自觉）。Cookie 只在本机进程之间传递，不会上传到任何服务器。
+
+#### 两条本机通道
+
+扩展会**先试 native messaging**，失败时才退回本机回环：
+
+| | Native Messaging（首选） | 本机回环（回退） |
+| --- | --- | --- |
+| 何时使用 | 默认 | Chrome 无法启动 native 宿主时（部分受管控的 Windows 会拒绝把管道交给子进程；此时扩展会收到 `Error when communicating with the native messaging host`） |
+| 监听端口 | 无 | `127.0.0.1:8765`，**仅在登录窗口打开期间** |
+| 准入 | Chrome 按扩展 ID 校验 `allowed_origins` | 校验请求的 `Origin` 必须正是本扩展；预检对其他来源一律拒绝 |
+| 校验 | 与回环走**同一个** `store_cookies` 闸门 | 同左 |
+
+两条通道都不接受来自浏览器以外的来源，也都不写入平台域名之外的 Cookie。
+
+> 为什么宿主必须是可执行文件：Chrome 用 `CreateProcess` 启动 native messaging 宿主，`.bat` 会在运行前就被拒绝，错误信息是 `Error when communicating with the native messaging host`，而宿主自己的日志里什么都不会有。源码目录请先运行 `packaging\build-native-host.ps1` 生成 `native_host\VideoDownloaderNativeHost\`；安装包会自带它。
+
+### 备选：用独立 Chrome 自动获取（无需扩展）
+
+如果不想安装任何扩展，登录窗口里还有一个「备选」分组：程序用它**自己的独立 Chrome 配置**（`chrome_profile_dir`，与本程序数据放在一起）打开登录页，通过 DevTools 协议让 Chrome 解密后取回会话。
+
+- 这个配置与你日常使用的浏览器配置**完全分开**，程序不会去读它；
+- 因为 Chrome 136 起禁止在默认配置上开启调试端口，所以必须用独立配置——代价是**首次需要在那个窗口里登录一次**，之后会保留；
+- 调试端口只绑定 `127.0.0.1`。
+
+### 已知限制
+
+默认浏览器是 Chrome / Edge 时，上面的**第 1 条路（直接读取）一定会失败**，程序会在你点登录之前就检测到（只读浏览器的 `Local State` 标记，不接触 Cookie 数据库），并在窗口顶部直接给出可用的替代方案，而不是让你白跑一趟。
 
 > `.env` 中已有的 `BILIBILI_COOKIEFILE` / `YTDLP_COOKIEFILE` / `YTDLP_COOKIES_FROM_BROWSER` 配置**仍然有效**；优先级为 `BILIBILI_COOKIE` / `BILIBILI_SESSDATA` > 本窗口保存的会话 > 上述 `.env` 文件路径。
 
@@ -369,6 +421,8 @@ docker compose run --rm video-downloader "https://www.bilibili.com/video/BV1GJ41
 | `DATABASE_PATH` | `downloads/downloads.db` | SQLite 历史数据库路径 |
 | `LOG_DIR` | `logs` | 日志目录 |
 | `SESSION_DIR` | `secrets` | 账号登录保存的会话目录，每个平台一个 `cookies.txt` |
+| `NATIVE_HOST_DIR` | `native_host` | Chrome 登录助手的 native messaging 清单与宿主程序所在目录（由「安装登录助手」生成，已 git-ignore） |
+| `CHROME_PROFILE_DIR` | `chrome-profile` | 备选方案使用的独立 Chrome 配置，与你的日常配置完全分开 |
 | `DIR_TEMPLATE` | `{platform}/{author}/{date}` | 输出目录模板，支持 `{platform}` `{author}` `{date}` `{year}` `{month}` `{day}` |
 | `MAX_FILENAME_LENGTH` | `120` | 文件名主干最大长度 |
 | `SKIP_EXISTING` | `true` | 命中记录且文件存在时跳过 |
@@ -499,7 +553,9 @@ uv run mypy .          # 类型检查
 .\packaging\build.ps1 -Console false
 ```
 
-产物在 `dist\VideoDownloader\`，采用 **onedir**：exe 旁边放 `.env.example`、`README-FIRST.txt`、`tools\ffmpeg\bin\`。**`.env` 与 `secrets\` 由用户自己创建，绝不进包**（构建脚本会在复制完成后扫描整个 dist，发现真实凭据值、`secrets/`、`.env`、数据库或日志文件即直接失败）。
+产物在 `dist\VideoDownloader\`，采用 **onedir**：exe 旁边放 `.env.example`、`README-FIRST.txt`、`tools\ffmpeg\bin\`，以及 Chrome 登录助手的两件东西 —— `chrome-extension\`（用户手动加载的扩展）与 `native_host\VideoDownloaderNativeHost\`（由 `packaging\build-native-host.ps1` 单独构建的 native messaging 宿主）。**`.env` 与 `secrets\` 由用户自己创建，绝不进包**（构建脚本会在复制完成后扫描整个 dist，发现真实凭据值、`secrets/`、`.env`、数据库或日志文件即直接失败）。
+
+> 登录助手的宿主位置由程序在安装时决定：应用目录可写时（便携版、源码目录）就用 `dist\VideoDownloader\native_host\`；安装在 `C:\Program Files` 下时，`install_bridge()` 会把整个 `--onedir` 目录复制到 `%LOCALAPPDATA%\VideoDownloader\native_host\`，因为 native messaging 清单指向的路径必须是当前用户能执行、且宿主能写入自己 `host-config.json` 的地方。两种情况下清单里的 `path` 都指向真实存在的宿主。
 
 打包后的自检（GUI 无法用脚本点按钮，因此提供 `--self-test` 走同一条下载链路）：
 
@@ -517,8 +573,8 @@ uv run mypy .          # 类型检查
 
 | 工作流 | 触发条件 | 作用 |
 | --- | --- | --- |
-| [`ci.yml`](.github/workflows/ci.yml) | Pull Request、push 到 `main` | Windows + Python 3.12，按 `uv.lock` 安装锁定依赖，执行 `pytest`、`ruff`、`mypy` 与敏感信息扫描 |
-| [`build.yml`](.github/workflows/build.yml) | 手动触发，或被 `release.yml` 调用 | 复用 `packaging/build.ps1` 做 PyInstaller 构建 → 复用 `packaging/build-installer.ps1` 生成 Inno Setup 安装包 → 生成 Portable ZIP → 生成 SHA-256 |
+| [`ci.yml`](.github/workflows/ci.yml) | Pull Request、push 到 `main` | Windows + Python 3.12，按 `uv.lock` 安装锁定依赖，执行 `pytest`、`ruff`、`mypy`、登录助手扩展的 Node 测试与敏感信息扫描 |
+| [`build.yml`](.github/workflows/build.yml) | 手动触发，或被 `release.yml` 调用 | 复用 `packaging/build.ps1` 做 PyInstaller 构建（含 native messaging 宿主）→ 校验登录助手确实在包里 → 复用 `packaging/build-installer.ps1` 生成 Inno Setup 安装包 → 生成 Portable ZIP → 生成 SHA-256 |
 | [`release.yml`](.github/workflows/release.yml) | 推送 `v*` Tag | 版本号一致性闸门 → 调用 `ci.yml` → 调用 `build.yml` → 创建 GitHub Release 并上传两个安装包 |
 
 发布一个新版本，只需三步：

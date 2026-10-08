@@ -6,10 +6,13 @@ Three independent checks run against ``dist/VideoDownloader``:
 2. **Value based** - the real values from the developer's ``.env`` and
    ``secrets/cookies.txt`` must not appear in any file, at any offset.
 3. **Keyword** - cookie *names* such as ``sessionid``/``SESSDATA``/``csrftoken``.
-   These are only a hard failure **outside** the bundled third-party payload
+   These are only a hard failure **outside** the bundled payloads
    (``_internal/`` holds yt-dlp and Qt; ``tools/`` holds ffmpeg, whose HTTP
-   stack references those names too) and outside ``.env.example``, whose
-   sensitive-looking lines are empty placeholders.
+   stack references those names too; ``native_host/`` is the compiled native
+   messaging host, another PyInstaller bundle; ``chrome-extension/`` is the
+   extension, which has to name the cookies it is allowed to read) and outside
+   ``.env.example``, whose sensitive-looking lines are empty placeholders.
+   The *value* check below applies everywhere, including those folders.
 
 Credential *values* are only taken from keys whose name marks them as secrets
 (``*_KEY``/``*_TOKEN``/``*_COOKIE``/``*SESSDATA``/``*SECRET``/``*PASSWORD*``),
@@ -48,8 +51,18 @@ COOKIE_FILE_MARKER: bytes = b"Netscape HTTP Cookie File"
 
 #: Third-party payload. Keyword hits here are informational only.
 #: ``tools/`` is listed because the bundled ffmpeg/ffprobe binaries contain
-#: cookie-related strings in their own HTTP implementation.
-INFORMATIONAL_PREFIXES: tuple[str, ...] = ("_internal", "tools")
+#: cookie-related strings in their own HTTP implementation. ``native_host/`` is
+#: the compiled native messaging host - a PyInstaller ``--onedir`` bundle of its
+#: own, with the same ``_internal/`` payload (yt-dlp's cookie jar included) as
+#: the main build, so it is third-party code by the same argument.
+INFORMATIONAL_PREFIXES: tuple[str, ...] = ("_internal", "tools", "native_host")
+
+#: First-level folders whose files are allowed to *name* the cookies they handle.
+#: The bundled Chrome extension has to declare ``SESSDATA`` / ``sessionid`` /
+#: ``csrftoken`` to do its job at all, so a keyword hit there is expected. This
+#: only relaxes the *keyword* rule: the value-based check still applies, which
+#: is the one that actually guards credentials.
+KEYWORD_EXEMPT_PREFIXES: tuple[str, ...] = ("chrome-extension",)
 
 #: Shipped template: every sensitive-looking line is an empty placeholder.
 #: A real value here would still be caught by the value check.
@@ -205,11 +218,13 @@ def scan_for_keywords(
     """Split keyword hits into (hard failures, informational hits).
 
     A hit inside the bundled third-party payload is expected - yt-dlp source
-    refers to cookie names - so it is reported but does not fail the build.
+    refers to cookie names, and so does the shipped extension - so it is
+    reported but does not fail the build.
     """
 
     hard: list[tuple[Path, list[bytes]]] = []
     soft: list[tuple[Path, list[bytes]]] = []
+    exempt = INFORMATIONAL_PREFIXES + KEYWORD_EXEMPT_PREFIXES
     for path in sorted(dist.rglob("*")):
         if not path.is_file():
             continue
@@ -219,7 +234,7 @@ def scan_for_keywords(
         relative = path.relative_to(dist)
         if path.name in KEYWORD_EXEMPT_FILENAMES:
             continue
-        if relative.parts and relative.parts[0] in INFORMATIONAL_PREFIXES:
+        if relative.parts and relative.parts[0] in exempt:
             soft.append((relative, hits))
         else:
             hard.append((relative, hits))
@@ -252,7 +267,7 @@ def build_report(dist: Path, project_root: Path) -> tuple[list[str], list[str]]:
         names = ", ".join(hit.decode("utf-8", "replace") for hit in hits)
         failures.append(f"敏感关键字出现在非第三方文件: {relative} ({names})")
     if soft:
-        notes.append(f"{len(soft)} 个第三方文件包含 Cookie 名称字符串（yt-dlp 源码引用，非凭据）")
+        notes.append(f"{len(soft)} 个随包文件包含 Cookie 名称字符串（扩展 / yt-dlp 引用，非凭据）")
     if not soft:
         notes.append("未在第三方载荷中发现 Cookie 名称字符串")
 

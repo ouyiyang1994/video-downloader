@@ -1,6 +1,6 @@
 [project]
 name = "video-downloader"
-version = "1.03"
+version = "1.04"
 description = "Multi-platform public video downloader (YouTube / Instagram / Bilibili)"
 readme = "README.md"
 requires-python = ">=3.12"

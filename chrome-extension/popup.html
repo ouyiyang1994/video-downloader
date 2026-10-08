@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>Video Downloader 登录助手</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <h1>Video Downloader 登录助手</h1>
+    <p class="lede">
+      把你在 Chrome 里已经完成的登录会话交给本机的 Video Downloader。 Cookie 只在本机进程之间传递，
+      <strong>不会上传到任何服务器</strong>。
+    </p>
+
+    <div class="row" id="platform-row">
+      <label><input type="radio" name="platform" value="bilibili" /> 哔哩哔哩</label>
+      <label><input type="radio" name="platform" value="instagram" /> Instagram</label>
+    </div>
+
+    <div class="buttons">
+      <button id="send" class="primary">发送到 Video Downloader</button>
+      <button id="test" class="ghost">测试与本程序的连接</button>
+    </div>
+
+    <p id="status" class="status"></p>
+
+    <details>
+      <summary>它是怎么工作的？</summary>
+      <ul>
+        <li>Chrome 自己解密 Cookie 并交给本机程序，扩展不接触加密密钥。</li>
+        <li>只读取哔哩哔哩 / Instagram 两个域名，其他网站的 Cookie 看不到。</li>
+        <li>不会修改或删除浏览器里的任何 Cookie。</li>
+        <li>退出登录只会删除 Video Downloader 自己保存的会话文件。</li>
+      </ul>
+    </details>
+
+    <script src="logic.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -18,6 +18,12 @@ secrets/
 cookies.txt
 *_cookies.txt
 
+# Generated Chrome bridge files: the native messaging launcher and manifest are
+# rewritten by 「安装登录助手」 on every machine, and the profile belongs to this
+# installation only. Neither may ever be committed.
+native_host/
+chrome-profile/
+
 # ============================================================================
 #  User data  —  downloads, database, logs
 # ============================================================================

@@ -152,9 +152,37 @@ jobs:
       # ------------------------------------------------------------------
       # Build.  Both scripts are the ones that produced 1.02; they already run
       # the secret scan over dist\ and refuse to continue when it fails.
+      # build.ps1 also builds the Chrome login helper: the native messaging
+      # host (packaging/build-native-host.ps1 -> dist/VideoDownloader/
+      # native_host/) and the unpacked extension (chrome-extension/).
       # ------------------------------------------------------------------
       - name: Build with PyInstaller
         run: ./packaging/build.ps1 -Console false -SkipTests
+
+      - name: Verify the login helper is in the bundle
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The native messaging manifest points at the host by path, and the
+          # user loads the extension from this folder, so a release missing
+          # either of them ships a sign-in flow that cannot work.
+          $required = @(
+            'dist/VideoDownloader/VideoDownloader.exe',
+            'dist/VideoDownloader/chrome-extension/manifest.json',
+            'dist/VideoDownloader/chrome-extension/logic.js',
+            'dist/VideoDownloader/native_host/VideoDownloaderNativeHost/VideoDownloaderNativeHost.exe'
+          )
+          foreach ($item in $required) {
+            if (-not (Test-Path -LiteralPath $item)) { throw "缺少 $item" }
+            Write-Host "OK  $item"
+          }
+          # The host is a console program - native messaging needs a working
+          # stdin/stdout - and it must be able to start on its own. Its
+          # self-test writes a probe file into the session directory, so point
+          # that at the runner's temp folder: leaving a `secrets/` behind in
+          # dist would (correctly) fail the packaging scan further down.
+          $env:VIDEO_DOWNLOADER_SESSION_DIR = Join-Path $env:RUNNER_TEMP 'vd-host-selftest'
+          & 'dist/VideoDownloader/native_host/VideoDownloaderNativeHost/VideoDownloaderNativeHost.exe' --selftest
+          if ($LASTEXITCODE -ne 0) { throw '宿主程序自检失败' }
 
       - name: Install Inno Setup
         run: |
@@ -228,10 +256,21 @@ jobs:
               'VideoDownloader/VideoDownloader.exe',
               'VideoDownloader/.env.example',
               'VideoDownloader/tools/ffmpeg/bin/ffmpeg.exe',
-              'VideoDownloader/tools/ffmpeg/bin/ffprobe.exe'
+              'VideoDownloader/tools/ffmpeg/bin/ffprobe.exe',
+              # The sign-in helper: the extension the user loads unpacked, and
+              # the host the native messaging manifest points at.
+              'VideoDownloader/chrome-extension/manifest.json',
+              'VideoDownloader/chrome-extension/logic.js',
+              'VideoDownloader/native_host/VideoDownloaderNativeHost/VideoDownloaderNativeHost.exe'
             )
             foreach ($entry in $required) {
               if ($names -notcontains $entry) { throw "Portable 包中缺少 $entry" }
+            }
+            # Only the runtime half of the extension belongs in a release.
+            $stray = $names | Where-Object { $_ -match '(^|/)(logic\.test\.js|make_icons\.py)$' }
+            if ($stray) {
+              $stray | ForEach-Object { Write-Host "多余文件: $_" }
+              throw 'Portable 包混入了扩展的开发文件'
             }
             Write-Host "Portable 包共 $($names.Count) 个条目，结构校验通过"
           }

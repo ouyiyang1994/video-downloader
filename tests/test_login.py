@@ -702,9 +702,15 @@ def test_outlook_prefers_firefox_when_the_default_is_blocked(
     assert "手动填写会话" in advice
 
 
-def test_outlook_falls_back_to_manual_when_only_chromium_exists(
+def test_outlook_offers_the_chrome_helper_when_only_chromium_exists(
     browsers: FakeBrowsers,
 ) -> None:
+    """Requirement: App-Bound Encryption must not read as "cannot sign in".
+
+    The extension is the route Chrome itself provides, so it leads - and manual
+    entry stays available as the last resort.
+    """
+
     browsers.add("chrome", app_bound=True)
     browsers.add("edge", app_bound=True)
     browsers.use_as_default("chrome")
@@ -714,8 +720,9 @@ def test_outlook_falls_back_to_manual_when_only_chromium_exists(
     assert outlook.possible is False
     advice = outlook.advice()
     assert "App-Bound Encryption" in advice
+    assert "Chrome 登录助手" in advice
     assert "手动填写会话" in advice
-    assert "安装 Firefox" in advice
+    assert advice.index("Chrome 登录助手") < advice.index("手动填写会话")
 
 
 def test_outlook_with_no_browser_at_all(browsers: FakeBrowsers) -> None:
@@ -726,10 +733,11 @@ def test_outlook_with_no_browser_at_all(browsers: FakeBrowsers) -> None:
     assert "未检测到任何已安装的浏览器" in outlook.advice()
 
 
-def test_app_bound_message_leads_with_firefox() -> None:
+def test_app_bound_message_leads_with_the_extension_then_firefox() -> None:
     message, hint = browser_cookies.failure_message("chrome", BrowserFailure.ENCRYPTED)
     assert "App-Bound" in message
-    assert hint.index("Firefox") < hint.index("手动填写会话"), "Firefox 必须是首选方案"
+    assert hint.index("Chrome 登录助手") < hint.index("Firefox"), "扩展必须是首选方案"
+    assert hint.index("Firefox") < hint.index("手动填写会话"), "Firefox 优先于手动填写"
 
 
 def test_extraction_reports_encryption_when_the_marker_says_so(

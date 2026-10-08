@@ -20,6 +20,8 @@ extracting it next to itself never scatters files into the current directory:
       .env.example
       README-FIRST.txt
       tools/ffmpeg/bin/{ffmpeg,ffprobe}.exe
+      chrome-extension/            (登录助手扩展，用户手动加载)
+      native_host/VideoDownloaderNativeHost/   (native messaging 宿主)
       _internal/...
 
 Credentials, cookies, databases and logs are rejected outright rather than
@@ -61,6 +63,27 @@ FORBIDDEN_NAMES: frozenset[str] = frozenset({".env", "cookies.txt"})
 FORBIDDEN_DIRNAMES: frozenset[str] = frozenset({"secrets", "downloads", "logs"})
 FORBIDDEN_SUFFIXES: frozenset[str] = frozenset(
     {".db", ".db-wal", ".db-shm", ".db-journal", ".sqlite", ".sqlite3", ".log", ".part"}
+)
+
+#: Files that only exist to develop the extension. ``build.ps1`` leaves them out
+#: of ``dist/VideoDownloader/chrome-extension``; if one turns up here, the
+#: staging step did not do its job.
+DEV_ONLY_EXTENSION_FILES: frozenset[str] = frozenset({"logic.test.js", "make_icons.py"})
+
+#: Entries every release must contain. The sign-in helper is not optional: the
+#: native messaging manifest points at the host by path, and the user loads the
+#: extension from this very folder, so an archive without them ships a sign-in
+#: flow that cannot work. ``build.ps1`` produces exactly these.
+REQUIRED_ENTRIES: frozenset[str] = frozenset(
+    {
+        f"{ARCHIVE_ROOT}/VideoDownloader.exe",
+        f"{ARCHIVE_ROOT}/.env.example",
+        f"{ARCHIVE_ROOT}/tools/ffmpeg/bin/ffmpeg.exe",
+        f"{ARCHIVE_ROOT}/tools/ffmpeg/bin/ffprobe.exe",
+        f"{ARCHIVE_ROOT}/chrome-extension/manifest.json",
+        f"{ARCHIVE_ROOT}/chrome-extension/logic.js",
+        f"{ARCHIVE_ROOT}/native_host/VideoDownloaderNativeHost/VideoDownloaderNativeHost.exe",
+    }
 )
 
 #: Deflate level.  6 is the usual sweet spot for a ~190 MB payload.
@@ -118,12 +141,7 @@ def build(source: Path, output: Path) -> tuple[int, int]:
 def verify(output: Path) -> int:
     """Re-open the archive and confirm the layout survived the round trip."""
 
-    required = {
-        f"{ARCHIVE_ROOT}/VideoDownloader.exe",
-        f"{ARCHIVE_ROOT}/.env.example",
-        f"{ARCHIVE_ROOT}/tools/ffmpeg/bin/ffmpeg.exe",
-        f"{ARCHIVE_ROOT}/tools/ffmpeg/bin/ffprobe.exe",
-    }
+    required = set(REQUIRED_ENTRIES)
     with zipfile.ZipFile(output) as archive:
         names = archive.namelist()
         bad = archive.testzip()
@@ -135,6 +153,10 @@ def verify(output: Path) -> int:
         wrong_separator = [name for name in names if "\\" in name]
         if wrong_separator:
             raise SystemExit(f"[失败] 归档条目使用了反斜杠分隔符: {wrong_separator[0]}")
+        # Development-only files that live beside the extension sources.
+        stray = [name for name in names if Path(name).name in DEV_ONLY_EXTENSION_FILES]
+        if stray:
+            raise SystemExit(f"[失败] 归档混入了扩展的开发文件: {', '.join(sorted(stray))}")
         tops = {name.split("/", 1)[0] for name in names}
         if tops != {ARCHIVE_ROOT}:
             raise SystemExit(f"[失败] 归档顶层目录应为 {ARCHIVE_ROOT}，实际为 {sorted(tops)}")

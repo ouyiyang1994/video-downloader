@@ -62,6 +62,24 @@ Write-Host "  $Iscc"
 
 Write-Step '2/6 检查待打包目录'
 if (-not (Test-Path $AppDir)) { throw "缺少 $AppDir，请先运行 build.ps1" }
+
+# installer.iss 用 recursesubdirs 把整个目录搬进 {app}，所以这里只确认
+# 「必须存在」的东西真的在：少了宿主程序或扩展，装出来的登录助手是坏的，
+# 而那种问题要到用户机器上才会暴露。
+$required = @(
+    'VideoDownloader.exe',
+    '.env.example',
+    'chrome-extension\manifest.json',
+    'chrome-extension\logic.js',
+    'native_host\VideoDownloaderNativeHost\VideoDownloaderNativeHost.exe'
+)
+foreach ($item in $required) {
+    if (-not (Test-Path -LiteralPath (Join-Path $AppDir $item))) {
+        throw "待打包目录缺少 $item —— 请重新运行 build.ps1（它会构建 Chrome 登录助手）"
+    }
+}
+Write-Host "  必需文件齐备（含 Chrome 登录助手扩展与宿主）"
+
 $files = Get-ChildItem -LiteralPath $AppDir -Recurse -File
 $sizeMb = [math]::Round((($files | Measure-Object -Property Length -Sum).Sum) / 1MB, 1)
 Write-Host ("  {0} 个文件, {1} MB" -f $files.Count, $sizeMb)

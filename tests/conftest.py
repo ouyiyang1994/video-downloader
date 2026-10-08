@@ -28,6 +28,10 @@ def settings(tmp_path: Path) -> Settings:
         # Keep the sign-in flow's session files inside tmp_path: a test must
         # never read or overwrite the developer's real secrets/ folder.
         session_dir=tmp_path / "secrets",
+        # Same reasoning for everything the Chrome bridge generates and for the
+        # profile the DevTools fallback would launch.
+        native_host_dir=tmp_path / "native_host",
+        chrome_profile_dir=tmp_path / "chrome-profile",
         max_retries=2,
         request_timeout=5.0,
     )

@@ -69,13 +69,39 @@ from config.settings import (
 from core.browser_cookies import (
     automatic_read_outlook,
     browser_label,
+    default_browser,
     extract_session,
+    is_chromium_based,
+)
+from core.chrome_bridge import (
+    BridgeStatus,
+    bridge_status,
+    install_bridge,
+    install_hint,
+    open_directory,
+    open_extensions_page,
+    repair_registration,
+    uninstall_bridge,
+    verify_host,
+)
+from core.chrome_bridge import (
+    extension_dir as chrome_extension_dir,
+)
+from core.chrome_cdp import (
+    fetch_cookies as cdp_fetch_cookies,
+)
+from core.chrome_cdp import (
+    shared_session as cdp_session,
+)
+from core.chrome_cdp import (
+    store as cdp_store,
 )
 from core.database import DownloadDatabase
 from core.downloader import ProgressUpdate
 from core.exceptions import (
     AuthRequiredError,
     BrowserCookieError,
+    ChromeBridgeError,
     CookieAccessError,
     DatabaseError,
     DownloadCancelled,
@@ -91,6 +117,7 @@ from core.exceptions import (
 )
 from core.http import build_client, check_proxy
 from core.interfaces import PlatformAdapter
+from core.local_bridge import LocalBridge
 from core.logging_setup import setup_logging
 from core.login import (
     LoginState,
@@ -128,6 +155,20 @@ PASTE_BUTTON_TEXT = "保存并验证"
 PASTE_BUSY_TEXT = "验证中…"
 LOGIN_BUSY_TEXT = "检测中…"
 
+#: Chrome extension helper.
+CHROME_HELPER_TITLE = "Chrome 登录助手"
+CHROME_HELPER_BUTTON_TEXT = "安装 / 更新登录助手"
+CHROME_HELPER_BUSY_TEXT = "正在安装…"
+CHROME_OPEN_PAGE_TEXT = "打开扩展安装页"
+CHROME_OPEN_FOLDER_TEXT = "打开扩展文件夹"
+CHROME_CHECK_TEXT = "检查安装状态"
+CHROME_UNINSTALL_TEXT = "卸载登录助手"
+
+#: DevTools-protocol fallback, for a user who would rather not install anything.
+CDP_LAUNCH_TEXT = "1. 打开独立 Chrome"
+CDP_FETCH_TEXT = "2. 我已登录，自动获取"
+CDP_CLOSE_TEXT = "关闭该 Chrome"
+
 #: Quality preset -> Chinese label shown in the combo box.
 QUALITY_LABELS: dict[str, str] = {
     "best": "最佳",
@@ -156,6 +197,41 @@ HISTORY_COLUMNS = ("平台", "标题", "作者", "画质", "下载时间", "状�
 
 
 # --- pure helpers (no Qt objects, directly unit-testable) -------------------
+
+
+def _chrome_installed() -> bool:
+    """True when Google Chrome is present, i.e. the CDP fallback can work."""
+
+    from core.chrome_bridge import browser_executable
+
+    return browser_executable("chrome") is not None
+
+
+def _safe_bridge_status(settings: Settings) -> BridgeStatus | None:
+    """``bridge_status`` that never raises into the GUI."""
+
+    try:
+        return bridge_status(settings)
+    except ChromeBridgeError:
+        logger.exception("读取登录助手状态失败")
+        return None
+
+
+def _safe_repair_registration(settings: Settings) -> None:
+    """Restore a registration an upgrade's uninstaller removed.
+
+    Inno Setup uninstalls the previous version before installing the new one,
+    and that uninstaller deletes the ``HKCU`` keys the helper registered. The
+    manifest and the host are in the data root, which the installer never
+    touches, so the registration can simply be re-pointed. It is done when the
+    helper dialog opens, and it only ever touches an installation that already
+    exists - a machine that never installed the helper is left alone.
+    """
+
+    try:
+        repair_registration(settings)
+    except Exception:  # noqa: BLE001 - a repair must never break the dialog
+        logger.exception("修复登录助手注册失败")
 
 
 def detect_platform(url: str, registry: PlatformRegistry | None) -> tuple[Platform | None, str]:
@@ -288,10 +364,15 @@ def friendly_error(
     if isinstance(exc, CookieAccessError):
         text = str(exc)
         if "解密" in text or "App-Bound" in text:
-            return "浏览器 Cookie 无法解密，请在「账号登录」里登录或手动填写会话"
+            return (
+                "浏览器 Cookie 无法直接解密，请用「账号登录」里的 Chrome 登录助手扩展，"
+                "或改用 Firefox / 手动填写会话"
+            )
         if "未找到" in text:
             return "未找到 Cookie 文件，请在「账号登录」里重新登录"
         return "Cookie 读取失败，请在「账号登录」里重新登录"
+    if isinstance(exc, ChromeBridgeError):
+        return exc.message
     if isinstance(exc, AuthRequiredError):
         name = platform.display_name if platform is not None else "该平台"
         if session_present:
@@ -462,6 +543,20 @@ class LoginAction(StrEnum):
     ACQUIRE = "acquire"
     #: Validate a session value the user pasted, then store it.
     PASTE = "paste"
+    #: Start Chrome on this application's own profile with debugging enabled.
+    CDP_LAUNCH = "cdp_launch"
+    #: Read the session out of that Chrome through the DevTools protocol.
+    CDP_FETCH = "cdp_fetch"
+
+
+#: What each sign-in step says while it runs, so the status line never lies.
+_BUSY_TEXT: dict[LoginAction, str] = {
+    LoginAction.ACQUIRE: "正在从浏览器读取会话并向平台校验…",
+    LoginAction.PASTE: "正在向平台校验你填写的会话…",
+    LoginAction.STATUS: "正在向平台确认登录状态…",
+    LoginAction.CDP_LAUNCH: "正在启动独立 Chrome…",
+    LoginAction.CDP_FETCH: "正在从独立 Chrome 读取会话…",
+}
 
 
 class LoginWorker(QThread):
@@ -518,6 +613,10 @@ class LoginWorker(QThread):
             return await self._acquire()
         if self.action is LoginAction.PASTE:
             return await self._save_pasted()
+        if self.action is LoginAction.CDP_LAUNCH:
+            return self._cdp_launch()
+        if self.action is LoginAction.CDP_FETCH:
+            return await self._cdp_fetch()
         raise ValueError(f"未知的登录动作：{self.action}")
 
     async def _check(self, header: str | None) -> SessionStatus:
@@ -569,6 +668,66 @@ class LoginWorker(QThread):
         logger.info("已保存手动填写的 %s 登录会话", self.adapter.platform.value)
         return status
 
+    def _cdp_launch(self) -> SessionStatus:
+        """Start Chrome on this application's own profile, at the login page.
+
+        Blocking (Chrome has to boot), which is why it runs inside the worker.
+        The instance is owned by :data:`core.chrome_cdp.shared_session` so it
+        survives this thread and can be reused by the next step.
+        """
+
+        url = self.adapter.login_url or "about:blank"
+        instance = cdp_session().ensure(self.settings, url=url)
+        logger.info("备选方案：已在独立配置中启动 Chrome（端口 %d）", instance.port)
+        return SessionStatus(
+            platform=self.adapter.platform,
+            state=LoginState.UNKNOWN,
+            detail=(
+                f"已打开独立 Chrome（配置目录：{instance.profile_dir.name}）。"
+                f"请在该窗口里登录 {self.adapter.display_name}，"
+                "然后回到本窗口点「2. 我已登录，自动获取」。"
+            ),
+        )
+
+    async def _cdp_fetch(self) -> SessionStatus:
+        """Read the session out of the debugging Chrome and store it.
+
+        Chrome decrypts the cookies itself, so App-Bound Encryption is not in
+        the way. The result goes through exactly the same validation the native
+        messaging host applies, then the platform is asked to confirm it.
+        """
+
+        instance = cdp_session().instance
+        if instance is None:
+            raise ChromeBridgeError(
+                "独立 Chrome 没有在运行",
+                detail="请先点「1. 打开独立 Chrome」，并在该窗口中完成登录。",
+            )
+
+        cookies = cdp_fetch_cookies(instance, self.adapter.session_domain)
+        result = cdp_store(self.settings, self.adapter.platform.value, cookies)
+        if not result.get("ok"):
+            raise SessionValueError(
+                "没有从独立 Chrome 取到可用的会话",
+                detail=str(result.get("error") or "请确认已经在该窗口中登录，然后重试。"),
+            )
+        logger.info("已从独立 Chrome 保存 %s 的登录会话", self.adapter.platform.value)
+
+        # The session has to exist on disk before it can be checked, so undo the
+        # write when the platform turns out to reject it - persisting a session
+        # that does not authenticate would leave the UI claiming a login that
+        # is not there.
+        self.adapter.reload_session()
+        status = await self._check(self.adapter.session_cookie_header())
+        if status.state in (LoginState.EXPIRED, LoginState.LOGGED_OUT):
+            delete_session(self.settings, self.adapter.platform)
+            self.adapter.reload_session()
+            raise SessionValueError(
+                "平台判定该会话未登录（来源：独立 Chrome）",
+                detail=status.detail or "请确认已经在该窗口中登录，然后重试。",
+            )
+        return status
+
     @staticmethod
     def _reject_only_when_the_platform_says_no(status: SessionStatus, *, source: str) -> None:
         """Refuse a session the platform explicitly rejected - and only then.
@@ -584,6 +743,270 @@ class LoginWorker(QThread):
                 f"平台判定该会话未登录（来源：{source}）",
                 detail=status.detail or "请确认已经登录，然后重试。",
             )
+
+
+class ChromeBridgeWorker(QThread):
+    """Installs, verifies or removes the native messaging bridge.
+
+    Touches the registry and spawns a probe process, so it must not run on the
+    GUI thread.
+    """
+
+    done = Signal(object)  # dict with keys: ok, message, detail, status
+
+    def __init__(
+        self,
+        settings: Settings,
+        action: str,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.settings = settings
+        self.action = action
+
+    def run(self) -> None:
+        try:
+            self.done.emit(self._run())
+        except ChromeBridgeError as exc:
+            self.done.emit(
+                {"ok": False, "message": exc.message, "detail": exc.detail or "", "status": None}
+            )
+        except Exception as exc:  # noqa: BLE001 - last line of defence
+            logger.exception("登录助手操作失败")
+            self.done.emit(
+                {
+                    "ok": False,
+                    "message": "操作失败，详情见 logs/downloader.log",
+                    "detail": type(exc).__name__,
+                    "status": None,
+                }
+            )
+
+    def _run(self) -> dict[str, object]:
+        if self.action == "install":
+            result = install_bridge(self.settings)
+            ok, detail = verify_host(self.settings)
+            message = "登录助手已安装。" if ok else "登录助手已登记，但宿主程序自检未通过。"
+            return {
+                "ok": ok,
+                "message": message,
+                "detail": "" if ok else detail,
+                "status": result.status,
+                "extension_dir": str(result.extension_dir),
+            }
+        if self.action == "uninstall":
+            removed = uninstall_bridge(self.settings)
+            return {
+                "ok": True,
+                "message": (
+                    "已卸载登录助手（已清理注册表项：" + (", ".join(removed) or "无") + "）"
+                    "。浏览器与已保存的会话都不受影响。"
+                ),
+                "detail": "",
+                "status": _safe_bridge_status(self.settings),
+            }
+        ok, detail = verify_host(self.settings)
+        return {
+            "ok": ok,
+            "message": "宿主程序自检通过。" if ok else "宿主程序自检未通过。",
+            "detail": detail,
+            "status": _safe_bridge_status(self.settings),
+        }
+
+
+class ChromeHelperDialog(QDialog):
+    """The one-time Chrome extension install, made explicit.
+
+    The extension cannot be installed silently - Chrome only loads an unpacked
+    extension when the user asks it to - so this dialog does everything that
+    *can* be automated (registering the native host, opening the right pages)
+    and then states the two clicks that remain.
+    """
+
+    def __init__(self, settings: Settings, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.settings = settings
+        self.worker: ChromeBridgeWorker | None = None
+
+        self.setWindowTitle(CHROME_HELPER_TITLE)
+        self.setMinimumWidth(660)
+        self._build_ui()
+        self._refresh()
+
+    # -- construction -------------------------------------------------------
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        intro = QLabel(
+            "Chrome / Edge 用 App-Bound Encryption 保护 Cookie，外部程序无法解密。"
+            "登录助手扩展让 Chrome 自己解密并把会话交给本程序：\n\n" + install_hint()
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        privacy = QLabel(
+            "扩展只申请 cookies 权限，并且只对 bilibili.com / instagram.com 生效 —— "
+            "其他网站的 Cookie 它连看都看不到。会话只在本机进程之间传递，"
+            "不会上传到任何服务器；本程序也不会修改或删除浏览器里的任何 Cookie。"
+        )
+        privacy.setWordWrap(True)
+        privacy.setStyleSheet("color: #57606a;")
+        layout.addWidget(privacy)
+
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        self.detail_label = QLabel("")
+        self.detail_label.setWordWrap(True)
+        self.detail_label.setStyleSheet("color: #57606a;")
+        layout.addWidget(self.detail_label)
+
+        row = QHBoxLayout()
+        self.install_button = QPushButton(CHROME_HELPER_BUTTON_TEXT)
+        self.install_button.setObjectName("primary")
+        self.install_button.clicked.connect(lambda: self._start("install"))
+        row.addWidget(self.install_button)
+
+        self.page_button = QPushButton(CHROME_OPEN_PAGE_TEXT)
+        self.page_button.clicked.connect(self._open_page)
+        row.addWidget(self.page_button)
+
+        self.folder_button = QPushButton(CHROME_OPEN_FOLDER_TEXT)
+        self.folder_button.clicked.connect(self._open_folder)
+        row.addWidget(self.folder_button)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        row2 = QHBoxLayout()
+        self.check_button = QPushButton(CHROME_CHECK_TEXT)
+        self.check_button.clicked.connect(lambda: self._start("verify"))
+        row2.addWidget(self.check_button)
+
+        self.uninstall_button = QPushButton(CHROME_UNINSTALL_TEXT)
+        self.uninstall_button.clicked.connect(lambda: self._start("uninstall"))
+        row2.addWidget(self.uninstall_button)
+        row2.addStretch(1)
+        layout.addLayout(row2)
+
+        footer = QHBoxLayout()
+        footer.addStretch(1)
+        self.close_button = QPushButton("关闭")
+        self.close_button.clicked.connect(self.accept)
+        footer.addWidget(self.close_button)
+        layout.addLayout(footer)
+
+    # -- rendering ----------------------------------------------------------
+    def _refresh(self) -> None:
+        _safe_repair_registration(self.settings)
+        status = _safe_bridge_status(self.settings)
+        if status is None:
+            self.status_label.setText("无法读取登录助手状态。")
+            self.status_label.setStyleSheet("color: #d1242f;")
+            self.detail_label.setText("")
+            return
+        colour = "#1a7f37" if status.ready else "#9a6700"
+        self.status_label.setStyleSheet(f"color: {colour};")
+        self.status_label.setText(status.summary())
+        self.detail_label.setText(self._describe(status))
+
+    @staticmethod
+    def _describe(status: BridgeStatus) -> str:
+        kind = {"exe": "可执行宿主（Chrome 可用）", "script": "脚本启动器（Chrome 无法启动）"}
+        lines = [
+            f"扩展 ID：{status.extension_id or '（不可用）'}"
+            + (f"（v{status.extension_version}）" if status.extension_version else ""),
+            f"扩展目录：{status.extension_dir or '（缺失）'}",
+            f"宿主清单：{status.expected_manifest}",
+            f"宿主程序：{kind.get(status.launcher_kind, '未找到')}",
+            f"会话目录：{status.session_dir}",
+            "已登记的浏览器：" + (", ".join(status.registered_browsers) or "无"),
+        ]
+        if status.last_delivery is not None:
+            lines.append(f"最近一次收到会话：{format_timestamp(status.last_delivery)}")
+        else:
+            lines.append("最近一次收到会话：尚未收到")
+        lines.append(status.advice())
+        return "\n".join(lines)
+
+    # -- actions ------------------------------------------------------------
+    def _start(self, action: str) -> None:
+        if self.worker is not None and self.worker.isRunning():
+            return
+        self._set_busy(True)
+        worker = ChromeBridgeWorker(self.settings, action, self)
+        worker.done.connect(self._on_done)
+        worker.finished.connect(self._on_finished)
+        self.worker = worker
+        worker.start()
+
+    def _on_done(self, result: dict[str, object]) -> None:
+        ok = bool(result.get("ok"))
+        colour = "#1a7f37" if ok else "#d1242f"
+        self.status_label.setStyleSheet(f"color: {colour};")
+        self.status_label.setText(str(result.get("message") or ""))
+        detail = str(result.get("detail") or "")
+        status = result.get("status")
+        described = self._describe(status) if isinstance(status, BridgeStatus) else ""
+        self.detail_label.setText("\n".join(item for item in (detail, described) if item))
+        if ok and result.get("extension_dir"):
+            # The next step is a file-picker, so make the folder easy to find.
+            self._open_page()
+
+    def _on_finished(self) -> None:
+        self._set_busy(False)
+        self.worker = None
+
+    def _set_busy(self, busy: bool) -> None:
+        for widget in (
+            self.install_button,
+            self.check_button,
+            self.uninstall_button,
+            self.page_button,
+            self.folder_button,
+        ):
+            widget.setEnabled(not busy)
+        self.install_button.setText(CHROME_HELPER_BUSY_TEXT if busy else CHROME_HELPER_BUTTON_TEXT)
+
+    def _open_page(self) -> None:
+        browser = default_browser() or "chrome"
+        if not is_chromium_based(browser):
+            browser = "chrome"
+        if open_extensions_page(browser):
+            self.detail_label.setText(
+                f"已打开 {browser_label(browser)} 的扩展页面："
+                "打开「开发者模式」，点「加载已解压的扩展程序」，选择下面的扩展文件夹。"
+            )
+        else:
+            self.detail_label.setText(
+                "无法自动打开扩展页面，请在 Chrome 地址栏手动输入 chrome://extensions/"
+            )
+
+    def _open_folder(self) -> None:
+        directory = chrome_extension_dir()
+        if open_directory(directory):
+            self.detail_label.setText(f"已打开扩展文件夹：{directory}")
+        else:
+            self.detail_label.setText(f"请手动打开扩展文件夹：{directory}")
+
+    def done(self, result: int) -> None:
+        """Wait for an in-flight install before the dialog can be destroyed.
+
+        ``accept``/``reject`` - the 关闭 button among them - go through here and
+        *not* through ``closeEvent``, and this dialog is the only thing holding a
+        reference to the worker: a ``QThread`` destroyed while still running
+        takes the process with it.
+        """
+
+        wait_for_thread(self.worker, 5000)
+        super().done(result)
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
+        # The window's X never reaches ``done``: Qt hides the dialog and exec()
+        # returns, so the wait has to happen here too.
+        wait_for_thread(self.worker, 5000)
+        event.accept()
 
 
 class LoginDialog(QDialog):
@@ -609,11 +1032,35 @@ class LoginDialog(QDialog):
         self.worker: LoginWorker | None = None
         #: The verdict when the dialog is accepted, so the caller can refresh.
         self.result_status: SessionStatus | None = None
+        #: Which step is running, so a status reply can be interpreted correctly.
+        self._last_action: LoginAction | None = None
+        #: Loopback transport for the extension, live only while this window is.
+        self.bridge = LocalBridge(settings)
+        self._bridge_error = ""
 
         self.setWindowTitle(f"登录 {adapter.display_name}")
         self.setMinimumWidth(620)
         self._build_ui()
         self._open_login_page()
+        self.finished.connect(lambda _result: self.bridge.stop())
+
+    def showEvent(self, event: QShowEvent) -> None:  # noqa: N802 - Qt API
+        """Start the loopback fallback, but only once the window is really up.
+
+        Starting it lazily keeps a listening socket out of every code path that
+        merely constructs a dialog - including the tests.
+        """
+
+        super().showEvent(event)
+        if self.bridge.running or self._bridge_error:
+            return
+        try:
+            self.bridge.start()
+        except OSError as exc:
+            # Native messaging is still the primary route; this only removes an
+            # extra way for the extension to reach us.
+            self._bridge_error = type(exc).__name__
+            logger.info("本地回环通道未能启动：%s", exc)
 
     # -- construction -------------------------------------------------------
     def _build_ui(self) -> None:
@@ -697,12 +1144,76 @@ class LoginDialog(QDialog):
         self.manual_box.setVisible(not outlook.default_readable)
         layout.addWidget(self.manual_box)
 
+        # --- the supported route into Chrome / Edge ---------------------------
+        #
+        # Chromium blocks outside access to its cookie store, so this is not a
+        # workaround but the interface Chrome itself offers: the extension asks
+        # for the cookies, Chrome decrypts them, the native host stores them.
+        self.chrome_box = QGroupBox(CHROME_HELPER_TITLE)
+        chrome = QVBoxLayout(self.chrome_box)
+        self.chrome_status_label = QLabel("")
+        self.chrome_status_label.setWordWrap(True)
+        chrome.addWidget(self.chrome_status_label)
+
+        chrome_hint = QLabel(
+            "Chrome / Edge 用 App-Bound Encryption 保护 Cookie，外部程序无法读取。"
+            "安装登录助手扩展后，由 Chrome 自己解密并把会话交给本程序："
+            "本程序不接触任何密钥、不注入浏览器、不修改或删除任何 Cookie，"
+            "扩展也只申请读取哔哩哔哩 / Instagram 两个域名。"
+        )
+        chrome_hint.setWordWrap(True)
+        chrome_hint.setStyleSheet("color: #57606a;")
+        chrome.addWidget(chrome_hint)
+
+        chrome_row = QHBoxLayout()
+        self.chrome_button = QPushButton("安装 / 检查登录助手")
+        self.chrome_button.setObjectName("primary")
+        self.chrome_button.clicked.connect(self._open_chrome_helper)
+        chrome_row.addWidget(self.chrome_button)
+        chrome_row.addStretch(1)
+        chrome.addLayout(chrome_row)
+
+        self.chrome_send_hint = QLabel("")
+        self.chrome_send_hint.setWordWrap(True)
+        chrome.addWidget(self.chrome_send_hint)
+        self.chrome_box.setVisible(bool(outlook.blocked_browsers))
+        layout.addWidget(self.chrome_box)
+
+        # --- fallback for a user who would rather not install anything --------
+        self.cdp_box = QGroupBox("备选：用独立 Chrome 自动获取（无需扩展）")
+        cdp = QVBoxLayout(self.cdp_box)
+        cdp_hint = QLabel(
+            "本程序可以用它自己的独立 Chrome 配置打开登录页，由 Chrome 解密后取回会话。"
+            "该配置存放在本程序的数据目录，不会读取你日常使用的浏览器配置；"
+            "首次需要在打开的窗口里登录一次，之后会保留。"
+        )
+        cdp_hint.setWordWrap(True)
+        cdp_hint.setStyleSheet("color: #57606a;")
+        cdp.addWidget(cdp_hint)
+
+        cdp_row = QHBoxLayout()
+        self.cdp_launch_button = QPushButton(CDP_LAUNCH_TEXT)
+        self.cdp_launch_button.clicked.connect(self._cdp_launch)
+        cdp_row.addWidget(self.cdp_launch_button)
+        self.cdp_fetch_button = QPushButton(CDP_FETCH_TEXT)
+        self.cdp_fetch_button.clicked.connect(self._cdp_fetch)
+        cdp_row.addWidget(self.cdp_fetch_button)
+        self.cdp_close_button = QPushButton(CDP_CLOSE_TEXT)
+        self.cdp_close_button.clicked.connect(self._cdp_close)
+        cdp_row.addWidget(self.cdp_close_button)
+        cdp_row.addStretch(1)
+        cdp.addLayout(cdp_row)
+        self.cdp_box.setVisible(_chrome_installed())
+        layout.addWidget(self.cdp_box)
+
         footer = QHBoxLayout()
         footer.addStretch(1)
         self.close_button = QPushButton("取消")
         self.close_button.clicked.connect(self.reject)
         footer.addWidget(self.close_button)
         layout.addLayout(footer)
+
+        self._refresh_chrome_box()
 
     # -- browser ------------------------------------------------------------
     def _open_login_page(self) -> None:
@@ -732,19 +1243,61 @@ class LoginDialog(QDialog):
             return
         self._start(LoginAction.PASTE, text)
 
+    def _open_chrome_helper(self) -> None:
+        """Show the one-time extension install/verification dialog."""
+
+        dialog = ChromeHelperDialog(self.settings, self)
+        dialog.exec()
+        self._refresh_chrome_box()
+
+    def _refresh_chrome_box(self) -> None:
+        """Describe the bridge state, and the one step the user has to take."""
+
+        status = _safe_bridge_status(self.settings)
+        if status is None:
+            self.chrome_status_label.setText("登录助手状态未知，请点「安装 / 检查登录助手」。")
+            self.chrome_status_label.setStyleSheet("color: #9a6700;")
+            self.chrome_send_hint.setText("")
+            return
+        colour = "#1a7f37" if status.ready else "#9a6700"
+        self.chrome_status_label.setStyleSheet(f"color: {colour};")
+        self.chrome_status_label.setText(status.summary())
+        if status.ready:
+            extra = (
+                f"（本机回环通道正在监听 127.0.0.1:{self.bridge.port}，"
+                "native messaging 被系统拒绝时也能用）"
+                if self.bridge.running
+                else ""
+            )
+            self.chrome_send_hint.setText(
+                "在 Chrome 里点扩展图标 → 选择平台 → 「发送到 Video Downloader」，"
+                f"然后点上面的「{DETECT_BUTTON_TEXT}」。{extra}"
+            )
+        else:
+            self.chrome_send_hint.setText(status.advice())
+
+    # -- DevTools fallback --------------------------------------------------
+    def _cdp_launch(self) -> None:
+        self._start(LoginAction.CDP_LAUNCH)
+
+    def _cdp_fetch(self) -> None:
+        self._start(LoginAction.CDP_FETCH)
+
+    def _cdp_close(self) -> None:
+        if cdp_session().close():
+            self._set_status("已关闭独立 Chrome。", ok=None)
+        else:
+            self._set_status("独立 Chrome 当前没有在运行。", ok=None)
+
     def _start(self, action: LoginAction, text: str = "") -> None:
         if self.worker is not None and self.worker.isRunning():
             # A run is already in flight. The buttons are disabled, so this is
             # only reachable through a stray signal - ignore it rather than
             # starting a second check.
             return
+        self._last_action = action
         self._set_busy(True, action=action)
-        self._set_status(
-            "正在从浏览器读取会话并向平台校验…"
-            if action is LoginAction.ACQUIRE
-            else "正在向平台校验你填写的会话…",
-            ok=None,
-        )
+        self._set_status(_BUSY_TEXT.get(action, "正在处理…"), ok=None)
         worker = LoginWorker(self.settings, self.adapter, action, text, self)
         worker.status_ready.connect(self._on_status)
         worker.browser_unavailable.connect(self._on_browser_unavailable)
@@ -761,10 +1314,13 @@ class LoginDialog(QDialog):
             self.accept()
             return
         if status.state is LoginState.UNKNOWN:
-            # The session was stored, but the platform could not be reached to
-            # confirm it. Saying so beats claiming a success we did not verify.
-            self._set_status(f"会话已保存，但暂时无法向平台确认：{status.detail}", ok=None)
-            self.accept()
+            # Two very different situations land here: a session that was stored
+            # but could not be confirmed, and "Chrome is starting, go and sign
+            # in". Only the first one is a finished step, so the dialog closes
+            # only for that one.
+            self._set_status(status.detail or "会话已保存，但暂时无法向平台确认。", ok=None)
+            if self._last_action is not LoginAction.CDP_LAUNCH:
+                self.accept()
             return
         self._set_status(f"检测结果：{status.summary()}。{status.detail}", ok=False)
         self.manual_box.show()
@@ -803,6 +1359,10 @@ class LoginDialog(QDialog):
             self.save_button,
             self.reopen_button,
             self.paste_edit,
+            self.chrome_button,
+            self.cdp_launch_button,
+            self.cdp_fetch_button,
+            self.cdp_close_button,
         ):
             widget.setEnabled(not busy)
         self.detect_button.setText(
@@ -811,8 +1371,30 @@ class LoginDialog(QDialog):
         self.save_button.setText(
             PASTE_BUSY_TEXT if busy and action is LoginAction.PASTE else PASTE_BUTTON_TEXT
         )
+        self.cdp_launch_button.setText(
+            CHROME_HELPER_BUSY_TEXT
+            if busy and action is LoginAction.CDP_LAUNCH
+            else CDP_LAUNCH_TEXT
+        )
+        self.cdp_fetch_button.setText(
+            PASTE_BUSY_TEXT if busy and action is LoginAction.CDP_FETCH else CDP_FETCH_TEXT
+        )
+
+    def done(self, result: int) -> None:
+        """Wait for a running check before the dialog can be destroyed.
+
+        ``accept``/``reject`` - the 取消 button among them - go through here and
+        *not* through ``closeEvent``, and the worker is a child of this dialog:
+        a ``QThread`` destroyed while still running takes the process with it.
+        """
+
+        wait_for_thread(self.worker, 5000)
+        super().done(result)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
+        # The window's X never reaches ``done`` (Qt just hides the dialog and
+        # exec() returns), so both the socket and the thread are handled here.
+        self.bridge.stop()
         wait_for_thread(self.worker, 5000)
         event.accept()
 
@@ -1124,10 +1706,16 @@ class MainWindow(QMainWindow):
         self.login_message.setStyleSheet("color: #57606a;")
         layout.addWidget(self.login_message)
 
+        refresh_row = QHBoxLayout()
         self.login_refresh_button = QPushButton("刷新登录状态")
         self.login_refresh_button.clicked.connect(self.refresh_login_status)
-        refresh_row = QHBoxLayout()
         refresh_row.addWidget(self.login_refresh_button)
+
+        # Chrome and Edge cannot be read from outside, so the extension route is
+        # offered here too - discoverable without starting a sign-in first.
+        self.chrome_helper_button = QPushButton(CHROME_HELPER_TITLE + "…")
+        self.chrome_helper_button.clicked.connect(self._open_chrome_helper)
+        refresh_row.addWidget(self.chrome_helper_button)
         refresh_row.addStretch(1)
         layout.addLayout(refresh_row)
 
@@ -1194,9 +1782,18 @@ class MainWindow(QMainWindow):
         self._refresh_login_row(adapter.platform)
         self._refresh_login_controls()
 
+    def _open_chrome_helper(self) -> None:
+        """Open the Chrome extension install/verification dialog."""
+
+        dialog = ChromeHelperDialog(self.settings, self)
+        dialog.exec()
+        self._set_login_message(
+            "登录助手设置已更新。若刚安装扩展，请在 Chrome 里加载扩展后再刷新登录状态。",
+            ok=None,
+        )
+
     def _on_login_button(self, adapter: PlatformAdapter) -> None:
         """The single button beside a platform: sign in, or sign out."""
-
         status = self.login_status.get(adapter.platform)
         if status is not None and status.logged_in:
             self._logout(adapter)

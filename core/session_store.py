@@ -83,6 +83,11 @@ def delete_session(settings: Settings, platform: Platform) -> bool:
     return True
 
 
+#: Default lifetime for a cookie whose real expiry is not known (a session
+#: cookie, or a manually pasted value).
+DEFAULT_COOKIE_LIFETIME = 365 * 24 * 3600
+
+
 def make_cookie(
     name: str,
     value: str,
@@ -90,8 +95,14 @@ def make_cookie(
     domain: str,
     path: str = "/",
     secure: bool = True,
+    expires: int | None = None,
 ) -> http.cookiejar.Cookie:
-    """Build a :class:`~http.cookiejar.Cookie` for the Netscape writer."""
+    """Build a :class:`~http.cookiejar.Cookie` for the Netscape writer.
+
+    ``expires`` is the browser's own expiry, when it has one. The loader ignores
+    expiry either way, but recording the real value keeps the file honest and
+    stops an already-expired cookie from being written in the first place.
+    """
 
     return http.cookiejar.Cookie(
         version=0,
@@ -105,7 +116,7 @@ def make_cookie(
         path=path,
         path_specified=True,
         secure=secure,
-        expires=int(time.time()) + 365 * 24 * 3600,
+        expires=expires if expires is not None else int(time.time()) + DEFAULT_COOKIE_LIFETIME,
         discard=False,
         comment=None,
         comment_url=None,

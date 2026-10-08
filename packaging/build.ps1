@@ -2,6 +2,20 @@
 .SYNOPSIS
     构建 Windows GUI 版（PyInstaller --onedir）并组装可分发的目录。
 
+.DESCRIPTION
+    产物是 dist\VideoDownloader\，它同时是 Portable ZIP 的内容和 Inno Setup
+    的源目录，因此这里必须把「用户拿到的所有东西」都放进去：
+
+      VideoDownloader.exe                 主程序（PyInstaller --onedir）
+      .env.example / README-FIRST.txt     模板与说明
+      tools\ffmpeg\bin\                   内置 ffmpeg / ffprobe
+      chrome-extension\                   Chrome 登录助手扩展（用户手动加载）
+      native_host\VideoDownloaderNativeHost\
+                                          native messaging 宿主（Chrome 启动它）
+
+    最后一项由 packaging\build-native-host.ps1 单独构建：它是控制台程序、
+    --onedir，和主程序互不影响，但缺少它「Chrome 登录助手」就无法工作。
+
 .EXAMPLE
     .\packaging\build.ps1                     # 第一轮：带控制台，便于调试
     .\packaging\build.ps1 -Console false      # 验证通过后再去掉控制台
@@ -27,6 +41,10 @@ $Spec = Join-Path $PackagingDir 'VideoDownloader.spec'
 $EnvTemplate = Join-Path $ProjectRoot '.env.example'
 $ReadmeFirst = Join-Path $PackagingDir 'README-FIRST.txt'
 $Scanner = Join-Path $PackagingDir 'scan_secrets.py'
+$NativeHostScript = Join-Path $PackagingDir 'build-native-host.ps1'
+$NativeHostOut = Join-Path $AppDir 'native_host'
+$ExtensionSrc = Join-Path $ProjectRoot 'chrome-extension'
+$ExtensionDst = Join-Path $AppDir 'chrome-extension'
 
 function Write-Step([string]$Text) {
     Write-Host ''
@@ -157,7 +175,7 @@ foreach ($attempt in 1, 2) {
 if (-not $built) { throw 'PyInstaller 未产出结果' }
 if (-not (Test-Path $AppDir)) { throw "未生成 $AppDir" }
 
-Write-Step '5/8 组装外部文件（.env.example / 说明 / ffmpeg）'
+Write-Step '5/8 组装外部文件（.env.example / 说明 / ffmpeg / Chrome 登录助手）'
 
 # .env 与 secrets\ 一律不放进 dist —— 那里可能有真实凭据。
 Copy-Item -LiteralPath $EnvTemplate -Destination $AppDir -Force
@@ -185,6 +203,45 @@ else {
     Write-Warning '  tools\ffmpeg\bin\ffmpeg.exe 不存在，dist 未包含 ffmpeg；'
     Write-Warning '  用户需自行放置，或在 .env 中设置 FFMPEG_PATH。'
 }
+
+# --- Chrome 登录助手：扩展 + native messaging 宿主 ---------------------------
+# 两件东西都必须和主程序放在一起，而且目录名不能改：
+#   chrome-extension\   core/chrome_bridge.extension_dir() 按这个名字定位它，
+#                       用户在 chrome://extensions 里加载的就是这个文件夹；
+#   native_host\        build-native-host.ps1 的产物，install_bridge() 会把
+#                       它登记给 Chrome（必要时复制到用户数据目录）。
+if (-not (Test-Path -LiteralPath (Join-Path $ExtensionSrc 'manifest.json'))) {
+    throw "找不到 $ExtensionSrc\manifest.json，无法打包 Chrome 登录助手扩展"
+}
+New-Item -ItemType Directory -Force -Path $ExtensionDst | Out-Null
+$extensionCopied = 0
+foreach ($file in Get-ChildItem -LiteralPath $ExtensionSrc -Recurse -File) {
+    # Node 测试与图标生成脚本只在开发时用得到，不进安装包。
+    if ($file.Name -in @('logic.test.js', 'make_icons.py')) { continue }
+    $relative = $file.FullName.Substring($ExtensionSrc.Length).TrimStart('\', '/')
+    if (($relative -split '[\\/]') -contains '__pycache__') { continue }
+    $target = Join-Path $ExtensionDst $relative
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $target) | Out-Null
+    Copy-Item -LiteralPath $file.FullName -Destination $target -Force
+    $extensionCopied++
+}
+foreach ($required in 'manifest.json', 'logic.js', 'background.js', 'popup.html', 'popup.css', 'popup.js') {
+    if (-not (Test-Path -LiteralPath (Join-Path $ExtensionDst $required))) {
+        throw "扩展文件不完整：缺少 $required"
+    }
+}
+Write-Host "  已复制 Chrome 扩展（$extensionCopied 个文件）"
+
+# 宿主由独立脚本构建：它是控制台程序（native messaging 需要可用的
+# stdin/stdout），--onedir 打包，与主程序互不影响。缺少它时 Chrome 无法启动
+# 登录助手，所以这里失败即整个构建失败。
+Write-Host '  构建 native messaging 宿主（packaging\build-native-host.ps1）...'
+& $NativeHostScript -OutputDir $NativeHostOut
+$NativeHostExe = Join-Path $NativeHostOut 'VideoDownloaderNativeHost\VideoDownloaderNativeHost.exe'
+if (-not (Test-Path -LiteralPath $NativeHostExe)) {
+    throw "未生成宿主程序：$NativeHostExe"
+}
+Write-Host "  已生成宿主程序：$NativeHostExe"
 
 if ($SkipSensitiveScan) {
     Write-Step '6/8 跳过敏感信息扫描（-SkipSensitiveScan）'

@@ -297,16 +297,25 @@ class AutomaticReadOutlook:
                 f"{default_label} 的 Cookie 可以直接读取，"
                 "登录后点击「我已登录，检测会话」即可自动获取。"
             )
+        if self.default_browser and is_chromium_based(self.default_browser):
+            # Chromium blocks outside access; the extension is the supported way
+            # in, so it is offered first - not as a workaround but as the route
+            # Chrome itself provides.
+            return (
+                f"{default_label} 用 App-Bound Encryption 保护 Cookie，外部程序无法读取。"
+                "本程序提供「Chrome 登录助手」扩展：由 Chrome 自己解密并把会话交给本程序，"
+                "一次性安装后即可自动获取。也可以改用 Firefox，或用「手动填写会话」。"
+            )
         if self.firefox_available:
             return (
-                f"{default_label} 使用 App-Bound Encryption（v20），yt-dlp 无法解密，"
-                "因此无法自动读取。检测到本机已安装 Firefox：在 Firefox 中登录后可自动获取；"
-                "或用下面的「手动填写会话」。"
+                f"{default_label} 的 Cookie 无法自动读取。检测到本机已安装 Firefox："
+                "在 Firefox 中登录后可自动获取；"
+                "也可以用「Chrome 登录助手」扩展，或下面的「手动填写会话」。"
             )
         return (
-            f"{default_label} 使用 App-Bound Encryption（v20），yt-dlp 无法解密，"
-            "与是否登录无关。请用下面的「手动填写会话」，"
-            "或安装 Firefox 后在 Firefox 中登录以自动获取。"
+            f"{default_label} 的 Cookie 无法自动读取。"
+            "请用「Chrome 登录助手」扩展（一次性安装），"
+            "或安装 Firefox 后在 Firefox 中登录，也可以用下面的「手动填写会话」。"
         )
 
 
@@ -371,12 +380,14 @@ def failure_message(browser: str, failure: BrowserFailure) -> tuple[str, str]:
         )
     if failure is BrowserFailure.ENCRYPTED:
         return (
-            f"无法解密 {label} 的 Cookie（App-Bound Encryption）",
+            f"无法直接解密 {label} 的 Cookie（App-Bound Encryption）",
             (
-                f"{label} 用 v20 应用绑定加密保护 Cookie，yt-dlp 目前不支持解密，"
+                f"{label} 用 v20 应用绑定加密保护 Cookie，外部程序无法解密，"
                 "与是否登录、是否关闭浏览器都无关。\n"
-                "首选方案：改用 Firefox 登录 —— Firefox 的 Cookie 不加密，可以自动读取；\n"
-                "其次：用下面的「手动填写会话」直接提供会话值。"
+                "首选方案：安装「Chrome 登录助手」扩展 —— 由 Chrome 自己解密并把会话"
+                "交给本程序，扩展只申请读取哔哩哔哩 / Instagram 两个域名；\n"
+                "其次：改用 Firefox 登录（Firefox 的 Cookie 不加密，可以自动读取）；\n"
+                "最后：用下面的「手动填写会话」直接提供会话值。"
             ),
         )
     if failure is BrowserFailure.NOT_INSTALLED:
@@ -494,7 +505,10 @@ def _aggregate_failure(attempts: list[_Attempt]) -> BrowserCookieError:
     if failure is BrowserFailure.ENCRYPTED and not any(
         is_readable(b) for b in installed_browsers()
     ):
-        notes.append("本机未检测到 Firefox；安装后在 Firefox 中登录即可自动获取会话。")
+        notes.append(
+            "本机未检测到 Firefox；可以在 Video Downloader 里安装「Chrome 登录助手」扩展"
+            "（由 Chrome 自己解密，一次性安装），或在 Firefox 中登录后自动获取会话。"
+        )
 
     detail = "\n".join([hint, *notes, "", "各浏览器结果：", *lines])
     return BrowserCookieError(message, reason=failure.value, browser=chosen.browser, detail=detail)

@@ -113,6 +113,16 @@ class BrowserCookieError(VideoDownloaderError):
         self.browser = browser
 
 
+class ChromeBridgeError(VideoDownloaderError):
+    """The Chrome extension bridge could not be installed or inspected.
+
+    Raised for a missing extension folder, an unparsable manifest, or a failed
+    registry write. Never carries a cookie value.
+    """
+
+    exit_code = 14
+
+
 class SessionValueError(VideoDownloaderError):
     """A manually supplied session value could not be used.
 

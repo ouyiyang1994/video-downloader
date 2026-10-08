@@ -55,6 +55,13 @@ jobs:
       - name: Mypy
         run: uv run --no-sync mypy .
 
+      # The Chrome sign-in helper ships to users, so the rules that decide
+      # *what* it sends (which domains, which cookie names, never a value in a
+      # message) are part of the release gate. ``logic.js`` is deliberately
+      # free of any ``chrome.*`` call so Node can exercise it directly.
+      - name: Extension logic (Node)
+        run: node --test chrome-extension/logic.test.js
+
       - name: Pytest
         shell: pwsh
         run: |

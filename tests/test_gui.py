@@ -21,11 +21,13 @@ from config import settings as settings_module
 from config.constants import QUALITY_AUDIO_ONLY, QUALITY_PRESETS
 from config.settings import Settings
 from core import browser_cookies, session_store
+from core.chrome_bridge import BridgeStatus
 from core.database import DownloadDatabase
 from core.downloader import ProgressUpdate
 from core.exceptions import (
     AuthRequiredError,
     BrowserCookieError,
+    ChromeBridgeError,
     CookieAccessError,
     DatabaseError,
     DownloadCancelled,
@@ -1177,3 +1179,496 @@ def test_close_waits_for_a_worker_running_inside_the_dialog(
 
     assert dialog.worker in waited, "关闭窗口必须等待对话框里仍在运行的检测线程"
     window._login_dialog = None
+
+
+def test_cancelling_the_login_dialog_waits_for_its_worker(
+    window: gui.MainWindow, monkeypatch
+) -> None:
+    """``reject`` never reaches ``closeEvent`` - it goes through ``done``.
+
+    The 取消 button calls ``reject()``, which hides the dialog and lets
+    ``exec()`` return; the caller then drops its reference. Without a wait the
+    dialog is destroyed with its QThread still running, and a QThread destroyed
+    while running aborts the process.
+    """
+
+    monkeypatch.setattr(gui.webbrowser, "open", lambda *a, **k: True)
+    dialog = gui.LoginDialog(window.settings, window.login_adapters[Platform.BILIBILI], window)
+    dialog.worker = _StubWorker()  # type: ignore[assignment]
+
+    waited: list[object] = []
+    monkeypatch.setattr(gui, "wait_for_thread", lambda thread, *a, **k: waited.append(thread))
+
+    dialog.reject()
+
+    assert dialog.worker in waited
+
+
+def test_closing_the_helper_dialog_waits_for_its_worker(
+    qtbot, settings: Settings, monkeypatch
+) -> None:
+    """The same trap, in the dialog that owns the bridge worker."""
+
+    monkeypatch.setattr(gui, "bridge_status", lambda _s: _bridge_status())
+    dialog = gui.ChromeHelperDialog(settings)
+    qtbot.addWidget(dialog)
+    dialog.worker = _StubWorker()  # type: ignore[assignment]
+
+    waited: list[object] = []
+    monkeypatch.setattr(gui, "wait_for_thread", lambda thread, *a, **k: waited.append(thread))
+
+    dialog.accept()
+
+    assert dialog.worker in waited
+
+
+# --- Chrome login helper -----------------------------------------------------
+
+
+def _bridge_status(
+    *,
+    present: bool = True,
+    registered: bool = True,
+    delivered: bool = False,
+    host_present: bool = True,
+) -> BridgeStatus:
+    return BridgeStatus(
+        extension_present=present,
+        extension_id="deegmfcjldojkppoahflbkikhppnfepd" if present else None,
+        extension_version="1.0.0" if present else None,
+        extension_dir=Path("chrome-extension") if present else None,
+        registered=registered,
+        registered_browsers=("chrome", "edge") if registered else (),
+        expected_manifest=Path("native_host") / "com.videodownloader.cookies.json",
+        session_dir=Path("secrets"),
+        last_delivery=datetime(2026, 1, 2, tzinfo=UTC) if delivered else None,
+        host_present=host_present,
+    )
+
+
+@pytest.fixture
+def chrome_helper(qtbot, settings: Settings, monkeypatch):
+    """A helper dialog that never starts Chrome or the file manager."""
+
+    monkeypatch.setattr(gui, "bridge_status", lambda _settings: _bridge_status())
+    monkeypatch.setattr(gui, "open_extensions_page", lambda browser: True)
+    monkeypatch.setattr(gui, "open_directory", lambda path: True)
+    dialog = gui.ChromeHelperDialog(settings)
+    qtbot.addWidget(dialog)
+    return dialog
+
+
+def test_chrome_installed_tracks_the_executable(monkeypatch) -> None:
+    monkeypatch.setattr(gui, "_chrome_installed", lambda: True)
+    assert gui._chrome_installed() is True
+
+
+def test_safe_bridge_status_swallows_a_bridge_error(settings: Settings, monkeypatch) -> None:
+    def _boom(_settings: Settings) -> BridgeStatus:
+        raise ChromeBridgeError("坏了")
+
+    monkeypatch.setattr(gui, "bridge_status", _boom)
+    assert gui._safe_bridge_status(settings) is None
+
+
+def test_the_helper_dialog_repairs_the_registration(qtbot, settings: Settings, monkeypatch) -> None:
+    """An upgrade's uninstaller deletes our keys; opening the dialog puts them back."""
+
+    calls: list[Settings] = []
+    monkeypatch.setattr(gui, "bridge_status", lambda _s: _bridge_status())
+    monkeypatch.setattr(gui, "repair_registration", lambda target: calls.append(target) or ())
+
+    dialog = gui.ChromeHelperDialog(settings)
+    qtbot.addWidget(dialog)
+
+    assert calls == [settings]
+
+
+def test_a_failed_repair_never_breaks_the_dialog(qtbot, settings: Settings, monkeypatch) -> None:
+    def _boom(_settings: Settings) -> tuple[str, ...]:
+        raise ChromeBridgeError("注册表坏了")
+
+    monkeypatch.setattr(gui, "bridge_status", lambda _s: _bridge_status())
+    monkeypatch.setattr(gui, "repair_registration", _boom)
+
+    dialog = gui.ChromeHelperDialog(settings)
+    qtbot.addWidget(dialog)
+
+    assert dialog.status_label.text() == _bridge_status().summary()
+
+
+def test_the_dialog_never_touches_the_registry_without_a_manifest(
+    qtbot, settings: Settings, monkeypatch
+) -> None:
+    """A machine that never installed the helper must not be touched at all.
+
+    ``settings`` points its data root at ``tmp_path``, so there is no manifest -
+    and the repair path must stop before it reads anything from ``HKCU``.
+    """
+
+    from core import chrome_bridge
+
+    class _Forbidden:
+        def __getattr__(self, name: str) -> object:
+            raise AssertionError(f"不应访问注册表：{name}")
+
+    monkeypatch.setattr(chrome_bridge, "winreg", _Forbidden())
+    monkeypatch.setattr(gui, "bridge_status", lambda _s: _bridge_status())
+
+    dialog = gui.ChromeHelperDialog(settings)
+    qtbot.addWidget(dialog)
+
+    assert dialog.status_label.text() == _bridge_status().summary()
+
+
+def test_friendly_error_surfaces_a_bridge_message() -> None:
+    message = gui.friendly_error(ChromeBridgeError("找不到 Chrome 扩展文件"))
+    assert message == "找不到 Chrome 扩展文件"
+
+
+def test_helper_dialog_describes_the_bridge(chrome_helper) -> None:
+    text = chrome_helper.detail_label.text()
+    assert "deegmfcjldojkppoahflbkikhppnfepd" in text
+    assert "1.0.0" in text
+    assert "chrome, edge" in text
+    assert "尚未收到" in text
+    assert chrome_helper.status_label.text() == _bridge_status().summary()
+
+
+def test_helper_dialog_says_when_it_is_ready(qtbot, settings: Settings, monkeypatch) -> None:
+    monkeypatch.setattr(gui, "bridge_status", lambda _s: _bridge_status(delivered=True))
+    dialog = gui.ChromeHelperDialog(settings)
+    qtbot.addWidget(dialog)
+    assert "已就绪" in dialog.status_label.text()
+    assert "最近一次收到会话" in dialog.detail_label.text()
+
+
+def test_helper_dialog_shows_progress_and_blocks_a_second_click(chrome_helper) -> None:
+    chrome_helper._set_busy(True)
+
+    assert chrome_helper.install_button.text() == gui.CHROME_HELPER_BUSY_TEXT
+    for widget in (
+        chrome_helper.install_button,
+        chrome_helper.check_button,
+        chrome_helper.uninstall_button,
+        chrome_helper.page_button,
+        chrome_helper.folder_button,
+    ):
+        assert not widget.isEnabled()
+
+    chrome_helper._set_busy(False)
+    assert chrome_helper.install_button.text() == gui.CHROME_HELPER_BUTTON_TEXT
+    assert chrome_helper.install_button.isEnabled()
+
+
+def test_helper_dialog_renders_a_failure_without_a_status(chrome_helper) -> None:
+    chrome_helper._on_done(
+        {"ok": False, "message": "写注册表失败", "detail": "denied", "status": None}
+    )
+    assert chrome_helper.status_label.text() == "写注册表失败"
+    assert "denied" in chrome_helper.detail_label.text()
+
+
+def test_helper_dialog_opens_the_extension_page(chrome_helper) -> None:
+    chrome_helper._open_page()
+    assert "开发者模式" in chrome_helper.detail_label.text()
+
+
+def test_helper_dialog_reports_an_unopenable_folder(chrome_helper, monkeypatch) -> None:
+    monkeypatch.setattr(gui, "open_directory", lambda path: False)
+    chrome_helper._open_folder()
+    assert "请手动打开" in chrome_helper.detail_label.text()
+
+
+def test_helper_dialog_survives_a_missing_extension(qtbot, settings: Settings, monkeypatch) -> None:
+    monkeypatch.setattr(gui, "bridge_status", lambda _s: _bridge_status(present=False))
+    dialog = gui.ChromeHelperDialog(settings)
+    qtbot.addWidget(dialog)
+    assert "缺失" in dialog.status_label.text()
+    assert "（不可用）" in dialog.detail_label.text()
+
+
+def test_main_window_offers_the_chrome_helper(window: gui.MainWindow) -> None:
+    assert window.chrome_helper_button.isEnabled()
+    assert gui.CHROME_HELPER_TITLE in window.chrome_helper_button.text()
+
+
+def test_main_window_opens_the_helper_dialog(window: gui.MainWindow, monkeypatch) -> None:
+    opened: list[object] = []
+
+    def _exec(self) -> int:  # noqa: ANN001 - Qt signature
+        opened.append(self)
+        return 0
+
+    monkeypatch.setattr(gui.ChromeHelperDialog, "exec", _exec)
+    window._open_chrome_helper()
+
+    assert len(opened) == 1
+    assert "登录助手" in window.login_message.text()
+
+
+def test_login_dialog_offers_the_extension_when_chromium_blocks(
+    qtbot, settings: Settings, registry: PlatformRegistry, monkeypatch
+) -> None:
+    """Requirement: a blocked browser must show the new route, not a refusal."""
+
+    monkeypatch.setattr(
+        gui, "automatic_read_outlook", lambda: _outlook(default="chrome", readable=())
+    )
+    monkeypatch.setattr(gui.webbrowser, "open", lambda *a, **k: True)
+    monkeypatch.setattr(gui, "bridge_status", lambda _s: _bridge_status())
+
+    dialog = gui.LoginDialog(settings, registry.get(Platform.BILIBILI))
+    qtbot.addWidget(dialog)
+
+    assert not dialog.chrome_box.isHidden()
+    assert "Chrome 登录助手" in dialog.advice_label.text()
+    assert dialog.chrome_status_label.text()
+
+
+def test_login_dialog_hides_the_extension_when_the_default_is_readable(
+    qtbot, settings: Settings, registry: PlatformRegistry, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        gui, "automatic_read_outlook", lambda: _outlook(default="firefox", readable=("firefox",))
+    )
+    monkeypatch.setattr(gui.webbrowser, "open", lambda *a, **k: True)
+
+    dialog = gui.LoginDialog(settings, registry.get(Platform.BILIBILI))
+    qtbot.addWidget(dialog)
+
+    assert dialog.chrome_box.isHidden()
+
+
+def test_login_dialog_prompts_to_send_from_the_extension(login_dialog, monkeypatch) -> None:
+    monkeypatch.setattr(gui, "bridge_status", lambda _s: _bridge_status())
+    login_dialog._refresh_chrome_box()
+    assert "发送到 Video Downloader" in login_dialog.chrome_send_hint.text()
+
+
+def test_login_dialog_prompts_to_install_when_not_ready(login_dialog, monkeypatch) -> None:
+    monkeypatch.setattr(gui, "bridge_status", lambda _s: _bridge_status(registered=False))
+    login_dialog._refresh_chrome_box()
+    assert "安装" in login_dialog.chrome_send_hint.text()
+
+
+def test_login_dialog_handles_an_unknown_bridge_state(login_dialog, monkeypatch) -> None:
+    monkeypatch.setattr(gui, "_safe_bridge_status", lambda _s: None)
+    login_dialog._refresh_chrome_box()
+    assert "状态未知" in login_dialog.chrome_status_label.text()
+
+
+def test_login_dialog_busy_state_covers_the_new_controls(login_dialog) -> None:
+    login_dialog._set_busy(True, action=gui.LoginAction.CDP_LAUNCH)
+    for widget in (
+        login_dialog.chrome_button,
+        login_dialog.cdp_launch_button,
+        login_dialog.cdp_fetch_button,
+        login_dialog.cdp_close_button,
+    ):
+        assert not widget.isEnabled()
+    assert login_dialog.cdp_launch_button.text() == gui.CHROME_HELPER_BUSY_TEXT
+
+    login_dialog._set_busy(True, action=gui.LoginAction.CDP_FETCH)
+    assert login_dialog.cdp_fetch_button.text() == gui.PASTE_BUSY_TEXT
+
+    login_dialog._set_busy(False)
+    assert login_dialog.cdp_launch_button.text() == gui.CDP_LAUNCH_TEXT
+    assert login_dialog.cdp_fetch_button.text() == gui.CDP_FETCH_TEXT
+    assert login_dialog.cdp_close_button.isEnabled()
+
+
+def test_launching_chrome_does_not_close_the_dialog(login_dialog) -> None:
+    """The fallback is a two-step flow; step one must not dismiss the window."""
+
+    accepted: list[bool] = []
+    login_dialog.accepted.connect(lambda: accepted.append(True))
+
+    login_dialog._last_action = gui.LoginAction.CDP_LAUNCH
+    login_dialog._on_status(
+        SessionStatus(
+            platform=Platform.BILIBILI,
+            state=LoginState.UNKNOWN,
+            detail="已打开独立 Chrome（配置目录：chrome-profile）。",
+        )
+    )
+
+    assert accepted == [], "第一步只是启动 Chrome，不能关闭对话框"
+    assert "独立 Chrome" in login_dialog.status_label.text()
+
+
+def test_a_stored_but_unconfirmed_session_still_closes_the_dialog(login_dialog) -> None:
+    accepted: list[bool] = []
+    login_dialog.accepted.connect(lambda: accepted.append(True))
+
+    login_dialog._last_action = gui.LoginAction.CDP_FETCH
+    login_dialog._on_status(
+        SessionStatus(
+            platform=Platform.BILIBILI,
+            state=LoginState.UNKNOWN,
+            detail="Instagram 返回 HTTP 429，无法确认登录状态",
+        )
+    )
+
+    assert accepted == [True]
+
+
+def test_fetching_without_a_running_chrome_explains_the_order(login_dialog, monkeypatch) -> None:
+    class _NoSession:
+        instance = None
+
+    monkeypatch.setattr(gui, "cdp_session", lambda: _NoSession())
+    worker = gui.LoginWorker(login_dialog.settings, login_dialog.adapter, gui.LoginAction.CDP_FETCH)
+
+    with pytest.raises(ChromeBridgeError) as info:
+        asyncio.run(worker._run())
+    assert "打开独立 Chrome" in (info.value.detail or "")
+
+
+def test_fetching_from_the_debug_chrome_stores_the_session(login_dialog, monkeypatch) -> None:
+    """The fallback must end with the same kind of session file the extension writes."""
+
+    class _Instance:
+        port = 9222
+
+    class _Session:
+        instance = _Instance()
+
+    monkeypatch.setattr(gui, "cdp_session", lambda: _Session())
+    monkeypatch.setattr(
+        gui,
+        "cdp_fetch_cookies",
+        lambda instance, domain: [
+            {
+                "name": "SESSDATA",
+                "value": "SECRET-FROM-CHROME",
+                "domain": ".bilibili.com",
+                "path": "/",
+                "secure": True,
+            }
+        ],
+    )
+
+    async def _logged_in(self, header):  # noqa: ANN001 - stands in for LoginWorker._check
+        assert header is not None and "SESSDATA" in header
+        return SessionStatus(
+            platform=self.adapter.platform, state=LoginState.LOGGED_IN, account="某人"
+        )
+
+    monkeypatch.setattr(gui.LoginWorker, "_check", _logged_in)
+
+    worker = gui.LoginWorker(login_dialog.settings, login_dialog.adapter, gui.LoginAction.CDP_FETCH)
+    status = asyncio.run(worker._run())
+
+    assert status.logged_in is True
+    body = session_store.session_file(login_dialog.settings, Platform.BILIBILI).read_text(
+        encoding="utf-8"
+    )
+    assert "SECRET-FROM-CHROME" in body
+
+
+def test_a_session_the_platform_rejects_is_not_left_on_disk(login_dialog, monkeypatch) -> None:
+    class _Instance:
+        port = 9222
+
+    class _Session:
+        instance = _Instance()
+
+    monkeypatch.setattr(gui, "cdp_session", lambda: _Session())
+    monkeypatch.setattr(
+        gui,
+        "cdp_fetch_cookies",
+        lambda instance, domain: [
+            {"name": "SESSDATA", "value": "STALE", "domain": ".bilibili.com", "path": "/"}
+        ],
+    )
+
+    async def _rejected(self, header):  # noqa: ANN001
+        return SessionStatus(
+            platform=self.adapter.platform, state=LoginState.EXPIRED, detail="未登录"
+        )
+
+    monkeypatch.setattr(gui.LoginWorker, "_check", _rejected)
+
+    worker = gui.LoginWorker(login_dialog.settings, login_dialog.adapter, gui.LoginAction.CDP_FETCH)
+    with pytest.raises(SessionValueError):
+        asyncio.run(worker._run())
+
+    assert not session_store.session_file(login_dialog.settings, Platform.BILIBILI).exists(), (
+        "被平台否定的会话不能留在磁盘上"
+    )
+
+
+def test_closing_the_debug_browser_is_reported(login_dialog, monkeypatch) -> None:
+    class _Closable:
+        def close(self) -> bool:
+            return True
+
+    monkeypatch.setattr(gui, "cdp_session", lambda: _Closable())
+    login_dialog._cdp_close()
+    assert "已关闭" in login_dialog.status_label.text()
+
+    class _Nothing:
+        def close(self) -> bool:
+            return False
+
+    monkeypatch.setattr(gui, "cdp_session", lambda: _Nothing())
+    login_dialog._cdp_close()
+    assert "没有在运行" in login_dialog.status_label.text()
+
+
+def test_the_login_dialog_starts_the_loopback_fallback_when_shown(
+    qtbot, settings: Settings, registry: PlatformRegistry, monkeypatch
+) -> None:
+    """The fallback only listens while the window is open - no idle socket."""
+
+    monkeypatch.setattr(gui.webbrowser, "open", lambda *a, **k: True)
+    dialog = gui.LoginDialog(settings, registry.get(Platform.BILIBILI))
+    qtbot.addWidget(dialog)
+
+    assert dialog.bridge.running is False, "构造对话框不应开监听端口"
+
+    dialog.show()
+    qtbot.waitExposed(dialog)
+    assert dialog.bridge.running is True
+
+    dialog.close()
+    assert dialog.bridge.running is False, "关闭后必须释放端口"
+
+
+def test_a_busy_bridge_port_does_not_break_the_dialog(
+    qtbot, settings: Settings, registry: PlatformRegistry, monkeypatch
+) -> None:
+    """Native messaging is still the primary route, so this is not fatal."""
+
+    monkeypatch.setattr(gui.webbrowser, "open", lambda *a, **k: True)
+
+    def _busy(self) -> int:  # noqa: ANN001 - stands in for LocalBridge.start
+        raise OSError("port in use")
+
+    monkeypatch.setattr(gui.LocalBridge, "start", _busy)
+
+    dialog = gui.LoginDialog(settings, registry.get(Platform.BILIBILI))
+    qtbot.addWidget(dialog)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+
+    assert dialog.bridge.running is False
+    assert dialog._bridge_error == "OSError"
+    dialog.close()
+
+
+def test_the_login_dialog_reports_the_bridge_in_its_hint(login_dialog, monkeypatch) -> None:
+    monkeypatch.setattr(gui, "bridge_status", lambda _s: _bridge_status())
+
+    class _Running:
+        running = True
+        port = 8765
+
+        def stop(self) -> None:
+            self.running = False
+
+    login_dialog.bridge = _Running()
+    login_dialog._refresh_chrome_box()
+
+    assert "127.0.0.1:8765" in login_dialog.chrome_send_hint.text()

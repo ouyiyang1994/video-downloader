@@ -15,6 +15,7 @@ import pytest
 from config import settings as settings_module
 
 SCANNER_PATH = Path(__file__).resolve().parent.parent / "packaging" / "scan_secrets.py"
+PORTABLE_PATH = Path(__file__).resolve().parent.parent / "packaging" / "make_portable_zip.py"
 
 
 def _load_scanner():
@@ -27,7 +28,18 @@ def _load_scanner():
     return module
 
 
+def _load_portable():
+    """Load packaging/make_portable_zip.py the same way."""
+
+    spec = importlib.util.spec_from_file_location("make_portable_zip_under_test", PORTABLE_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 scan = _load_scanner()
+portable = _load_portable()
 
 # --- app root ---------------------------------------------------------------
 
@@ -619,6 +631,130 @@ def test_proxy_port_is_never_treated_as_a_credential(tmp_path: Path) -> None:
 def test_scanner_ignores_empty_secret_list(tmp_path: Path) -> None:
     dist = _fake_dist(tmp_path)
     assert scan.scan_for_values(dist, []) == []
+
+
+# --- the Chrome sign-in helper inside the bundle ----------------------------
+
+
+def test_the_extension_may_name_the_cookies_it_handles(tmp_path: Path) -> None:
+    """The shipped extension has to say ``SESSDATA`` / ``sessionid`` to work."""
+
+    dist = _fake_dist(tmp_path)
+    extension = dist / "chrome-extension"
+    extension.mkdir()
+    (extension / "logic.js").write_text(
+        "const names = ['SESSDATA', 'sessionid', 'csrftoken'];", encoding="utf-8"
+    )
+
+    failures, _ = scan.build_report(dist, tmp_path / "project")
+
+    assert failures == []
+
+
+def test_the_compiled_host_counts_as_a_bundle_of_its_own(tmp_path: Path) -> None:
+    """``native_host/`` is a second PyInstaller tree, with its own ``_internal``."""
+
+    dist = _fake_dist(tmp_path)
+    payload = dist / "native_host" / "VideoDownloaderNativeHost" / "_internal"
+    payload.mkdir(parents=True)
+    (payload / "yt_dlp_cookies.pyc").write_bytes(b"...sessionid...Netscape HTTP Cookie File...")
+
+    failures, notes = scan.build_report(dist, tmp_path / "project")
+
+    assert failures == []
+    assert any("随包文件" in note for note in notes)
+
+
+def test_the_keyword_exemption_still_checks_for_credentials(tmp_path: Path) -> None:
+    """The value check is what actually guards secrets, and it applies everywhere."""
+
+    dist = _fake_dist(tmp_path)
+    extension = dist / "chrome-extension"
+    extension.mkdir()
+    (extension / "logic.js").write_text("// REALSESSIONVALUE", encoding="utf-8")
+    project = tmp_path / "project"
+    (project / "secrets").mkdir(parents=True)
+    (project / "secrets" / "cookies.txt").write_text(
+        ".instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tREALSESSIONVALUE\n", encoding="utf-8"
+    )
+
+    failures, _ = scan.build_report(dist, project)
+
+    assert any("真实凭据值" in failure for failure in failures)
+
+
+def test_the_build_script_ships_the_login_helper() -> None:
+    """The host must land in the folder ``core.chrome_bridge`` looks in.
+
+    ``build.ps1`` writes it under ``dist/VideoDownloader/native_host`` while the
+    application looks for ``APP_ROOT/native_host/VideoDownloaderNativeHost``. If
+    the two ever drift apart the release silently loses its sign-in helper, and
+    nothing fails until a user tries to log in.
+    """
+
+    from core import chrome_bridge
+
+    script = (Path(__file__).resolve().parent.parent / "packaging" / "build.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert f"$NativeHostOut = Join-Path $AppDir '{chrome_bridge.HOST_DIRNAME}'" in script
+    assert f"$ExtensionDst = Join-Path $AppDir '{chrome_bridge.EXTENSION_DIRNAME}'" in script
+    assert "& $NativeHostScript -OutputDir $NativeHostOut" in script
+    assert chrome_bridge.HOST_FOLDER_NAME in script
+    assert chrome_bridge.PACKAGED_HOST_NAME in script
+
+
+def test_the_whole_chain_stages_the_same_directory() -> None:
+    """build.ps1 -> dist/VideoDownloader -> installer.iss must agree.
+
+    The installer copies ``{#SourceDir}\\*`` into ``{app}``, and at run time
+    ``APP_ROOT`` *is* ``{app}`` - so the directory build.ps1 assembles is exactly
+    the one the application will look in for its extension and its host. Moving
+    either end breaks the helper without breaking the build.
+    """
+
+    packaging = Path(__file__).resolve().parent.parent / "packaging"
+    build = (packaging / "build.ps1").read_text(encoding="utf-8")
+    installer = (packaging / "build-installer.ps1").read_text(encoding="utf-8")
+    script = (packaging / "installer.iss").read_text(encoding="utf-8")
+
+    assert "$DistDir = Join-Path $ProjectRoot 'dist'" in build
+    assert "$AppDir = Join-Path $DistDir 'VideoDownloader'" in build
+    assert "$AppDir = Join-Path $ProjectRoot 'dist\\VideoDownloader'" in installer
+    assert '"/DSourceDir=$AppDir"' in installer
+    assert 'Source: "{#SourceDir}\\*"; DestDir: "{app}";' in script
+
+
+# --- what the portable archive must (and must not) contain -------------------
+
+
+def test_the_archive_requires_the_login_helper() -> None:
+    """A release without the helper cannot sign in on Chrome or Edge."""
+
+    root = portable.ARCHIVE_ROOT
+    required = portable.REQUIRED_ENTRIES
+    host = f"{root}/native_host/VideoDownloaderNativeHost/VideoDownloaderNativeHost.exe"
+
+    assert f"{root}/VideoDownloader.exe" in required
+    assert f"{root}/chrome-extension/manifest.json" in required
+    assert f"{root}/chrome-extension/logic.js" in required
+    assert host in required
+
+
+def test_the_build_leaves_out_exactly_the_development_files() -> None:
+    """The archive check and the staging step must name the same files.
+
+    ``verify()`` rejects a ZIP containing a development file, so ``build.ps1``
+    has to be the one that leaves them behind - if the two lists drift, every
+    release fails at the very last step.
+    """
+
+    build = (Path(__file__).resolve().parent.parent / "packaging" / "build.ps1").read_text(
+        encoding="utf-8"
+    )
+    for name in portable.DEV_ONLY_EXTENSION_FILES:
+        assert f"'{name}'" in build, f"build.ps1 没有排除 {name}"
 
 
 # --- installer artefact scan ------------------------------------------------
