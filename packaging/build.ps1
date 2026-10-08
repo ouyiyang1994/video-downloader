@@ -100,7 +100,17 @@ foreach ($candidate in @("$env:USERPROFILE\.local\bin\uv.exe", 'uv')) {
     }
 }
 if ($Uv) {
-    Invoke-Native -Exe $Uv -Arguments @('sync', '--dev') -What 'uv sync'
+    # ``uv sync`` 从**当前目录**往上找 pyproject.toml，而脚本其它地方都用
+    # $PSScriptRoot 定位项目；从别处调用本脚本时这一步会报
+    # "No pyproject.toml found in current directory or any parent directory"。
+    # 固定到项目根，行为不再取决于调用者的工作目录。
+    Push-Location $ProjectRoot
+    try {
+        Invoke-Native -Exe $Uv -Arguments @('sync', '--dev') -What 'uv sync'
+    }
+    finally {
+        Pop-Location
+    }
 }
 else {
     Write-Warning '未找到 uv，跳过依赖同步（假设环境已就绪）'

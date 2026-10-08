@@ -93,7 +93,21 @@ $HostExe = Join-Path $AppDir "$AppName.exe"
 if (-not (Test-Path $HostExe)) { throw "未生成 $HostExe" }
 
 Write-Step '4/5 自检'
-$report = & $HostExe --selftest
+# 自检会把 sessionDir 目录真的建出来。冻结态下该目录按 exe 所在位置解析，
+# 也就是 dist\VideoDownloader\native_host\VideoDownloaderNativeHost\ —— 于是
+# 构建产物里会多出一个 secrets\ 空目录，而打包前的敏感信息扫描（正确地）把任何
+# 名为 secrets 的目录判为禁止项，整个构建就停在这里。把会话目录临时指到 %TEMP%
+# 下的一次性目录即可：自检照样验证「能创建、能写入」，dist 保持干净。
+# （build.yml 里对同一件事已有同样的处理，这里是本地构建链的对应补丁。）
+$previousSessionDir = $env:VIDEO_DOWNLOADER_SESSION_DIR
+$env:VIDEO_DOWNLOADER_SESSION_DIR = Join-Path $env:TEMP 'vd-native-host-selftest'
+try {
+    $report = & $HostExe --selftest
+}
+finally {
+    # 赋 $null 会直接删除该变量，未设置时也能正确还原。
+    $env:VIDEO_DOWNLOADER_SESSION_DIR = $previousSessionDir
+}
 Write-Host $report
 if ($LASTEXITCODE -ne 0) { throw "宿主自检失败：$report" }
 

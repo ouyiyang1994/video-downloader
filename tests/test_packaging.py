@@ -705,6 +705,39 @@ def test_the_build_script_ships_the_login_helper() -> None:
     assert chrome_bridge.PACKAGED_HOST_NAME in script
 
 
+def test_the_host_selftest_cannot_leave_a_secrets_folder_in_dist() -> None:
+    """The host's self-test really creates the session directory it reports.
+
+    Under a frozen build that directory resolves relative to the executable, so
+    without an override the build drops a ``secrets/`` folder inside
+    ``dist/VideoDownloader/native_host/VideoDownloaderNativeHost`` - which the
+    packaging scan (correctly) rejects, and which also blocks the Portable ZIP.
+    ``build.yml`` overrides the variable for its own self-test call; the script
+    that builds the host has to do the same, or every build stops at step 6.
+    """
+
+    script = (
+        Path(__file__).resolve().parent.parent / "packaging" / "build-native-host.ps1"
+    ).read_text(encoding="utf-8")
+
+    assert script.index("VIDEO_DOWNLOADER_SESSION_DIR") < script.index("--selftest"), (
+        "必须在自检之前覆盖会话目录"
+    )
+    assert script.count("VIDEO_DOWNLOADER_SESSION_DIR") >= 2, "覆盖之后必须还原"
+
+
+def test_the_build_script_does_not_depend_on_the_callers_directory() -> None:
+    """``uv sync`` resolves the project from the *current* directory."""
+
+    script = (Path(__file__).resolve().parent.parent / "packaging" / "build.ps1").read_text(
+        encoding="utf-8"
+    )
+    sync = script.index("'sync', '--dev'")
+
+    assert "Push-Location $ProjectRoot" in script[:sync]
+    assert "Pop-Location" in script[sync:]
+
+
 def test_the_whole_chain_stages_the_same_directory() -> None:
     """build.ps1 -> dist/VideoDownloader -> installer.iss must agree.
 
