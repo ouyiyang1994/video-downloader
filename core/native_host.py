@@ -249,7 +249,7 @@ def handle(message: dict[str, Any], *, settings: Any | None = None) -> dict[str,
     try:
         action = message.get("action")
         if action == "ping":
-            return _ping()
+            return _ping(settings)
         if action == "store":
             return store_cookies(
                 settings or _settings(), message.get("platform"), message.get("cookies")
@@ -264,8 +264,10 @@ def handle(message: dict[str, Any], *, settings: Any | None = None) -> dict[str,
         return {"ok": False, "error": f"本机程序处理失败：{type(exc).__name__}"}
 
 
-def _ping() -> dict[str, Any]:
-    directory = _session_dir()
+def _ping(settings: Any | None = None) -> dict[str, Any]:
+    from core.session_store import session_dir
+
+    directory = session_dir(settings or _settings())
     return {
         "ok": True,
         "host": HOST_NAME,
@@ -408,8 +410,15 @@ def _cookie_from(item: Any, domain_suffix: str) -> Any:
 # --- entry points ------------------------------------------------------------
 
 
-def serve(stdin: BinaryIO, stdout: BinaryIO) -> int:
-    """Run the protocol loop until Chrome closes the pipe."""
+def serve(stdin: BinaryIO, stdout: BinaryIO, *, settings: Any | None = None) -> int:
+    """Run the protocol loop until Chrome closes the pipe.
+
+    ``settings`` is threaded through to every message so a caller that already
+    knows the data root can pin it - which is what keeps a test (or any other
+    embedding) from ever reaching the real ``secrets/`` folder. ``main`` passes
+    nothing and the host derives the root from its environment, exactly as
+    Chrome needs it to.
+    """
 
     while True:
         try:
@@ -421,7 +430,7 @@ def serve(stdin: BinaryIO, stdout: BinaryIO) -> int:
         if message is None:
             logger.info("标准输入已关闭，宿主退出")
             return 0
-        write_message(stdout, handle(message))
+        write_message(stdout, handle(message, settings=settings))
 
 
 def selftest() -> int:

@@ -6,6 +6,7 @@ developer's real ``HKCU``, and the generated files all land in ``tmp_path``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import struct
 from pathlib import Path
@@ -13,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from config import settings as settings_module
 from config.settings import Settings
 from core import chrome_bridge, native_host
 from core.exceptions import ChromeBridgeError
@@ -90,6 +92,46 @@ def no_bundled_host(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         chrome_bridge, "bundled_host_executable", lambda: Path("__no_bundled_host__")
     )
+
+
+@pytest.fixture(autouse=True)
+def sandboxed_data_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Keep the real data root out of reach for every test in this module.
+
+    ``native_host._settings()`` falls back to ``Settings()`` whenever nothing
+    injects a root, and ``Settings.resolve_path`` resolves relative paths
+    against ``config.settings.DATA_ROOT`` - which on a developer machine *is*
+    the project folder, so the host's ``store`` action used to write straight
+    into the real ``secrets/``.
+
+    Pointing ``DATA_ROOT`` at ``tmp_path`` makes that fallback harmless, so a
+    test that forgets to inject its own settings still cannot touch the
+    developer's data. ``APP_ROOT`` is deliberately left alone: it is the real
+    folder, and the regression tests below use it as the thing to compare
+    against.
+    """
+
+    root = tmp_path / "data-root"
+    root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(settings_module, "DATA_ROOT", root)
+    return root
+
+
+def real_secrets_snapshot() -> dict[str, str]:
+    """Name -> content digest of the *real* ``secrets/`` folder.
+
+    Empty when the folder does not exist, so a clean checkout is covered too.
+    Only digests are kept; no cookie value is ever read into an assertion.
+    """
+
+    directory = settings_module.APP_ROOT / "secrets"
+    if not directory.is_dir():
+        return {}
+    return {
+        item.name: hashlib.sha256(item.read_bytes()).hexdigest()
+        for item in sorted(directory.iterdir())
+        if item.is_file()
+    }
 
 
 def _fake_bundled_host(root: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -846,8 +888,8 @@ def test_an_oversized_response_is_replaced_not_truncated() -> None:
 # --- request handling --------------------------------------------------------
 
 
-def test_ping_answers_without_touching_anything(monkeypatch: pytest.MonkeyPatch) -> None:
-    response = native_host.handle({"action": "ping"})
+def test_ping_answers_without_touching_anything(settings: Settings) -> None:
+    response = native_host.handle({"action": "ping"}, settings=settings)
     assert response["ok"] is True
     assert response["host"] == native_host.HOST_NAME
     assert response["platforms"] == ["bilibili", "instagram"]
@@ -1033,7 +1075,7 @@ def test_serve_answers_every_message_in_order(settings: Settings) -> None:
     )
     stdout = io.BytesIO()
 
-    assert native_host.serve(stdin, stdout) == 0
+    assert native_host.serve(stdin, stdout, settings=settings) == 0
 
     stdout.seek(0)
     replies = []
@@ -1057,18 +1099,37 @@ def test_serve_stops_on_a_protocol_error_without_crashing() -> None:
     assert reply is not None and reply["ok"] is False
 
 
+class _Trickle:
+    """A stream that hands out one byte at a time, like a slow pipe."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+
+    def read(self, count: int) -> bytes:
+        chunk, self._data = self._data[:count], self._data[count:]
+        return chunk
+
+
 def test_serve_handles_a_message_split_across_reads(settings: Settings) -> None:
     """Chrome writes the frame and the body separately; both must be read."""
 
-    class Trickle:
-        def __init__(self, data: bytes) -> None:
-            self._data = data
+    import io
 
-        def read(self, count: int) -> bytes:
-            chunk, self._data = self._data[:count], self._data[count:]
-            return chunk
+    stdout = io.BytesIO()
+    stdin = _Trickle(
+        _frame({"action": "store", "platform": "bilibili", "cookies": _bilibili_payload()})
+    )
 
-    message = native_host.read_message(Trickle(_frame({"action": "ping"})))
+    assert native_host.serve(stdin, stdout, settings=settings) == 0
+
+    stdout.seek(0)
+    reply = native_host.read_message(stdout)
+    assert reply is not None and reply["ok"] is True
+    assert reply["cookieNames"] == ["SESSDATA", "bili_jct"]
+
+
+def test_a_byte_at_a_time_read_still_yields_the_message() -> None:
+    message = native_host.read_message(_Trickle(_frame({"action": "ping"})))
     assert message == {"action": "ping"}
 
 
@@ -1078,3 +1139,97 @@ def test_logging_never_goes_to_stdout() -> None:
     source = Path(native_host.__file__).read_text(encoding="utf-8")
     assert "print(" not in source
     assert "sys.stdout.write" not in source.split("def selftest")[0]
+
+
+# --- the host must never write into the developer's real data root -----------
+
+
+def _instagram_payload() -> list[dict[str, Any]]:
+    return [
+        {"name": "sessionid", "value": "SECRET-SESSIONID", "domain": ".instagram.com", "path": "/"}
+    ]
+
+
+def test_serve_writes_only_into_the_injected_directory(
+    settings: Settings, sandboxed_data_root: Path
+) -> None:
+    """Regression: the protocol loop must forward the injected settings.
+
+    ``serve`` used to call ``handle`` without a data root, so a ``store``
+    message fell back to ``Settings()`` and overwrote the developer's real
+    ``secrets/bilibili_cookies.txt`` on every test run.
+    """
+
+    import io
+
+    before = real_secrets_snapshot()
+
+    stdin = io.BytesIO(
+        _frame({"action": "store", "platform": "bilibili", "cookies": _bilibili_payload()})
+    )
+    assert native_host.serve(stdin, io.BytesIO(), settings=settings) == 0
+
+    assert real_secrets_snapshot() == before, "serve 不得触碰真实的 secrets/"
+    written = settings.resolve_path(settings.session_dir) / "bilibili_cookies.txt"
+    assert written.is_file(), "会话必须写进注入的临时目录"
+    assert "SECRET-SESSDATA" in written.read_text(encoding="utf-8")
+    assert not (sandboxed_data_root / "secrets").exists(), "注入生效时不该用回退目录"
+
+
+def test_the_fallback_root_is_the_data_root_not_the_project(sandboxed_data_root: Path) -> None:
+    """A forgotten ``settings=`` must still stay inside the sandboxed root.
+
+    ``sandboxed_data_root`` points ``DATA_ROOT`` at ``tmp_path``, so this
+    exercises exactly the un-injected path and proves it cannot escape into the
+    project folder.
+    """
+
+    import io
+
+    before = real_secrets_snapshot()
+
+    stdin = io.BytesIO(
+        _frame({"action": "store", "platform": "instagram", "cookies": _instagram_payload()})
+    )
+    assert native_host.serve(stdin, io.BytesIO()) == 0
+
+    assert real_secrets_snapshot() == before
+    assert (sandboxed_data_root / "secrets" / "instagram_cookies.txt").is_file()
+
+
+def test_the_host_never_creates_a_secrets_folder_in_the_project(
+    sandboxed_data_root: Path,
+) -> None:
+    """Every message type, un-injected: ``APP_ROOT/secrets`` must not change.
+
+    Covers a clean checkout (folder absent before, still absent after) and a
+    developer machine (folder present, file list and contents identical).
+    """
+
+    import io
+
+    directory = settings_module.APP_ROOT / "secrets"
+    existed = directory.is_dir()
+    before = real_secrets_snapshot()
+
+    frames = (
+        _frame({"action": "ping"})
+        + _frame({"action": "store", "platform": "bilibili", "cookies": _bilibili_payload()})
+        + _frame({"action": "store", "platform": "instagram", "cookies": _instagram_payload()})
+        + _frame({"action": "status"})
+        + _frame({"action": "clear", "platform": "bilibili"})
+    )
+    assert native_host.serve(io.BytesIO(frames), io.BytesIO()) == 0
+
+    assert directory.is_dir() is existed, "宿主不得在项目里凭空创建 secrets/"
+    assert real_secrets_snapshot() == before, "真实 secrets/ 的内容与文件列表都不得变化"
+
+
+def test_ping_and_status_read_the_injected_root(settings: Settings) -> None:
+    """The read-only actions must not fall back to the real data root either."""
+
+    ping = native_host.handle({"action": "ping"}, settings=settings)
+    assert ping["sessionDir"] == settings.session_dir.name
+
+    status = native_host.handle({"action": "status"}, settings=settings)
+    assert status["sessions"] == {"bilibili": False, "instagram": False}
