@@ -34,7 +34,7 @@
 ; exactly our host key - never another extension's.
 
 #define AppName "Video Downloader"
-#define AppVersion "1.04"
+#define AppVersion "1.05"
 #define AppPublisher "Video Downloader"
 #define AppExeName "VideoDownloader.exe"
 ; Must equal core.chrome_bridge.HOST_NAME (and core.native_host.HOST_NAME).

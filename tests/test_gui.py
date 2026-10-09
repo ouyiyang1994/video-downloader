@@ -1109,6 +1109,16 @@ def test_login_worker_reports_a_browser_it_cannot_read(
         detail="首选方案：改用 Firefox 登录",
     )
     monkeypatch.setattr(gui, "extract_session", lambda domain: (_ for _ in ()).throw(error))
+    # No stored session of any kind: the browser error must be the answer, and
+    # nothing may be asked of the network.
+    settings.bilibili_cookie = None
+    settings.bilibili_sessdata = None
+    settings.bilibili_cookiefile = None
+
+    async def _never(header: str | None) -> SessionStatus:
+        raise AssertionError("没有已保存的会话时不应发起校验请求")
+
+    monkeypatch.setattr(gui.LoginWorker, "_check", _never)
 
     worker = gui.LoginWorker(settings, registry.get(Platform.BILIBILI), gui.LoginAction.ACQUIRE)
     reported: list[object] = []
@@ -1117,6 +1127,118 @@ def test_login_worker_reports_a_browser_it_cannot_read(
     worker.run()
 
     assert reported == [error]
+
+
+def _store_session(settings: Settings, platform: Platform, value: str = "STORED") -> None:
+    """Write a managed session, so the acquire fallback has something to read."""
+
+    names = {
+        Platform.BILIBILI: ("SESSDATA", "bilibili.com"),
+        Platform.INSTAGRAM: ("sessionid", "instagram.com"),
+    }
+    cookie_name, domain = names[platform]
+    session_store.write_session(
+        settings,
+        platform,
+        [session_store.make_cookie(cookie_name, value, domain=f".{domain}")],
+        domain_suffix=domain,
+    )
+
+
+def _unreadable_browser() -> BrowserCookieError:
+    return BrowserCookieError(
+        "无法解密 Chrome 的 Cookie（App-Bound Encryption）",
+        reason=browser_cookies.BrowserFailure.ENCRYPTED.value,
+        browser="chrome",
+        detail="首选方案：安装「Chrome 登录助手」扩展",
+    )
+
+
+def test_acquire_confirms_the_session_the_extension_already_saved(
+    settings: Settings, registry: PlatformRegistry, monkeypatch
+) -> None:
+    """App-Bound Encryption blocks Chrome - but the helper already delivered it.
+
+    "我已登录，检测会话" must confirm what is already on disk instead of telling
+    the user to type in a cookie the extension has already handed over.
+    """
+
+    error = _unreadable_browser()
+    monkeypatch.setattr(gui, "extract_session", lambda domain: (_ for _ in ()).throw(error))
+    _store_session(settings, Platform.INSTAGRAM)
+
+    checked: list[str | None] = []
+
+    async def _logged_in(self: gui.LoginWorker, header: str | None) -> SessionStatus:  # noqa: ANN001 - stands in for LoginWorker._check
+        checked.append(header)
+        return SessionStatus(platform=Platform.INSTAGRAM, state=LoginState.LOGGED_IN)
+
+    monkeypatch.setattr(gui.LoginWorker, "_check", _logged_in)
+
+    worker = gui.LoginWorker(settings, registry.get(Platform.INSTAGRAM), gui.LoginAction.ACQUIRE)
+    ready: list[SessionStatus] = []
+    unavailable: list[object] = []
+    worker.status_ready.connect(ready.append)
+    worker.browser_unavailable.connect(unavailable.append)
+
+    worker.run()
+
+    assert unavailable == [], "扩展已保存的会话可用时不应再报「浏览器不可读」"
+    assert [status.state for status in ready] == [LoginState.LOGGED_IN]
+    assert checked and checked[0] is not None
+    assert "sessionid=" in (checked[0] or "")
+
+
+def test_acquire_never_asks_the_platform_when_nothing_is_stored(
+    settings: Settings, registry: PlatformRegistry, monkeypatch
+) -> None:
+    error = _unreadable_browser()
+    monkeypatch.setattr(gui, "extract_session", lambda domain: (_ for _ in ()).throw(error))
+
+    async def _never(self: gui.LoginWorker, header: str | None) -> SessionStatus:  # noqa: ANN001 - stands in for LoginWorker._check
+        raise AssertionError("没有已保存的会话时不应发起校验请求")
+
+    monkeypatch.setattr(gui.LoginWorker, "_check", _never)
+
+    worker = gui.LoginWorker(settings, registry.get(Platform.INSTAGRAM), gui.LoginAction.ACQUIRE)
+    unavailable: list[object] = []
+    worker.browser_unavailable.connect(unavailable.append)
+
+    worker.run()
+
+    assert unavailable == [error]
+
+
+def test_acquire_keeps_the_stored_session_when_it_cannot_be_confirmed(
+    settings: Settings, registry: PlatformRegistry, monkeypatch
+) -> None:
+    """A rate-limited check must not throw the stored session away."""
+
+    error = _unreadable_browser()
+    monkeypatch.setattr(gui, "extract_session", lambda domain: (_ for _ in ()).throw(error))
+    _store_session(settings, Platform.INSTAGRAM)
+    session_path = session_store.session_file(settings, Platform.INSTAGRAM)
+
+    async def _unknown(self: gui.LoginWorker, header: str | None) -> SessionStatus:  # noqa: ANN001 - stands in for LoginWorker._check
+        return SessionStatus(
+            platform=Platform.INSTAGRAM,
+            state=LoginState.UNKNOWN,
+            detail="Instagram 触发限流（HTTP 429）",
+        )
+
+    monkeypatch.setattr(gui.LoginWorker, "_check", _unknown)
+
+    worker = gui.LoginWorker(settings, registry.get(Platform.INSTAGRAM), gui.LoginAction.ACQUIRE)
+    unavailable: list[object] = []
+    ready: list[SessionStatus] = []
+    worker.browser_unavailable.connect(unavailable.append)
+    worker.status_ready.connect(ready.append)
+
+    worker.run()
+
+    assert unavailable == [error], "无法确认时应保留原有的浏览器错误提示"
+    assert ready == []
+    assert session_path.is_file(), "无法确认不是删除会话的理由"
 
 
 def test_a_stale_worker_finish_does_not_untrack_the_live_one(

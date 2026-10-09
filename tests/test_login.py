@@ -31,7 +31,16 @@ from platforms.instagram.adapter import InstagramAdapter
 from platforms.youtube.adapter import YouTubeAdapter
 
 NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
-PROFILE_URL = "https://www.instagram.com/api/v1/users/web_profile_info/"
+#: The "who am I" endpoint the status probe asks. The public-profile endpoint
+#: (``users/web_profile_info``) is a scraping target that answers 429 to most
+#: exit IPs, so it must never come back as the probe.
+EDIT_FORM_URL = "https://www.instagram.com/api/v1/accounts/edit/web_form_data/"
+
+
+def _edit_form(username: str = "someone") -> dict[str, object]:
+    """A realistic account-settings answer for a signed-in session."""
+
+    return {"status": "ok", "form_data": {"username": username, "email": "a@b.test"}}
 
 
 def _cookie(name: str, value: str, domain: str) -> http.cookiejar.Cookie:
@@ -358,19 +367,64 @@ async def test_bilibili_network_failure_is_not_a_verdict(settings: Settings) -> 
 
 @respx.mock
 async def test_instagram_reports_a_live_session(settings: Settings) -> None:
-    respx.get(url__regex=f"{PROFILE_URL}.*").mock(
-        return_value=Response(200, json={"data": {"user": {"username": "instagram"}}})
+    route = respx.get(url__regex=f"{EDIT_FORM_URL}.*").mock(
+        return_value=Response(200, json=_edit_form("someone"))
     )
 
     async with httpx.AsyncClient() as client:
         status = await InstagramAdapter(settings, client).check_session("sessionid=live")
 
     assert status.state is LoginState.LOGGED_IN
+    assert status.account == "someone"
+    assert route.called, "探针必须请求 accounts/edit/web_form_data"
+
+
+def test_the_probe_is_the_edit_form_not_the_scraping_endpoint() -> None:
+    """Guard the fix: the public-profile endpoint must not come back.
+
+    It answers HTTP 429 to most exit IPs, which made a valid sign-in look
+    broken. The probe has to be the endpoint the signed-in web app itself uses.
+    """
+
+    from platforms.instagram import adapter as instagram_adapter
+
+    assert instagram_adapter.ACCOUNT_EDIT_API == EDIT_FORM_URL
+    assert "web_profile_info" not in instagram_adapter.ACCOUNT_EDIT_API
+    assert not hasattr(instagram_adapter, "PROFILE_INFO_API")
+
+
+@respx.mock
+async def test_instagram_rate_limit_is_not_a_verdict(settings: Settings) -> None:
+    """HTTP 429 is rate limiting, not a rejected session."""
+
+    respx.get(url__regex=f"{EDIT_FORM_URL}.*").mock(return_value=Response(429))
+
+    async with httpx.AsyncClient() as client:
+        status = await InstagramAdapter(settings, client).check_session("sessionid=live")
+
+    assert status.state is LoginState.UNKNOWN
+    assert status.logged_in is False
+    assert "429" in status.detail
+    assert "限流" in status.detail
+
+
+@respx.mock
+async def test_instagram_200_without_an_account_is_expired(settings: Settings) -> None:
+    """A ``200`` with no account in it must not be read as a live session."""
+
+    respx.get(url__regex=f"{EDIT_FORM_URL}.*").mock(
+        return_value=Response(200, json={"status": "ok", "form_data": {}})
+    )
+
+    async with httpx.AsyncClient() as client:
+        status = await InstagramAdapter(settings, client).check_session("sessionid=stale")
+
+    assert status.state is LoginState.EXPIRED
 
 
 @respx.mock
 async def test_instagram_login_wall_means_expired(settings: Settings) -> None:
-    respx.get(url__regex=f"{PROFILE_URL}.*").mock(
+    respx.get(url__regex=f"{EDIT_FORM_URL}.*").mock(
         return_value=Response(
             302, headers={"location": "https://www.instagram.com/accounts/login/"}
         )
@@ -384,7 +438,7 @@ async def test_instagram_login_wall_means_expired(settings: Settings) -> None:
 
 @respx.mock
 async def test_instagram_homepage_redirect_means_expired(settings: Settings) -> None:
-    respx.get(url__regex=f"{PROFILE_URL}.*").mock(
+    respx.get(url__regex=f"{EDIT_FORM_URL}.*").mock(
         return_value=Response(302, headers={"location": "https://www.instagram.com/"})
     )
 
@@ -397,7 +451,7 @@ async def test_instagram_homepage_redirect_means_expired(settings: Settings) -> 
 @pytest.mark.parametrize("code", [401, 403])
 @respx.mock
 async def test_instagram_rejection_means_expired(settings: Settings, code: int) -> None:
-    respx.get(url__regex=f"{PROFILE_URL}.*").mock(return_value=Response(code))
+    respx.get(url__regex=f"{EDIT_FORM_URL}.*").mock(return_value=Response(code))
 
     async with httpx.AsyncClient() as client:
         status = await InstagramAdapter(settings, client).check_session("sessionid=stale")
@@ -407,7 +461,7 @@ async def test_instagram_rejection_means_expired(settings: Settings, code: int) 
 
 @respx.mock
 async def test_instagram_json_error_body_means_expired(settings: Settings) -> None:
-    respx.get(url__regex=f"{PROFILE_URL}.*").mock(
+    respx.get(url__regex=f"{EDIT_FORM_URL}.*").mock(
         return_value=Response(200, json={"message": "login required", "status": "fail"})
     )
 
@@ -426,7 +480,7 @@ async def test_instagram_without_a_cookie_is_logged_out(settings: Settings) -> N
 
 @respx.mock
 async def test_instagram_network_failure_is_not_a_verdict(settings: Settings) -> None:
-    respx.get(url__regex=f"{PROFILE_URL}.*").mock(side_effect=httpx.ConnectError("boom"))
+    respx.get(url__regex=f"{EDIT_FORM_URL}.*").mock(side_effect=httpx.ConnectError("boom"))
 
     async with httpx.AsyncClient() as client:
         status = await InstagramAdapter(settings, client).check_session("sessionid=live")
@@ -849,8 +903,8 @@ async def test_bilibili_without_sessdata_never_calls_the_api(settings: Settings)
 
 @respx.mock
 async def test_instagram_without_sessionid_never_calls_the_api(settings: Settings) -> None:
-    route = respx.get(url__regex=f"{PROFILE_URL}.*").mock(
-        return_value=Response(200, json={"data": {"user": {"username": "instagram"}}})
+    route = respx.get(url__regex=f"{EDIT_FORM_URL}.*").mock(
+        return_value=Response(200, json=_edit_form())
     )
 
     async with httpx.AsyncClient() as client:
@@ -866,9 +920,7 @@ async def test_instagram_does_not_trust_a_positive_answer_without_sessionid(
 ) -> None:
     """Even a 200 must not become "已登录" when the auth cookie is missing."""
 
-    respx.get(url__regex=f"{PROFILE_URL}.*").mock(
-        return_value=Response(200, json={"data": {"user": {"username": "instagram"}}})
-    )
+    respx.get(url__regex=f"{EDIT_FORM_URL}.*").mock(return_value=Response(200, json=_edit_form()))
 
     async with httpx.AsyncClient() as client:
         status = await InstagramAdapter(settings, client).check_session("csrftoken=only")

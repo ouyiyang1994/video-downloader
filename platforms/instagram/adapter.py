@@ -39,12 +39,15 @@ SESSION_DOMAIN = "instagram.com"
 #: authentication token (``InstagramBaseIE._AUTH_COOKIE_NAME``).
 SESSION_COOKIE_NAMES = ("sessionid",)
 
-#: Endpoint and headers taken from yt-dlp's Instagram extractor, so the status
-#: probe speaks to the site exactly the way the downloader does.
-PROFILE_INFO_API = "https://www.instagram.com/api/v1/users/web_profile_info/"
-#: A long-lived official account, used only as a "can this session read the
-#: API at all" probe.
-PROBE_USERNAME = "instagram"
+#: "Who am I" endpoint: the account-settings form the signed-in web app loads
+#: for itself. A valid session gets a plain ``200`` JSON here, while an
+#: anonymous caller is redirected to the login page.
+#:
+#: It deliberately replaces the public-profile endpoint
+#: (``users/web_profile_info``), which is a scraping target: Instagram answers
+#: that one with HTTP 429 for most exit IPs, which says nothing about the
+#: session and made a perfectly good sign-in look broken.
+ACCOUNT_EDIT_API = "https://www.instagram.com/api/v1/accounts/edit/web_form_data/"
 APP_ID = "936619743392459"
 #: A status probe should answer quickly; the download timeout (30 s by default)
 #: would leave the settings row on "检测中…" for far too long.
@@ -96,17 +99,22 @@ class InstagramAdapter(PlatformAdapter):
         return load_cookie_header(self.engine.cookie_file, domain_suffix=SESSION_DOMAIN)
 
     async def check_session(self, cookie_header: str | None) -> SessionStatus:
-        """Probe the session with the same API call yt-dlp relies on.
+        """Ask Instagram who this session belongs to.
 
-        Instagram has no "who am I" endpoint that does not need a username, so
-        the probe asks for one well-known public account. A login wall (redirect
-        to ``/accounts/login``), a 401/403, or a JSON error body all mean the
-        session is no longer valid; a network failure means we simply cannot
-        tell, which is reported as ``UNKNOWN`` rather than as a verdict.
+        The probe is the account-settings form the signed-in web app loads for
+        itself, so a live session answers ``200`` with the account's own profile
+        in ``form_data``. A login wall (redirect to ``/accounts/login``), a
+        401/403, or a ``status`` other than ``ok`` all mean the session is no
+        longer valid.
+
+        HTTP 429 is **not** a verdict: Instagram rate-limits this API per exit
+        IP, so a perfectly good session can be told to come back later. That is
+        reported as ``UNKNOWN`` and the stored session is left alone. A network
+        failure is ``UNKNOWN`` for the same reason.
 
         A header without ``sessionid`` is treated as "not signed in" before any
-        request is made: if the profile endpoint ever answers an anonymous
-        caller, that must not be mistaken for a signed-in session.
+        request is made, so an anonymous answer can never be mistaken for a
+        signed-in session.
         """
 
         if not header_has_cookie(cookie_header, SESSION_COOKIE_NAMES):
@@ -119,8 +127,7 @@ class InstagramAdapter(PlatformAdapter):
 
         try:
             response = await self.client.get(
-                PROFILE_INFO_API,
-                params={"username": PROBE_USERNAME},
+                ACCOUNT_EDIT_API,
                 headers=headers,
                 follow_redirects=False,
                 timeout=SESSION_CHECK_TIMEOUT,
@@ -146,6 +153,13 @@ class InstagramAdapter(PlatformAdapter):
                 detail="Instagram 返回了未预期的跳转，无法确认登录状态",
             )
 
+        if response.status_code == 429:
+            # Rate limiting, not a rejection: never read it as "expired".
+            return SessionStatus(
+                platform=self.platform,
+                state=LoginState.UNKNOWN,
+                detail="Instagram 触发限流（HTTP 429），暂时无法确认登录状态，请稍后重试",
+            )
         if response.status_code in (401, 403):
             return _expired()
         if response.status_code >= 400:
@@ -164,10 +178,26 @@ class InstagramAdapter(PlatformAdapter):
                 detail="Instagram 返回了非 JSON 内容，无法确认登录状态",
             )
 
-        user = (payload.get("data") or {}).get("user") if isinstance(payload, dict) else None
-        if isinstance(user, dict) and user.get("username"):
-            return SessionStatus(platform=self.platform, state=LoginState.LOGGED_IN)
-        return _expired()
+        return self._verdict_from_edit_form(payload)
+
+    def _verdict_from_edit_form(self, payload: Any) -> SessionStatus:
+        """Read the account-settings answer: ``form_data`` + ``status``.
+
+        A signed-in account always comes back with its own ``form_data``
+        (including the username) and ``status: "ok"``. Anything else - a
+        ``fail`` status, or a body without an account in it - is the platform
+        saying the session does not authenticate.
+        """
+
+        if not isinstance(payload, dict) or payload.get("status") not in (None, "ok"):
+            return _expired()
+        form_data = payload.get("form_data")
+        if not isinstance(form_data, dict):
+            return _expired()
+        username = form_data.get("username")
+        if not isinstance(username, str) or not username:
+            return _expired()
+        return SessionStatus(platform=self.platform, state=LoginState.LOGGED_IN, account=username)
 
     def matches(self, url: str) -> bool:
         return urls.matches(url)

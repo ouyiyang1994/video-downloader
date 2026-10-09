@@ -635,9 +635,24 @@ class LoginWorker(QThread):
             await client.aclose()
 
     async def _acquire(self) -> SessionStatus:
-        """Read the session from the browser, prove it works, then store it."""
+        """Read the session from the browser, prove it works, then store it.
 
-        session = extract_session(self.adapter.session_domain)
+        Chromium 127+ encrypts its cookie store with App-Bound Encryption and
+        yt-dlp cannot decrypt it, so reading Chrome/Edge can fail outright. In
+        that case the Chrome helper extension may already have handed this very
+        platform's session to the application - so what is on disk is validated
+        first, and only when that cannot be confirmed does the browser error
+        (with its "use the extension / type it in" advice) reach the user.
+        """
+
+        try:
+            session = extract_session(self.adapter.session_domain)
+        except BrowserCookieError as exc:
+            stored = await self._confirm_stored_session(cause=exc)
+            if stored is None:
+                raise
+            return stored
+
         status = await self._check(header_from_cookies(session.cookies))
         self._reject_only_when_the_platform_says_no(status, source=browser_label(session.browser))
         write_session(
@@ -647,6 +662,39 @@ class LoginWorker(QThread):
             domain_suffix=self.adapter.session_domain,
         )
         logger.info("已从 %s 保存 %s 的登录会话", session.browser, self.adapter.platform.value)
+        return status
+
+    async def _confirm_stored_session(self, *, cause: BrowserCookieError) -> SessionStatus | None:
+        """Validate the session the Chrome helper already stored, if any.
+
+        Returns the status when the platform confirms it, and ``None`` when
+        there is nothing stored or it could not be confirmed - in which case the
+        caller re-raises the browser error, which is the more actionable answer.
+
+        Nothing is written and nothing is deleted here: this only reads the
+        platform's own verdict about a file that already exists.
+        """
+
+        logger.info(
+            "无法直接读取浏览器 Cookie（%s），改为校验已保存的 %s 会话",
+            cause.reason,
+            self.adapter.platform.value,
+        )
+        self.adapter.reload_session()
+        header = self.adapter.session_cookie_header()
+        if header is None:
+            return None
+
+        status = await self._check(header)
+        if not status.logged_in:
+            logger.info(
+                "已保存的 %s 会话未被平台确认（%s）",
+                self.adapter.platform.value,
+                status.state.value,
+            )
+            return None
+
+        logger.info("已确认扩展保存的 %s 会话，无需再读取浏览器", self.adapter.platform.value)
         return status
 
     async def _save_pasted(self) -> SessionStatus:
