@@ -454,20 +454,69 @@ def selftest() -> int:
     return 0 if report["ok"] else 1
 
 
-def main(argv: list[str] | None = None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The command line the host understands.
+
+    Chrome starts a native messaging host itself and hands it arguments the
+    host never asked for: the caller's origin (``chrome-extension://<id>/``)
+    and, on Windows, ``--parent-window=<HWND>``. Both are declared here so the
+    ``--help`` output stays honest, and :func:`parse_arguments` tolerates
+    anything else a future Chrome might append.
+    """
+
     parser = argparse.ArgumentParser(description="Video Downloader native messaging host")
     parser.add_argument(
         "--selftest",
         action="store_true",
         help="检查宿主能否启动并定位会话目录，然后退出",
     )
-    args = parser.parse_args(argv)
+    parser.add_argument(
+        "origin",
+        nargs="?",
+        help="Chrome 传入的调用方 origin（只写日志，不参与授权判断）",
+    )
+    parser.add_argument(
+        "--parent-window",
+        dest="parent_window",
+        default=None,
+        help="Chrome 传入的父窗口句柄（只写日志）",
+    )
+    return parser
+
+
+def parse_arguments(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[str]]:
+    """Parse our own arguments and whatever Chrome appended to them.
+
+    ``parse_args`` would abort the process with exit code 2 on the first
+    message Chrome sends, because Chrome always passes an origin and (on
+    Windows) ``--parent-window``. That is exactly the bug v1.06 shipped with:
+    the host died before it ever opened the protocol, so Chrome reported
+    "Error when communicating with the native messaging host" and the extension
+    silently fell back to loopback. Unknown arguments are returned to the
+    caller instead of ending the run.
+    """
+
+    return build_parser().parse_known_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args, unknown = parse_arguments(argv)
 
     if args.selftest:
         return selftest()
 
     setup_logging()
     logger.info("宿主启动（%s v%s）", HOST_NAME, HOST_VERSION)
+    if args.origin or args.parent_window or unknown:
+        # The origin and the parent-window handle are Chrome's own values, so
+        # they are logged as-is; anything else is only counted, which keeps a
+        # caller from smuggling arbitrary text into the log.
+        logger.info(
+            "Chrome 启动参数：origin=%s parent-window=%s 未知参数 %d 个",
+            args.origin or "-",
+            args.parent_window or "-",
+            len(unknown),
+        )
     _binary_stdio()
     return serve(sys.stdin.buffer, sys.stdout.buffer)
 

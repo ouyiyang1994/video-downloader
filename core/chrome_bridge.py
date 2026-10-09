@@ -830,21 +830,44 @@ def repair_registration(settings: Settings) -> tuple[str, ...]:
     return tuple(repaired)
 
 
+def host_probe_arguments() -> list[str]:
+    """The command line Chrome uses when *it* starts the host.
+
+    Chrome hands a native messaging host the caller's origin and, on Windows,
+    ``--parent-window=<HWND>``. A pre-flight that ran the launcher bare would
+    therefore miss a host that cannot parse its own command line - which is
+    exactly what happened in v1.06: the host exited with code 2 on these very
+    arguments, so the native channel was dead while loopback kept working.
+
+    The origin does not have to be the real one for the probe to be meaningful;
+    it only has to have the shape Chrome sends. A missing extension folder is
+    still reported by :func:`install_bridge`, not here.
+    """
+
+    try:
+        origin = f"chrome-extension://{extension_id()}/"
+    except ChromeBridgeError:
+        origin = "chrome-extension://unknown/"
+    return [origin, "--parent-window=0", "--selftest"]
+
+
 def verify_host(settings: Settings, *, timeout: float = 25.0) -> tuple[bool, str]:
-    """Run the host's ``--selftest`` so a broken launcher is caught here.
+    """Run the host's ``--selftest`` the way Chrome would start it.
 
     A silent failure inside Chrome is nearly impossible to diagnose, so the
-    application proves the launcher works before telling the user to try it.
+    application proves the launcher works before telling the user to try it -
+    with the same arguments Chrome passes, not a bare command line.
     """
 
     launcher = launcher_path(settings)
     if not launcher.is_file():
         return False, "宿主启动器不存在，请重新安装登录助手。"
 
+    arguments = host_probe_arguments()
     if launcher.suffix.lower() == ".exe":
-        command = [str(launcher), "--selftest"]
+        command = [str(launcher), *arguments]
     else:
-        command = ["cmd", "/c", str(launcher), "--selftest"]
+        command = ["cmd", "/c", str(launcher), *arguments]
 
     try:
         completed = subprocess.run(

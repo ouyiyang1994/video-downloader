@@ -820,6 +820,68 @@ def test_verify_host_reports_a_missing_launcher(settings: Settings) -> None:
     assert "不存在" in detail
 
 
+def test_the_host_accepts_the_command_line_chrome_builds() -> None:
+    """Chrome always appends the caller's origin and ``--parent-window``.
+
+    v1.06 parsed its command line strictly, so the host died with exit code 2
+    before it ever read stdin and the native channel never answered a single
+    message.
+    """
+
+    origin = f"chrome-extension://{chrome_bridge.extension_id()}/"
+    args, unknown = native_host.parse_arguments([origin, "--parent-window=7471384"])
+
+    assert args.selftest is False
+    assert args.origin == origin
+    assert args.parent_window == "7471384"
+    assert unknown == []
+
+
+def test_the_host_tolerates_arguments_it_does_not_know() -> None:
+    """A future Chrome release must not be able to kill the host."""
+
+    args, unknown = native_host.parse_arguments(["--brand-new-chrome-flag=1", "extra"])
+
+    assert args.selftest is False
+    assert args.origin == "extra"
+    assert unknown == ["--brand-new-chrome-flag=1"]
+
+
+def test_selftest_still_works_with_chrome_arguments() -> None:
+    """``--selftest`` is the one flag the application itself passes."""
+
+    assert native_host.parse_arguments(["--selftest"])[0].selftest is True
+
+    origin = f"chrome-extension://{chrome_bridge.extension_id()}/"
+    args, unknown = native_host.parse_arguments([origin, "--parent-window=0", "--selftest"])
+
+    assert args.selftest is True
+    assert args.origin == origin
+    assert args.parent_window == "0"
+    assert unknown == []
+
+
+def test_main_does_not_abort_on_chrome_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The whole point: no ``SystemExit(2)`` and no silent death at startup."""
+
+    calls: list[bool] = []
+    monkeypatch.setattr(native_host, "selftest", lambda: calls.append(True) or 0)
+
+    origin = f"chrome-extension://{chrome_bridge.extension_id()}/"
+    assert native_host.main([origin, "--parent-window=0", "--selftest"]) == 0
+    assert calls == [True]
+
+
+def test_the_preflight_uses_the_chrome_command_line() -> None:
+    """``verify_host`` must not pass a bare command line Chrome never sends."""
+
+    arguments = chrome_bridge.host_probe_arguments()
+
+    assert arguments[0] == f"chrome-extension://{chrome_bridge.extension_id()}/"
+    assert any(item.startswith("--parent-window=") for item in arguments)
+    assert arguments[-1] == "--selftest"
+
+
 # --- native messaging framing ------------------------------------------------
 
 
