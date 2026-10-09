@@ -40,7 +40,7 @@ from core.exceptions import (
     SessionValueError,
     UnsupportedUrlError,
 )
-from core.login import LoginState, SessionStatus, parse_session_text
+from core.login import LoginSource, LoginState, SessionOrigin, SessionStatus, parse_session_text
 from core.models import DownloadRecord, DownloadResult, DownloadStatus, Platform
 from core.registry import PlatformRegistry, build_registry
 
@@ -883,6 +883,182 @@ def test_logout_only_ever_touches_the_temporary_session_directory(
     assert (managed / "bilibili_cookies.txt").is_file()
 
 
+def _write_fallback_cookies(path: Path, *, domain: str, name: str) -> Path:
+    """A simulated ``.env`` cookie file - temporary, with fake values only."""
+
+    path.write_text(
+        f"# Netscape HTTP Cookie File\n.{domain}\tTRUE\t/\tTRUE\t0\t{name}\tFROMFALLBACK\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+@pytest.mark.parametrize(
+    ("platform", "key"),
+    [(Platform.INSTAGRAM, "YTDLP_COOKIEFILE"), (Platform.BILIBILI, "BILIBILI_COOKIEFILE")],
+)
+def test_login_row_names_the_env_source(
+    window: gui.MainWindow, platform: Platform, key: str
+) -> None:
+    """The row must name the key, not just mumble about ``.env``."""
+
+    window.login_status[platform] = SessionStatus(
+        platform=platform,
+        state=LoginState.LOGGED_IN,
+        account="某人",
+        origin=SessionOrigin(LoginSource.ENV_COOKIEFILE, key),
+    )
+    window._refresh_login_row(platform)
+
+    state_label, _button = window.login_rows[platform]
+    text = state_label.text()
+    assert ".env" in text
+    assert key in text
+    assert "本程序未保存会话" in text
+
+
+def test_login_row_stays_quiet_for_a_managed_session(window: gui.MainWindow) -> None:
+    platform = Platform.INSTAGRAM
+    window.login_status[platform] = SessionStatus(
+        platform=platform,
+        state=LoginState.LOGGED_IN,
+        account="某人",
+        origin=SessionOrigin(LoginSource.MANAGED),
+    )
+    window._refresh_login_row(platform)
+
+    state_label, _button = window.login_rows[platform]
+    assert ".env" not in state_label.text(), "本程序保存的会话不需要来源提示"
+
+
+def test_login_summary_names_the_env_source(window: gui.MainWindow) -> None:
+    window.login_status[Platform.INSTAGRAM] = SessionStatus(
+        platform=Platform.INSTAGRAM,
+        state=LoginState.LOGGED_IN,
+        account="bosco.slash",
+        origin=SessionOrigin(LoginSource.ENV_COOKIEFILE, "YTDLP_COOKIEFILE"),
+    )
+
+    summary = window._login_summary()
+
+    assert "YTDLP_COOKIEFILE" in summary
+    assert "来自 .env" in summary
+
+
+def test_logout_without_a_managed_session_explains_instead_of_deleting(
+    window: gui.MainWindow, settings: Settings, monkeypatch
+) -> None:
+    """The button must not pretend it removed an ``.env`` fallback.
+
+    This is the v1.08 behaviour that made the row bounce back to "已登录": the
+    confirmation was accepted, nothing of ours existed to delete, and the next
+    refresh pulled the session straight back from `.env`.
+    """
+
+    window.login_status[Platform.INSTAGRAM] = SessionStatus(
+        platform=Platform.INSTAGRAM,
+        state=LoginState.LOGGED_IN,
+        account="bosco.slash",
+        origin=SessionOrigin(LoginSource.ENV_COOKIEFILE, "YTDLP_COOKIEFILE"),
+    )
+    explained: list[str] = []
+    monkeypatch.setattr(
+        gui.QMessageBox, "information", lambda *args, **kwargs: explained.append(args[2])
+    )
+    monkeypatch.setattr(
+        gui.QMessageBox,
+        "question",
+        lambda *args, **kwargs: pytest.fail("没有托管会话时不应再弹「确认退出」"),
+    )
+    monkeypatch.setattr(window, "refresh_login_status", lambda: None)
+
+    window._logout(window.login_adapters[Platform.INSTAGRAM])
+
+    assert explained, "应弹出说明"
+    assert "YTDLP_COOKIEFILE" in explained[0]
+    assert ".env" in explained[0]
+    assert not session_store.has_session(settings, Platform.INSTAGRAM)
+
+
+def test_logout_warns_that_the_env_fallback_will_still_answer(
+    window: gui.MainWindow, settings: Settings, monkeypatch, tmp_path: Path
+) -> None:
+    """A managed session plus a configured fallback: say what happens next."""
+
+    settings.ytdlp_cookiefile = str(tmp_path / "cookies.txt")
+    _store_session(settings, Platform.INSTAGRAM)
+
+    prompts: list[str] = []
+
+    def _ask(*args: object, **kwargs: object) -> int:
+        prompts.append(str(args[2]))
+        # Cancel, so nothing is deleted and the warning is the only assertion.
+        return int(gui.QMessageBox.StandardButton.No)
+
+    monkeypatch.setattr(gui.QMessageBox, "question", _ask)
+    monkeypatch.setattr(window, "refresh_login_status", lambda: None)
+
+    window._logout(window.login_adapters[Platform.INSTAGRAM])
+
+    assert "YTDLP_COOKIEFILE" in prompts[0]
+    assert "再次显示「已登录」" in prompts[0]
+    assert session_store.has_session(settings, Platform.INSTAGRAM), "取消时不得删除"
+
+
+def test_status_refresh_labels_the_instagram_fallback_origin(
+    settings: Settings, registry: PlatformRegistry, monkeypatch, tmp_path: Path
+) -> None:
+    """End-to-end: what the row shows after the managed session is gone."""
+
+    settings.ytdlp_cookiefile = str(
+        _write_fallback_cookies(tmp_path / "cookies.txt", domain="instagram.com", name="sessionid")
+    )
+
+    async def _logged_in(self, header, *, origin=None):  # noqa: ANN001
+        return SessionStatus(
+            platform=self.adapter.platform,
+            state=LoginState.LOGGED_IN,
+            account="bosco.slash",
+            origin=origin or SessionOrigin(),
+        )
+
+    monkeypatch.setattr(gui.LoginWorker, "_check", _logged_in)
+
+    worker = gui.LoginWorker(settings, registry.get(Platform.INSTAGRAM), gui.LoginAction.STATUS)
+    status = asyncio.run(worker._run())
+
+    assert status.logged_in is True
+    assert status.origin.source is LoginSource.ENV_COOKIEFILE
+    assert status.origin.key == "YTDLP_COOKIEFILE"
+
+
+def test_status_refresh_labels_the_bilibili_fallback_origin(
+    settings: Settings, registry: PlatformRegistry, monkeypatch, tmp_path: Path
+) -> None:
+    settings.bilibili_cookie = None
+    settings.bilibili_sessdata = None
+    settings.bilibili_cookiefile = str(
+        _write_fallback_cookies(tmp_path / "bili.txt", domain="bilibili.com", name="SESSDATA")
+    )
+
+    async def _logged_in(self, header, *, origin=None):  # noqa: ANN001
+        return SessionStatus(
+            platform=self.adapter.platform,
+            state=LoginState.LOGGED_IN,
+            account="某人",
+            origin=origin or SessionOrigin(),
+        )
+
+    monkeypatch.setattr(gui.LoginWorker, "_check", _logged_in)
+
+    worker = gui.LoginWorker(settings, registry.get(Platform.BILIBILI), gui.LoginAction.STATUS)
+    status = asyncio.run(worker._run())
+
+    assert status.logged_in is True
+    assert status.origin.source is LoginSource.ENV_COOKIEFILE
+    assert status.origin.key == "BILIBILI_COOKIEFILE"
+
+
 def test_wait_for_thread_tolerates_a_destroyed_worker() -> None:
     """Closing the window after a worker was deleteLater'd must not raise."""
 
@@ -1162,7 +1338,7 @@ def test_login_worker_reports_a_browser_it_cannot_read(
     settings.bilibili_sessdata = None
     settings.bilibili_cookiefile = None
 
-    async def _never(header: str | None) -> SessionStatus:
+    async def _never(header: str | None, *, origin: SessionOrigin | None = None) -> SessionStatus:
         raise AssertionError("没有已保存的会话时不应发起校验请求")
 
     monkeypatch.setattr(gui.LoginWorker, "_check", _never)
@@ -1216,7 +1392,9 @@ def test_acquire_confirms_the_session_the_extension_already_saved(
 
     checked: list[str | None] = []
 
-    async def _logged_in(self: gui.LoginWorker, header: str | None) -> SessionStatus:  # noqa: ANN001 - stands in for LoginWorker._check
+    async def _logged_in(  # noqa: ANN001 - stands in for LoginWorker._check
+        self: gui.LoginWorker, header: str | None, *, origin: SessionOrigin | None = None
+    ) -> SessionStatus:
         checked.append(header)
         return SessionStatus(platform=Platform.INSTAGRAM, state=LoginState.LOGGED_IN)
 
@@ -1242,7 +1420,9 @@ def test_acquire_never_asks_the_platform_when_nothing_is_stored(
     error = _unreadable_browser()
     monkeypatch.setattr(gui, "extract_session", lambda domain: (_ for _ in ()).throw(error))
 
-    async def _never(self: gui.LoginWorker, header: str | None) -> SessionStatus:  # noqa: ANN001 - stands in for LoginWorker._check
+    async def _never(  # noqa: ANN001 - stands in for LoginWorker._check
+        self: gui.LoginWorker, header: str | None, *, origin: SessionOrigin | None = None
+    ) -> SessionStatus:
         raise AssertionError("没有已保存的会话时不应发起校验请求")
 
     monkeypatch.setattr(gui.LoginWorker, "_check", _never)
@@ -1266,7 +1446,9 @@ def test_acquire_keeps_the_stored_session_when_it_cannot_be_confirmed(
     _store_session(settings, Platform.INSTAGRAM)
     session_path = session_store.session_file(settings, Platform.INSTAGRAM)
 
-    async def _unknown(self: gui.LoginWorker, header: str | None) -> SessionStatus:  # noqa: ANN001 - stands in for LoginWorker._check
+    async def _unknown(  # noqa: ANN001 - stands in for LoginWorker._check
+        self: gui.LoginWorker, header: str | None, *, origin: SessionOrigin | None = None
+    ) -> SessionStatus:
         return SessionStatus(
             platform=Platform.INSTAGRAM,
             state=LoginState.UNKNOWN,
@@ -1718,7 +1900,9 @@ def test_fetching_from_the_debug_chrome_stores_the_session(login_dialog, monkeyp
         ],
     )
 
-    async def _logged_in(self, header):  # noqa: ANN001 - stands in for LoginWorker._check
+    async def _logged_in(  # noqa: ANN001 - stands in for LoginWorker._check
+        self, header, *, origin: SessionOrigin | None = None
+    ):
         assert header is not None and "SESSDATA" in header
         return SessionStatus(
             platform=self.adapter.platform, state=LoginState.LOGGED_IN, account="某人"
@@ -1752,7 +1936,7 @@ def test_a_session_the_platform_rejects_is_not_left_on_disk(login_dialog, monkey
         ],
     )
 
-    async def _rejected(self, header):  # noqa: ANN001
+    async def _rejected(self, header, *, origin: SessionOrigin | None = None):  # noqa: ANN001
         return SessionStatus(
             platform=self.adapter.platform, state=LoginState.EXPIRED, detail="未登录"
         )

@@ -19,7 +19,7 @@ from core import selection
 from core.exceptions import MetadataError, NotDownloadableError, RateLimitedError
 from core.http import load_cookie_header
 from core.interfaces import PlatformAdapter
-from core.login import LoginState, SessionStatus, header_has_cookie
+from core.login import LoginSource, LoginState, SessionOrigin, SessionStatus, header_has_cookie
 from core.models import DownloadPlan, MediaStream, Platform, VideoInfo
 from platforms.bilibili import api, urls
 
@@ -33,6 +33,15 @@ SESSION_DOMAIN = "bilibili.com"
 #: A status probe should answer quickly; the download timeout (30 s by default)
 #: would leave the settings row on "检测中…" for far too long.
 SESSION_CHECK_TIMEOUT = 10.0
+
+#: Source -> the wording the log has always used for it.
+_ORIGIN_LABELS: dict[LoginSource, str] = {
+    LoginSource.NONE: "匿名",
+    LoginSource.MANAGED: "secrets/ 托管会话",
+    LoginSource.ENV_VALUE: "配置项",
+    LoginSource.ENV_COOKIEFILE: "cookies.txt",
+    LoginSource.BROWSER: "浏览器",
+}
 
 
 class BilibiliAdapter(PlatformAdapter):
@@ -49,6 +58,7 @@ class BilibiliAdapter(PlatformAdapter):
         super().__init__(settings, client)
         self._wbi = api.WbiKeyCache()
         self._cookie_header: str | None = None
+        self._cookie_origin = SessionOrigin()
         self._cookie_loaded = False
 
     # -- URL -----------------------------------------------------------------
@@ -92,10 +102,31 @@ class BilibiliAdapter(PlatformAdapter):
 
         if not self._cookie_loaded:
             self._cookie_loaded = True
-            self._cookie_header, source = self._resolve_cookie()
+            self._cookie_header, self._cookie_origin = self._resolve_cookie()
             if self._cookie_header:
-                logger.debug("Bilibili 请求将携带登录 Cookie（来源：%s）", source)
+                logger.debug(
+                    "Bilibili 请求将携带登录 Cookie（来源：%s）",
+                    _ORIGIN_LABELS.get(self._cookie_origin.source, "配置项"),
+                )
         return self._cookie_header
+
+    def session_origin(self) -> SessionOrigin:
+        """Where the cached header came from (``.env`` key included)."""
+
+        self.session_cookie_header()
+        return self._cookie_origin
+
+    def fallback_config_keys(self) -> tuple[str, ...]:
+        """``.env`` keys that survive 「退出登录」 for this platform."""
+
+        keys: list[str] = []
+        if self.settings.bilibili_cookie:
+            keys.append("BILIBILI_COOKIE")
+        elif self.settings.bilibili_sessdata:
+            keys.append("BILIBILI_SESSDATA")
+        if str(self.settings.bilibili_cookiefile or "").strip():
+            keys.append("BILIBILI_COOKIEFILE")
+        return tuple(keys)
 
     def reload_session(self) -> None:
         """Forget the cached cookie header.
@@ -106,20 +137,22 @@ class BilibiliAdapter(PlatformAdapter):
 
         self._cookie_loaded = False
         self._cookie_header = None
+        self._cookie_origin = SessionOrigin()
 
-    def _resolve_cookie(self) -> tuple[str | None, str]:
+    def _resolve_cookie(self) -> tuple[str | None, SessionOrigin]:
         explicit = self.settings.bilibili_cookie_header()
         if explicit:
-            return explicit, "配置项"
+            key = "BILIBILI_COOKIE" if self.settings.bilibili_cookie else "BILIBILI_SESSDATA"
+            return explicit, SessionOrigin(LoginSource.ENV_VALUE, key)
         managed = load_cookie_header(self.managed_session_file, domain_suffix=SESSION_DOMAIN)
         if managed:
-            return managed, "secrets/ 托管会话"
+            return managed, SessionOrigin(LoginSource.MANAGED)
         configured = load_cookie_header(
             self.settings.bilibili_cookie_file, domain_suffix=SESSION_DOMAIN
         )
         if configured:
-            return configured, "cookies.txt"
-        return None, "匿名"
+            return configured, SessionOrigin(LoginSource.ENV_COOKIEFILE, "BILIBILI_COOKIEFILE")
+        return None, SessionOrigin()
 
     async def check_session(self, cookie_header: str | None) -> SessionStatus:
         """Ask Bilibili who this session belongs to, via the official nav API.

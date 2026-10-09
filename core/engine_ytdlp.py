@@ -21,6 +21,7 @@ from core.exceptions import (
     MetadataError,
     VideoDownloaderError,
 )
+from core.login import LoginSource, SessionOrigin
 from core.models import MediaStream, Platform, VideoInfo
 
 logger = logging.getLogger(__name__)
@@ -196,14 +197,28 @@ class YtDlpEngine:
         the sign-in flow just wrote), then ``YTDLP_COOKIEFILE`` from ``.env``.
         """
 
+        return self.cookie_file_source()[0]
+
+    def cookie_file_source(self) -> tuple[Path | None, SessionOrigin]:
+        """The cookies file in use *and* which configuration supplied it.
+
+        One resolution, two answers: the download path only needs the path,
+        while the sign-in status row has to know whether the file is *ours*
+        (removable by 「退出登录」) or one named by ``.env`` (which the button
+        must not pretend to delete).
+        """
+
         if not self.use_browser_cookies:
-            return None
+            return None, SessionOrigin()
         if self.managed_session_file is not None and self.managed_session_file.is_file():
-            return self.managed_session_file
+            return self.managed_session_file, SessionOrigin(LoginSource.MANAGED)
         raw = (self.settings.ytdlp_cookiefile or "").strip()
         if not raw:
-            return None
-        return self.settings.resolve_path(Path(raw))
+            return None, SessionOrigin()
+        return (
+            self.settings.resolve_path(Path(raw)),
+            SessionOrigin(LoginSource.ENV_COOKIEFILE, "YTDLP_COOKIEFILE"),
+        )
 
     def _ydl_options(self, referer: str | None = None) -> dict[str, Any]:
         headers = {"User-Agent": self.settings.user_agent}

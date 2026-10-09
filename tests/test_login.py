@@ -24,7 +24,7 @@ from core import browser_cookies, session_store
 from core.browser_cookies import BrowserFailure, browser_from_progid, classify_failure
 from core.exceptions import BrowserCookieError, SessionValueError
 from core.http import load_cookie_header
-from core.login import LoginState, header_has_cookie, parse_session_text
+from core.login import LoginSource, LoginState, header_has_cookie, parse_session_text
 from core.models import Platform
 from platforms.bilibili.adapter import BilibiliAdapter
 from platforms.instagram.adapter import InstagramAdapter
@@ -50,6 +50,14 @@ def _cookie(name: str, value: str, domain: str) -> http.cookiejar.Cookie:
 def _write_env_cookie_file(path: Path) -> Path:
     path.write_text(
         "# Netscape HTTP Cookie File\n.bilibili.com\tTRUE\t/\tTRUE\t0\tSESSDATA\tFROMFILE\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_instagram_cookie_file(path: Path) -> Path:
+    path.write_text(
+        "# Netscape HTTP Cookie File\n.instagram.com\tTRUE\t/\tTRUE\t0\tsessionid\tFROMFILE\n",
         encoding="utf-8",
     )
     return path
@@ -583,6 +591,126 @@ async def test_bilibili_session_cache_is_dropped_on_reload(settings: Settings) -
         session_store.delete_session(settings, Platform.BILIBILI)
         adapter.reload_session()
         assert adapter.session_cookie_header() is None, "退出登录后不能再读到旧会话"
+
+
+# --- which source the login state comes from ---------------------------------
+
+
+async def test_instagram_reports_the_managed_session_as_its_own(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """A session this program stored is the one 「退出登录」 can delete."""
+
+    settings.ytdlp_cookiefile = str(_write_instagram_cookie_file(tmp_path / "env-cookies.txt"))
+    session_store.write_session(
+        settings,
+        Platform.INSTAGRAM,
+        [_cookie("sessionid", "MANAGED", ".instagram.com")],
+        domain_suffix="instagram.com",
+    )
+
+    async with httpx.AsyncClient() as client:
+        adapter = InstagramAdapter(settings, client)
+        origin = adapter.session_origin()
+
+    assert origin.source is LoginSource.MANAGED
+    assert origin.key is None
+    assert origin.managed is True
+    assert origin.configured is False
+
+
+async def test_instagram_names_the_env_cookie_file_fallback(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """Without a managed session the verdict comes from ``YTDLP_COOKIEFILE``."""
+
+    settings.ytdlp_cookiefile = str(_write_instagram_cookie_file(tmp_path / "env-cookies.txt"))
+
+    async with httpx.AsyncClient() as client:
+        adapter = InstagramAdapter(settings, client)
+        origin = adapter.session_origin()
+
+    assert origin.source is LoginSource.ENV_COOKIEFILE
+    assert origin.key == "YTDLP_COOKIEFILE"
+    assert origin.configured is True
+    assert adapter.fallback_config_keys() == ("YTDLP_COOKIEFILE",)
+
+
+async def test_instagram_reports_no_source_without_any_session(settings: Settings) -> None:
+    settings.ytdlp_cookiefile = None
+
+    async with httpx.AsyncClient() as client:
+        adapter = InstagramAdapter(settings, client)
+        origin = adapter.session_origin()
+
+    assert origin.source is LoginSource.NONE
+    assert adapter.fallback_config_keys() == ()
+
+
+async def test_bilibili_names_the_env_cookie_file_fallback(
+    settings: Settings, tmp_path: Path
+) -> None:
+    settings.bilibili_cookie = None
+    settings.bilibili_sessdata = None
+    settings.bilibili_cookiefile = str(_write_env_cookie_file(tmp_path / "env-cookies.txt"))
+
+    async with httpx.AsyncClient() as client:
+        adapter = BilibiliAdapter(settings, client)
+        origin = adapter.session_origin()
+
+    assert origin.source is LoginSource.ENV_COOKIEFILE
+    assert origin.key == "BILIBILI_COOKIEFILE"
+    assert adapter.fallback_config_keys() == ("BILIBILI_COOKIEFILE",)
+
+
+async def test_bilibili_reports_the_managed_session_as_its_own(
+    settings: Settings, tmp_path: Path
+) -> None:
+    settings.bilibili_cookie = None
+    settings.bilibili_sessdata = None
+    settings.bilibili_cookiefile = str(_write_env_cookie_file(tmp_path / "env-cookies.txt"))
+    session_store.write_session(
+        settings,
+        Platform.BILIBILI,
+        [_cookie("SESSDATA", "MANAGED", ".bilibili.com")],
+        domain_suffix="bilibili.com",
+    )
+
+    async with httpx.AsyncClient() as client:
+        adapter = BilibiliAdapter(settings, client)
+        origin = adapter.session_origin()
+
+    assert origin.source is LoginSource.MANAGED
+    # The fallback still exists and must still be named in the warning.
+    assert adapter.fallback_config_keys() == ("BILIBILI_COOKIEFILE",)
+
+
+async def test_bilibili_names_a_pasted_env_value(settings: Settings) -> None:
+    settings.bilibili_cookie = "SESSDATA=FROMCONFIG"
+    settings.bilibili_sessdata = None
+    settings.bilibili_cookiefile = ""
+
+    async with httpx.AsyncClient() as client:
+        adapter = BilibiliAdapter(settings, client)
+        origin = adapter.session_origin()
+
+    assert origin.source is LoginSource.ENV_VALUE
+    assert origin.key == "BILIBILI_COOKIE"
+    assert adapter.fallback_config_keys() == ("BILIBILI_COOKIE",)
+
+
+async def test_bilibili_reports_no_source_without_any_session(settings: Settings) -> None:
+    settings.bilibili_cookie = None
+    settings.bilibili_sessdata = None
+    settings.bilibili_cookiefile = ""
+
+    async with httpx.AsyncClient() as client:
+        adapter = BilibiliAdapter(settings, client)
+        origin = adapter.session_origin()
+        assert adapter.session_cookie_header() is None
+
+    assert origin.source is LoginSource.NONE
+    assert adapter.fallback_config_keys() == ()
 
 
 # --- which platforms offer sign-in -------------------------------------------

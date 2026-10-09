@@ -15,7 +15,7 @@ import httpx
 from config.settings import Settings
 from core.exceptions import NotDownloadableError
 from core.http import load_cookie_header
-from core.login import LoginState, SessionStatus
+from core.login import LoginSource, LoginState, SessionOrigin, SessionStatus
 from core.models import DownloadPlan, Platform, VideoInfo
 from core.session_store import session_file
 
@@ -77,6 +77,32 @@ class PlatformAdapter(ABC):
         if not self.session_domain:
             return None
         return load_cookie_header(self.managed_session_file, domain_suffix=self.session_domain)
+
+    def session_origin(self) -> SessionOrigin:
+        """Where :meth:`session_cookie_header` takes its header from.
+
+        The GUI needs this to tell a session *this application stored* from one
+        supplied by ``.env``: only the former can be removed by 「退出登录」, and
+        saying otherwise makes the row bounce back to "已登录" with no
+        explanation. Adapters with ``.env`` fallbacks override this together
+        with :meth:`session_cookie_header`, so both answers come from the same
+        resolution.
+        """
+
+        if not self.session_domain:
+            return SessionOrigin()
+        if load_cookie_header(self.managed_session_file, domain_suffix=self.session_domain):
+            return SessionOrigin(LoginSource.MANAGED)
+        return SessionOrigin()
+
+    def fallback_config_keys(self) -> tuple[str, ...]:
+        """``.env`` keys that could still supply a session after a logout.
+
+        Only platforms with a configured fallback answer here. The GUI uses the
+        names - never the values - to warn that 「退出登录」 cannot remove them.
+        """
+
+        return ()
 
     async def check_session(self, cookie_header: str | None) -> SessionStatus:
         """Ask the platform whether ``cookie_header`` is a live session.

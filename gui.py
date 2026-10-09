@@ -20,6 +20,7 @@ import threading
 import traceback
 import types
 import webbrowser
+from dataclasses import replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -120,7 +121,9 @@ from core.interfaces import PlatformAdapter
 from core.local_bridge import LocalBridge
 from core.logging_setup import setup_logging
 from core.login import (
+    LoginSource,
     LoginState,
+    SessionOrigin,
     SessionStatus,
     parse_session_text,
 )
@@ -608,7 +611,9 @@ class LoginWorker(QThread):
         # adapter cached before the user signed in or out is stale by now.
         self.adapter.reload_session()
         if self.action is LoginAction.STATUS:
-            return await self._check(self.adapter.session_cookie_header())
+            return await self._check(
+                self.adapter.session_cookie_header(), origin=self.adapter.session_origin()
+            )
         if self.action is LoginAction.ACQUIRE:
             return await self._acquire()
         if self.action is LoginAction.PASTE:
@@ -619,20 +624,41 @@ class LoginWorker(QThread):
             return await self._cdp_fetch()
         raise ValueError(f"未知的登录动作：{self.action}")
 
-    async def _check(self, header: str | None) -> SessionStatus:
-        """Ask the platform about ``header`` using a short-lived client."""
+    async def _check(
+        self, header: str | None, *, origin: SessionOrigin | None = None
+    ) -> SessionStatus:
+        """Ask the platform about ``header`` using a short-lived client.
+
+        ``origin`` records where that header came from. Adapters answer pure
+        cookie questions and know nothing about the window, so the caller -
+        which resolved the header in the first place - has to say it.
+        """
 
         client = build_client(self.settings)
         registry: PlatformRegistry | None = None
         try:
             registry = build_registry(self.settings, client)
             adapter = registry.get(self.adapter.platform)
-            return await adapter.check_session(header)
+            status = await adapter.check_session(header)
         finally:
             if registry is not None:
                 for extra in registry.owned_clients:
                     await extra.aclose()
             await client.aclose()
+        if origin is None:
+            return status
+        return replace(status, origin=origin)
+
+    def _stored_origin(self) -> SessionOrigin:
+        """Where the session on disk comes from *now*.
+
+        Called right after a sign-in wrote a managed session: re-resolving is
+        safer than assuming, because a write that stored nothing leaves whatever
+        ``.env`` supplies in charge.
+        """
+
+        self.adapter.reload_session()
+        return self.adapter.session_origin()
 
     async def _acquire(self) -> SessionStatus:
         """Read the session from the browser, prove it works, then store it.
@@ -662,7 +688,7 @@ class LoginWorker(QThread):
             domain_suffix=self.adapter.session_domain,
         )
         logger.info("已从 %s 保存 %s 的登录会话", session.browser, self.adapter.platform.value)
-        return status
+        return replace(status, origin=self._stored_origin())
 
     async def _confirm_stored_session(self, *, cause: BrowserCookieError) -> SessionStatus | None:
         """Validate the session the Chrome helper already stored, if any.
@@ -685,7 +711,7 @@ class LoginWorker(QThread):
         if header is None:
             return None
 
-        status = await self._check(header)
+        status = await self._check(header, origin=self.adapter.session_origin())
         if not status.logged_in:
             logger.info(
                 "已保存的 %s 会话未被平台确认（%s）",
@@ -714,7 +740,7 @@ class LoginWorker(QThread):
             domain_suffix=self.adapter.session_domain,
         )
         logger.info("已保存手动填写的 %s 登录会话", self.adapter.platform.value)
-        return status
+        return replace(status, origin=self._stored_origin())
 
     def _cdp_launch(self) -> SessionStatus:
         """Start Chrome on this application's own profile, at the login page.
@@ -766,7 +792,9 @@ class LoginWorker(QThread):
         # that does not authenticate would leave the UI claiming a login that
         # is not there.
         self.adapter.reload_session()
-        status = await self._check(self.adapter.session_cookie_header())
+        status = await self._check(
+            self.adapter.session_cookie_header(), origin=self.adapter.session_origin()
+        )
         if status.state in (LoginState.EXPIRED, LoginState.LOGGED_OUT):
             delete_session(self.settings, self.adapter.platform)
             self.adapter.reload_session()
@@ -1864,11 +1892,26 @@ class MainWindow(QMainWindow):
     def _logout(self, adapter: PlatformAdapter) -> None:
         """Delete the session this application stored, and nothing else."""
 
+        platform = adapter.platform
+        if not has_session(self.settings, platform):
+            # There is nothing of ours to delete. Accepting the confirmation and
+            # then bouncing back to "已登录" - because ``.env`` still supplies a
+            # session - is exactly the confusing behaviour this explains away.
+            QMessageBox.information(
+                self,
+                "退出登录",
+                f"本程序没有保存 {adapter.display_name} 的会话。\n\n"
+                f"{self._login_origin_explanation(adapter)}",
+            )
+            self.refresh_login_status()
+            return
+
         answer = QMessageBox.question(
             self,
             "退出登录",
             f"确定要退出 {adapter.display_name} 吗？\n\n"
-            "只会删除本程序保存的该平台会话；浏览器里的登录状态完全不受影响。",
+            "只会删除本程序保存的该平台会话；浏览器里的登录状态完全不受影响。"
+            + self._fallback_warning(adapter),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -1892,6 +1935,56 @@ class MainWindow(QMainWindow):
         else:
             self._set_login_message(f"本程序没有保存 {adapter.display_name} 的会话", ok=None)
         self.refresh_login_status()
+
+    @staticmethod
+    def _fallback_warning(adapter: PlatformAdapter) -> str:
+        """Warn that a configured fallback can re-answer after a logout."""
+
+        keys = adapter.fallback_config_keys()
+        if not keys:
+            return ""
+        return (
+            "\n\n注意：.env 里的 "
+            + "、".join(keys)
+            + " 仍可能提供有效会话。退出后如果界面再次显示「已登录」，"
+            "那是这份配置在生效，本程序不会删除或禁用它。"
+        )
+
+    def _login_origin_explanation(self, adapter: PlatformAdapter) -> str:
+        """Explain a login this application cannot cancel, naming the key."""
+
+        status = self.login_status.get(adapter.platform)
+        origin = status.origin if status is not None else SessionOrigin()
+        keys = adapter.fallback_config_keys()
+
+        if origin.source is LoginSource.ENV_COOKIEFILE:
+            source = origin.key or "配置的回退文件"
+            return (
+                f"当前登录态来自 .env 中 {source} 指向的回退文件。\n\n"
+                "「退出登录」只能删除本程序保存的会话，不会删除或禁用该文件；"
+                "如需停止使用，请修改 .env 或删除该文件。\n\n"
+                "浏览器里的登录状态不受影响。"
+            )
+        if origin.source is LoginSource.ENV_VALUE:
+            source = origin.key or "会话配置"
+            return (
+                f"当前登录态来自 .env 中的 {source}。\n\n"
+                "「退出登录」不会删除或禁用 .env 里的配置；如需停止使用，请修改 .env。\n\n"
+                "浏览器里的登录状态不受影响。"
+            )
+        if origin.source is LoginSource.BROWSER:
+            return (
+                "当前登录态来自浏览器的 Cookie。请在浏览器里退出登录；"
+                "本程序不会改动浏览器的登录状态。"
+            )
+        if keys:
+            return (
+                "当前登录态来自 .env 中的 "
+                + "、".join(keys)
+                + "。\n\n「退出登录」不会删除或禁用这些配置；如需停止使用，请修改 .env。\n\n"
+                + "浏览器里的登录状态不受影响。"
+            )
+        return "本程序没有保存该平台的会话，「退出登录」没有可删除的内容。"
 
     # -- sign-in worker callbacks (always run on the GUI thread) -------------
     def _on_login_status(self, adapter: PlatformAdapter, status: SessionStatus) -> None:
@@ -1959,12 +2052,8 @@ class MainWindow(QMainWindow):
     def _login_source_hint(self, platform: Platform) -> str:
         """Say so when the session comes from ``.env`` rather than from here."""
 
-        status = self.login_status.get(platform)
-        if status is None or not status.logged_in:
-            return ""
-        if has_session(self.settings, platform):
-            return ""
-        return "（登录态来自 .env 配置，本程序未保存会话）"
+        note = self._login_source_note(platform)
+        return f"（登录态{note}，本程序未保存会话）" if note else ""
 
     def _login_summary(self) -> str:
         """One line covering every platform, including why a check was unsure."""
@@ -1980,8 +2069,37 @@ class MainWindow(QMainWindow):
             text = f"{adapter.display_name}：{status.summary()}"
             if status.detail and not status.logged_in:
                 text += f"（{status.detail}）"
+            note = self._login_source_note(platform)
+            if note:
+                text += f"，{note}"
             parts.append(text)
         return " ｜ ".join(parts)
+
+    def _login_source_note(self, platform: Platform) -> str:
+        """Short "where does this login come from" note, or ``""``.
+
+        Naming the actual ``.env`` key is the point: "登录态来自 .env 配置" left
+        users convinced 「退出登录」 had failed, when it had in fact deleted
+        everything it could and a configured fallback was still answering.
+        """
+
+        status = self.login_status.get(platform)
+        if status is None or not status.logged_in:
+            return ""
+        origin = status.origin
+        if origin.source is LoginSource.ENV_COOKIEFILE:
+            return f"来自 .env 的 {origin.key or 'COOKIEFILE'} 回退文件"
+        if origin.source is LoginSource.ENV_VALUE:
+            return f"来自 .env 的 {origin.key or '会话配置'}"
+        if origin.source is LoginSource.BROWSER:
+            return "来自浏览器"
+        if origin.source is LoginSource.MANAGED:
+            return ""
+        # An origin this build cannot name (an older status, a platform with no
+        # ``.env`` source): fall back to what is on disk.
+        if has_session(self.settings, platform):
+            return ""
+        return "来自 .env 配置"
 
     def _set_login_message(self, text: str, *, ok: bool | None) -> None:
         colour = {True: "#1a7f37", False: "#d1242f", None: "#57606a"}[ok]

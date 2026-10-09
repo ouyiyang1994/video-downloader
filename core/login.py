@@ -34,6 +34,50 @@ class LoginState(StrEnum):
     UNKNOWN = "unknown"
 
 
+class LoginSource(StrEnum):
+    """Where a platform's login state actually came from.
+
+    The distinction matters because "退出登录" can only delete a session this
+    application stored itself. A login that comes from ``.env`` (a configured
+    ``cookies.txt`` or a pasted session value) survives that button by design,
+    and the UI has to say so instead of letting the row bounce back to
+    "已登录" without an explanation.
+    """
+
+    #: No source supplied a session.
+    NONE = "none"
+    #: The managed ``secrets/<platform>_cookies.txt`` this program wrote.
+    MANAGED = "managed"
+    #: A ``cookies.txt`` named by a ``*_COOKIEFILE`` entry in ``.env``.
+    ENV_COOKIEFILE = "env_cookiefile"
+    #: A session value kept in ``.env`` itself (``BILIBILI_COOKIE`` ...).
+    ENV_VALUE = "env_value"
+    #: Read from the browser's own cookie store during a sign-in.
+    BROWSER = "browser"
+
+
+@dataclass(frozen=True, slots=True)
+class SessionOrigin:
+    """Where the effective session came from, and which key configured it."""
+
+    source: LoginSource = LoginSource.NONE
+    #: The ``.env`` key that supplied it (``YTDLP_COOKIEFILE`` ...), if any.
+    #: Names only - it never carries a value.
+    key: str | None = None
+
+    @property
+    def managed(self) -> bool:
+        """True when this application stored the session itself."""
+
+        return self.source is LoginSource.MANAGED
+
+    @property
+    def configured(self) -> bool:
+        """True when ``.env`` - not this application - supplies the session."""
+
+        return self.source in (LoginSource.ENV_COOKIEFILE, LoginSource.ENV_VALUE)
+
+
 #: State -> the label shown next to the platform name.
 STATE_LABELS: dict[LoginState, str] = {
     LoginState.LOGGED_OUT: "未登录",
@@ -61,6 +105,8 @@ class SessionStatus:
     account: str | None = None
     #: Short, safe explanation (never contains a cookie value).
     detail: str = ""
+    #: Which source produced the verdict, so the GUI can explain the outcome.
+    origin: SessionOrigin = SessionOrigin()
 
     @property
     def logged_in(self) -> bool:

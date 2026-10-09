@@ -22,7 +22,7 @@ from core.engine_ytdlp import YtDlpEngine
 from core.exceptions import NotDownloadableError, UnsupportedUrlError, VideoDownloaderError
 from core.http import load_cookie_header
 from core.interfaces import PlatformAdapter
-from core.login import LoginState, SessionStatus, header_has_cookie
+from core.login import LoginState, SessionOrigin, SessionStatus, header_has_cookie
 from core.models import DownloadPlan, MediaStream, Platform, VideoInfo
 from core.session_store import session_file
 from platforms.instagram import graph, urls
@@ -96,7 +96,31 @@ class InstagramAdapter(PlatformAdapter):
         this probe agree on which session is in use.
         """
 
-        return load_cookie_header(self.engine.cookie_file, domain_suffix=SESSION_DOMAIN)
+        return self._resolve_session()[0]
+
+    def session_origin(self) -> SessionOrigin:
+        """Whether the header above is ours or came from ``.env``."""
+
+        return self._resolve_session()[1]
+
+    def fallback_config_keys(self) -> tuple[str, ...]:
+        """``.env`` keys that survive 「退出登录」 for this platform."""
+
+        return ("YTDLP_COOKIEFILE",) if (self.settings.ytdlp_cookiefile or "").strip() else ()
+
+    def _resolve_session(self) -> tuple[str | None, SessionOrigin]:
+        """One resolution of the session: the header *and* where it came from.
+
+        Both answers come from ``YtDlpEngine.cookie_file_source``, so the
+        precedence the download path uses and the precedence reported to the
+        user can never disagree.
+        """
+
+        path, origin = self.engine.cookie_file_source()
+        header = load_cookie_header(path, domain_suffix=SESSION_DOMAIN)
+        if not header:
+            return None, SessionOrigin()
+        return header, origin
 
     async def check_session(self, cookie_header: str | None) -> SessionStatus:
         """Ask Instagram who this session belongs to.
