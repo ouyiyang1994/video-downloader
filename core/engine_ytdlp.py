@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from config.settings import Settings
+from core import fallback_policy
 from core.exceptions import (
     AuthRequiredError,
     CookieAccessError,
@@ -171,6 +172,7 @@ class YtDlpEngine:
         *,
         use_browser_cookies: bool = False,
         managed_session_file: Path | None = None,
+        platform: Platform | None = None,
     ) -> None:
         self.settings = settings
         #: Only platforms that genuinely need a logged-in session opt in, so
@@ -179,12 +181,24 @@ class YtDlpEngine:
         #: Session the GUI's sign-in flow stored under ``secrets/``. When it
         #: exists it is the most specific source and wins over ``.env``.
         self.managed_session_file = managed_session_file
+        #: Needed only to honour the per-platform 「退出登录」 switch. The
+        #: managed session above is never affected by it.
+        self.platform = platform
+
+    def _fallback_disabled(self) -> bool:
+        """True when the user switched this platform's ``.env`` fallback off."""
+
+        return self.platform is not None and fallback_policy.is_disabled(
+            self.settings, self.platform
+        )
 
     @property
     def browser_cookie_source(self) -> str | None:
         """Configured browser name, or None when cookies are not in play."""
 
         if not self.use_browser_cookies:
+            return None
+        if self._fallback_disabled():
             return None
         source = (self.settings.ytdlp_cookies_from_browser or "").strip().lower()
         return source or None
@@ -212,6 +226,8 @@ class YtDlpEngine:
             return None, SessionOrigin()
         if self.managed_session_file is not None and self.managed_session_file.is_file():
             return self.managed_session_file, SessionOrigin(LoginSource.MANAGED)
+        if self._fallback_disabled():
+            return None, SessionOrigin()
         raw = (self.settings.ytdlp_cookiefile or "").strip()
         if not raw:
             return None, SessionOrigin()

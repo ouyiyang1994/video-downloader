@@ -77,6 +77,7 @@ class InstagramAdapter(PlatformAdapter):
             settings,
             use_browser_cookies=True,
             managed_session_file=session_file(settings, self.platform),
+            platform=self.platform,
         )
         if settings.instagram_access_token and settings.instagram_user_id:
             # Graph API results are, by construction, the authorised account's

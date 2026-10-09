@@ -67,6 +67,7 @@ from config.settings import (
     get_settings,
     save_proxy_configuration,
 )
+from core import fallback_policy
 from core.browser_cookies import (
     automatic_read_outlook,
     browser_label,
@@ -157,6 +158,12 @@ DETECT_BUSY_TEXT = "检测中…"
 PASTE_BUTTON_TEXT = "保存并验证"
 PASTE_BUSY_TEXT = "验证中…"
 LOGIN_BUSY_TEXT = "检测中…"
+
+#: Shown only while a platform's ``.env`` fallback is switched off by
+#: 「退出登录」, so the way back is always visible.
+REENABLE_FALLBACK_TEXT = "重新启用配置会话"
+#: Suffix on the sign-in row while that switch is off.
+FALLBACK_DISABLED_HINT = "（.env 配置会话已禁用）"
 
 #: Chrome extension helper.
 CHROME_HELPER_TITLE = "Chrome 登录助手"
@@ -1546,6 +1553,7 @@ class MainWindow(QMainWindow):
         #: Sign-in state, one entry per platform that supports it.
         self.login_adapters: dict[Platform, PlatformAdapter] = {}
         self.login_rows: dict[Platform, tuple[QLabel, QPushButton]] = {}
+        self.login_reenable: dict[Platform, QPushButton] = {}
         self.login_status: dict[Platform, SessionStatus | None] = {}
         self.login_workers: dict[Platform, LoginWorker] = {}
         #: The open sign-in dialog, if any, so closing the window can wait for
@@ -1772,9 +1780,19 @@ class MainWindow(QMainWindow):
             )
             row.addWidget(button)
 
+            # Only ever visible while this platform's ``.env`` fallback is
+            # switched off, so the way back is never hidden.
+            reenable = QPushButton(REENABLE_FALLBACK_TEXT)
+            reenable.setVisible(False)
+            reenable.clicked.connect(
+                lambda _checked=False, target=adapter: self._reenable_fallback(target)
+            )
+            row.addWidget(reenable)
+
             layout.addLayout(row)
             self.login_adapters[adapter.platform] = adapter
             self.login_rows[adapter.platform] = (state, button)
+            self.login_reenable[adapter.platform] = reenable
             self.login_status[adapter.platform] = None
 
         self.login_message = QLabel("")
@@ -1890,18 +1908,23 @@ class MainWindow(QMainWindow):
             )
 
     def _logout(self, adapter: PlatformAdapter) -> None:
-        """Delete the session this application stored, and nothing else."""
+        """Delete this application's session *and* switch the fallback off.
+
+        Deleting the managed file alone was not enough: the platform would be
+        logged straight back in on the next refresh through the ``.env``
+        fallback. Nothing in ``.env`` - or in any cookie file - is touched; the
+        switch only stops *this* application from reading those credentials,
+        and 「重新启用配置会话」 puts them back.
+        """
 
         platform = adapter.platform
-        if not has_session(self.settings, platform):
-            # There is nothing of ours to delete. Accepting the confirmation and
-            # then bouncing back to "已登录" - because ``.env`` still supplies a
-            # session - is exactly the confusing behaviour this explains away.
+        managed = has_session(self.settings, platform)
+        keys = adapter.fallback_config_keys()
+        if not managed and not keys:
             QMessageBox.information(
                 self,
                 "退出登录",
-                f"本程序没有保存 {adapter.display_name} 的会话。\n\n"
-                f"{self._login_origin_explanation(adapter)}",
+                f"本程序没有保存 {adapter.display_name} 的会话，也没有可禁用的 .env 配置会话。",
             )
             self.refresh_login_status()
             return
@@ -1909,9 +1932,7 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "退出登录",
-            f"确定要退出 {adapter.display_name} 吗？\n\n"
-            "只会删除本程序保存的该平台会话；浏览器里的登录状态完全不受影响。"
-            + self._fallback_warning(adapter),
+            self._logout_question(adapter, managed=managed, keys=keys),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -1922,69 +1943,72 @@ class MainWindow(QMainWindow):
         if QMessageBox.StandardButton(answer) is not QMessageBox.StandardButton.Yes:
             return
 
-        removed = delete_session(self.settings, adapter.platform)
-        self.login_status[adapter.platform] = SessionStatus(
-            platform=adapter.platform, state=LoginState.LOGGED_OUT
-        )
-        self._refresh_login_row(adapter.platform)
-        if removed:
-            self._set_login_message(
-                f"已退出 {adapter.display_name}（仅删除了本程序保存的会话，浏览器不受影响）",
-                ok=True,
-            )
-        else:
-            self._set_login_message(f"本程序没有保存 {adapter.display_name} 的会话", ok=None)
+        removed = delete_session(self.settings, platform)
+        fallback_policy.set_disabled(self.settings, platform, disabled=True)
+
+        self.login_status[platform] = SessionStatus(platform=platform, state=LoginState.LOGGED_OUT)
+        self._refresh_login_row(platform)
+        self._set_login_message(self._logout_result(adapter, removed=removed, keys=keys), ok=True)
         self.refresh_login_status()
 
     @staticmethod
-    def _fallback_warning(adapter: PlatformAdapter) -> str:
-        """Warn that a configured fallback can re-answer after a logout."""
+    def _logout_question(adapter: PlatformAdapter, *, managed: bool, keys: tuple[str, ...]) -> str:
+        """What the confirmation actually promises to do."""
 
-        keys = adapter.fallback_config_keys()
-        if not keys:
-            return ""
+        lines = [f"确定要退出 {adapter.display_name} 吗？", ""]
+        if managed:
+            lines.append("• 删除本程序保存的该平台会话。")
+        if keys:
+            lines.append(
+                "• 在本程序内禁用 .env 中的 " + "、".join(keys) + "（不再读取它们，"
+                "文件本身不会被删除或修改）。"
+            )
+        lines += [
+            "",
+            "这样刷新后该平台会保持「未登录」。浏览器里的登录状态不受影响；"
+            f"需要时点「{REENABLE_FALLBACK_TEXT}」即可恢复读取。",
+        ]
+        return "\n".join(lines)
+
+    @staticmethod
+    def _logout_result(adapter: PlatformAdapter, *, removed: bool, keys: tuple[str, ...]) -> str:
+        """What was actually done, so the row's next state is not a surprise."""
+
+        done: list[str] = []
+        if removed:
+            done.append("已删除本程序保存的会话")
+        if keys:
+            done.append("已禁用 .env 中的 " + "、".join(keys))
+        if not done:
+            return f"已退出 {adapter.display_name}。浏览器里的登录状态不受影响。"
         return (
-            "\n\n注意：.env 里的 "
-            + "、".join(keys)
-            + " 仍可能提供有效会话。退出后如果界面再次显示「已登录」，"
-            "那是这份配置在生效，本程序不会删除或禁用它。"
+            f"已退出 {adapter.display_name}（"
+            + "；".join(done)
+            + "）。浏览器里的登录状态不受影响。"
         )
 
-    def _login_origin_explanation(self, adapter: PlatformAdapter) -> str:
-        """Explain a login this application cannot cancel, naming the key."""
+    def _reenable_fallback(self, adapter: PlatformAdapter) -> None:
+        """Let this platform read its ``.env`` credentials again."""
 
-        status = self.login_status.get(adapter.platform)
-        origin = status.origin if status is not None else SessionOrigin()
+        platform = adapter.platform
         keys = adapter.fallback_config_keys()
+        answer = QMessageBox.question(
+            self,
+            REENABLE_FALLBACK_TEXT,
+            f"重新允许本程序读取 {adapter.display_name} 的 .env 配置会话吗？\n\n"
+            + ("将重新使用：" + "、".join(keys) + "\n\n" if keys else "")
+            + "如果这些配置仍然有效，刷新后会重新显示「已登录」；"
+            ".env 和任何 Cookie 文件都不会被修改。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if QMessageBox.StandardButton(answer) is not QMessageBox.StandardButton.Yes:
+            return
 
-        if origin.source is LoginSource.ENV_COOKIEFILE:
-            source = origin.key or "配置的回退文件"
-            return (
-                f"当前登录态来自 .env 中 {source} 指向的回退文件。\n\n"
-                "「退出登录」只能删除本程序保存的会话，不会删除或禁用该文件；"
-                "如需停止使用，请修改 .env 或删除该文件。\n\n"
-                "浏览器里的登录状态不受影响。"
-            )
-        if origin.source is LoginSource.ENV_VALUE:
-            source = origin.key or "会话配置"
-            return (
-                f"当前登录态来自 .env 中的 {source}。\n\n"
-                "「退出登录」不会删除或禁用 .env 里的配置；如需停止使用，请修改 .env。\n\n"
-                "浏览器里的登录状态不受影响。"
-            )
-        if origin.source is LoginSource.BROWSER:
-            return (
-                "当前登录态来自浏览器的 Cookie。请在浏览器里退出登录；"
-                "本程序不会改动浏览器的登录状态。"
-            )
-        if keys:
-            return (
-                "当前登录态来自 .env 中的 "
-                + "、".join(keys)
-                + "。\n\n「退出登录」不会删除或禁用这些配置；如需停止使用，请修改 .env。\n\n"
-                + "浏览器里的登录状态不受影响。"
-            )
-        return "本程序没有保存该平台的会话，「退出登录」没有可删除的内容。"
+        fallback_policy.set_disabled(self.settings, platform, disabled=False)
+        self._refresh_login_row(platform)
+        self._set_login_message(f"已重新启用 {adapter.display_name} 的 .env 配置会话。", ok=True)
+        self.refresh_login_status()
 
     # -- sign-in worker callbacks (always run on the GUI thread) -------------
     def _on_login_status(self, adapter: PlatformAdapter, status: SessionStatus) -> None:
@@ -2040,9 +2064,25 @@ class MainWindow(QMainWindow):
             state_label.setText("检测中…")
             button.setText("登录")
         else:
-            state_label.setText(status.summary() + self._login_source_hint(platform))
+            state_label.setText(
+                status.summary()
+                + self._login_source_hint(platform)
+                + self._fallback_disabled_hint(platform)
+            )
             button.setText(status.action_label)
         button.setEnabled(not running)
+
+        reenable = self.login_reenable.get(platform)
+        if reenable is not None:
+            reenable.setVisible(fallback_policy.is_disabled(self.settings, platform))
+            reenable.setEnabled(not running)
+
+    def _fallback_disabled_hint(self, platform: Platform) -> str:
+        """Say so while this platform's ``.env`` fallback is switched off."""
+
+        if not fallback_policy.is_disabled(self.settings, platform):
+            return ""
+        return FALLBACK_DISABLED_HINT
 
     def _refresh_login_controls(self) -> None:
         """Keep the refresh button in step with the running checks."""

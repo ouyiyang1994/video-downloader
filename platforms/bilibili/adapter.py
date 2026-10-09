@@ -15,7 +15,7 @@ from typing import Any
 
 import httpx
 
-from core import selection
+from core import fallback_policy, selection
 from core.exceptions import MetadataError, NotDownloadableError, RateLimitedError
 from core.http import load_cookie_header
 from core.interfaces import PlatformAdapter
@@ -140,18 +140,25 @@ class BilibiliAdapter(PlatformAdapter):
         self._cookie_origin = SessionOrigin()
 
     def _resolve_cookie(self) -> tuple[str | None, SessionOrigin]:
-        explicit = self.settings.bilibili_cookie_header()
-        if explicit:
-            key = "BILIBILI_COOKIE" if self.settings.bilibili_cookie else "BILIBILI_SESSDATA"
-            return explicit, SessionOrigin(LoginSource.ENV_VALUE, key)
+        # The order below is the long-standing precedence and must not change:
+        # an explicit .env value, then the managed session, then the .env file.
+        # 「退出登录」 only removes the two ``.env`` steps for this platform.
+        fallback_disabled = fallback_policy.is_disabled(self.settings, self.platform)
+
+        if not fallback_disabled:
+            explicit = self.settings.bilibili_cookie_header()
+            if explicit:
+                key = "BILIBILI_COOKIE" if self.settings.bilibili_cookie else "BILIBILI_SESSDATA"
+                return explicit, SessionOrigin(LoginSource.ENV_VALUE, key)
         managed = load_cookie_header(self.managed_session_file, domain_suffix=SESSION_DOMAIN)
         if managed:
             return managed, SessionOrigin(LoginSource.MANAGED)
-        configured = load_cookie_header(
-            self.settings.bilibili_cookie_file, domain_suffix=SESSION_DOMAIN
-        )
-        if configured:
-            return configured, SessionOrigin(LoginSource.ENV_COOKIEFILE, "BILIBILI_COOKIEFILE")
+        if not fallback_disabled:
+            configured = load_cookie_header(
+                self.settings.bilibili_cookie_file, domain_suffix=SESSION_DOMAIN
+            )
+            if configured:
+                return configured, SessionOrigin(LoginSource.ENV_COOKIEFILE, "BILIBILI_COOKIEFILE")
         return None, SessionOrigin()
 
     async def check_session(self, cookie_header: str | None) -> SessionStatus:

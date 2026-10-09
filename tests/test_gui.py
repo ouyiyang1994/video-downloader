@@ -20,7 +20,7 @@ import gui
 from config import settings as settings_module
 from config.constants import QUALITY_AUDIO_ONLY, QUALITY_PRESETS
 from config.settings import Settings
-from core import browser_cookies, session_store
+from core import browser_cookies, fallback_policy, session_store
 from core.chrome_bridge import BridgeStatus
 from core.database import DownloadDatabase
 from core.downloader import ProgressUpdate
@@ -945,22 +945,16 @@ def test_login_summary_names_the_env_source(window: gui.MainWindow) -> None:
     assert "来自 .env" in summary
 
 
-def test_logout_without_a_managed_session_explains_instead_of_deleting(
+def test_logout_with_nothing_to_do_only_explains(
     window: gui.MainWindow, settings: Settings, monkeypatch
 ) -> None:
-    """The button must not pretend it removed an ``.env`` fallback.
+    """No managed session and no fallback: there is genuinely nothing to do."""
 
-    This is the v1.08 behaviour that made the row bounce back to "已登录": the
-    confirmation was accepted, nothing of ours existed to delete, and the next
-    refresh pulled the session straight back from `.env`.
-    """
+    settings.ytdlp_cookiefile = None
+    settings.bilibili_cookie = None
+    settings.bilibili_sessdata = None
+    settings.bilibili_cookiefile = ""
 
-    window.login_status[Platform.INSTAGRAM] = SessionStatus(
-        platform=Platform.INSTAGRAM,
-        state=LoginState.LOGGED_IN,
-        account="bosco.slash",
-        origin=SessionOrigin(LoginSource.ENV_COOKIEFILE, "YTDLP_COOKIEFILE"),
-    )
     explained: list[str] = []
     monkeypatch.setattr(
         gui.QMessageBox, "information", lambda *args, **kwargs: explained.append(args[2])
@@ -968,22 +962,21 @@ def test_logout_without_a_managed_session_explains_instead_of_deleting(
     monkeypatch.setattr(
         gui.QMessageBox,
         "question",
-        lambda *args, **kwargs: pytest.fail("没有托管会话时不应再弹「确认退出」"),
+        lambda *args, **kwargs: pytest.fail("没有可退出的内容时不应弹「确认退出」"),
     )
     monkeypatch.setattr(window, "refresh_login_status", lambda: None)
 
     window._logout(window.login_adapters[Platform.INSTAGRAM])
 
     assert explained, "应弹出说明"
-    assert "YTDLP_COOKIEFILE" in explained[0]
     assert ".env" in explained[0]
-    assert not session_store.has_session(settings, Platform.INSTAGRAM)
+    assert not fallback_policy.is_disabled(settings, Platform.INSTAGRAM)
 
 
-def test_logout_warns_that_the_env_fallback_will_still_answer(
+def test_logout_dialog_names_the_keys_it_will_disable(
     window: gui.MainWindow, settings: Settings, monkeypatch, tmp_path: Path
 ) -> None:
-    """A managed session plus a configured fallback: say what happens next."""
+    """The confirmation says exactly what changes - and what does not."""
 
     settings.ytdlp_cookiefile = str(tmp_path / "cookies.txt")
     _store_session(settings, Platform.INSTAGRAM)
@@ -992,7 +985,7 @@ def test_logout_warns_that_the_env_fallback_will_still_answer(
 
     def _ask(*args: object, **kwargs: object) -> int:
         prompts.append(str(args[2]))
-        # Cancel, so nothing is deleted and the warning is the only assertion.
+        # Cancel, so nothing changes and the wording is the only assertion.
         return int(gui.QMessageBox.StandardButton.No)
 
     monkeypatch.setattr(gui.QMessageBox, "question", _ask)
@@ -1001,8 +994,180 @@ def test_logout_warns_that_the_env_fallback_will_still_answer(
     window._logout(window.login_adapters[Platform.INSTAGRAM])
 
     assert "YTDLP_COOKIEFILE" in prompts[0]
-    assert "再次显示「已登录」" in prompts[0]
+    assert "禁用" in prompts[0]
+    assert "未登录" in prompts[0]
     assert session_store.has_session(settings, Platform.INSTAGRAM), "取消时不得删除"
+    assert not fallback_policy.is_disabled(settings, Platform.INSTAGRAM), "取消时不得禁用"
+
+
+@pytest.mark.parametrize(
+    ("platform", "key"),
+    [(Platform.INSTAGRAM, "YTDLP_COOKIEFILE"), (Platform.BILIBILI, "BILIBILI_COOKIEFILE")],
+)
+def test_logout_deletes_the_session_and_disables_the_fallback(
+    window: gui.MainWindow,
+    settings: Settings,
+    monkeypatch,
+    tmp_path: Path,
+    platform: Platform,
+    key: str,
+) -> None:
+    """The two rows are switched independently, and only one file is deleted."""
+
+    other = Platform.BILIBILI if platform is Platform.INSTAGRAM else Platform.INSTAGRAM
+    _store_session(settings, platform, value="MINE")
+    _store_session(settings, other, value="OTHER")
+    other_path = session_store.session_file(settings, other)
+    other_before = other_path.read_bytes()
+
+    if platform is Platform.INSTAGRAM:
+        settings.ytdlp_cookiefile = str(tmp_path / "cookies.txt")
+    else:
+        settings.bilibili_cookie = None
+        settings.bilibili_sessdata = None
+        settings.bilibili_cookiefile = str(tmp_path / "bili.txt")
+
+    monkeypatch.setattr(
+        gui.QMessageBox,
+        "question",
+        lambda *args, **kwargs: int(gui.QMessageBox.StandardButton.Yes),
+    )
+    monkeypatch.setattr(window, "refresh_login_status", lambda: None)
+
+    window._logout(window.login_adapters[platform])
+
+    assert not session_store.has_session(settings, platform), "托管会话应被删除"
+    assert fallback_policy.is_disabled(settings, platform) is True, "该平台的回退应被禁用"
+    assert window.login_status[platform].state is LoginState.LOGGED_OUT
+    # 另一个平台既没被禁用，文件也没被动过
+    assert fallback_policy.is_disabled(settings, other) is False
+    assert session_store.has_session(settings, other)
+    assert other_path.read_bytes() == other_before
+
+
+def test_logout_result_names_what_was_disabled(
+    window: gui.MainWindow, settings: Settings, monkeypatch, tmp_path: Path
+) -> None:
+    settings.ytdlp_cookiefile = str(tmp_path / "cookies.txt")
+    _store_session(settings, Platform.INSTAGRAM)
+    monkeypatch.setattr(
+        gui.QMessageBox,
+        "question",
+        lambda *args, **kwargs: int(gui.QMessageBox.StandardButton.Yes),
+    )
+    monkeypatch.setattr(window, "refresh_login_status", lambda: None)
+
+    window._logout(window.login_adapters[Platform.INSTAGRAM])
+
+    message = window.login_message.text()
+    assert "YTDLP_COOKIEFILE" in message
+    assert "禁用" in message
+
+
+def test_the_reenable_button_appears_only_while_disabled(
+    window: gui.MainWindow, settings: Settings
+) -> None:
+    platform = Platform.INSTAGRAM
+    button = window.login_reenable[platform]
+    window.login_status[platform] = SessionStatus(platform=platform, state=LoginState.LOGGED_OUT)
+
+    window._refresh_login_row(platform)
+    assert button.isHidden() is True
+
+    fallback_policy.set_disabled(settings, platform, disabled=True)
+    window._refresh_login_row(platform)
+
+    state_label, _action = window.login_rows[platform]
+    assert button.isHidden() is False, "禁用后必须能看到恢复入口"
+    assert gui.FALLBACK_DISABLED_HINT in state_label.text()
+
+    fallback_policy.set_disabled(settings, platform, disabled=False)
+    window._refresh_login_row(platform)
+    assert button.isHidden() is True
+    assert gui.FALLBACK_DISABLED_HINT not in state_label.text()
+
+
+def test_reenable_action_restores_the_env_source(
+    window: gui.MainWindow, settings: Settings, monkeypatch, tmp_path: Path
+) -> None:
+    platform = Platform.INSTAGRAM
+    settings.ytdlp_cookiefile = str(tmp_path / "cookies.txt")
+    fallback_policy.set_disabled(settings, platform, disabled=True)
+    monkeypatch.setattr(
+        gui.QMessageBox,
+        "question",
+        lambda *args, **kwargs: int(gui.QMessageBox.StandardButton.Yes),
+    )
+    monkeypatch.setattr(window, "refresh_login_status", lambda: None)
+
+    window._reenable_fallback(window.login_adapters[platform])
+
+    assert fallback_policy.is_disabled(settings, platform) is False
+    assert "重新启用" in window.login_message.text()
+
+
+def test_reenable_action_can_be_cancelled(
+    window: gui.MainWindow, settings: Settings, monkeypatch
+) -> None:
+    platform = Platform.INSTAGRAM
+    fallback_policy.set_disabled(settings, platform, disabled=True)
+    monkeypatch.setattr(
+        gui.QMessageBox,
+        "question",
+        lambda *args, **kwargs: int(gui.QMessageBox.StandardButton.No),
+    )
+    monkeypatch.setattr(window, "refresh_login_status", lambda: None)
+
+    window._reenable_fallback(window.login_adapters[platform])
+
+    assert fallback_policy.is_disabled(settings, platform) is True
+
+
+def test_status_refresh_stays_logged_out_after_the_switch(
+    settings: Settings, registry: PlatformRegistry, tmp_path: Path
+) -> None:
+    """The bounce is gone: the fallback file is still there, but ignored.
+
+    The real ``InstagramAdapter.check_session`` answers without any request when
+    the header carries no ``sessionid``, so this stays offline.
+    """
+
+    settings.ytdlp_cookiefile = str(
+        _write_fallback_cookies(tmp_path / "cookies.txt", domain="instagram.com", name="sessionid")
+    )
+    fallback_policy.set_disabled(settings, Platform.INSTAGRAM, disabled=True)
+
+    worker = gui.LoginWorker(settings, registry.get(Platform.INSTAGRAM), gui.LoginAction.STATUS)
+    status = asyncio.run(worker._run())
+
+    assert status.state is LoginState.LOGGED_OUT
+
+
+def test_a_new_sign_in_still_works_while_the_fallback_is_disabled(
+    settings: Settings, registry: PlatformRegistry, monkeypatch, tmp_path: Path
+) -> None:
+    """A fresh managed session - from the extension or the browser - wins."""
+
+    settings.ytdlp_cookiefile = str(
+        _write_fallback_cookies(tmp_path / "cookies.txt", domain="instagram.com", name="sessionid")
+    )
+    fallback_policy.set_disabled(settings, Platform.INSTAGRAM, disabled=True)
+    _store_session(settings, Platform.INSTAGRAM, value="FRESH")
+
+    async def _logged_in(self, header, *, origin=None):  # noqa: ANN001
+        return SessionStatus(
+            platform=self.adapter.platform,
+            state=LoginState.LOGGED_IN,
+            origin=origin or SessionOrigin(),
+        )
+
+    monkeypatch.setattr(gui.LoginWorker, "_check", _logged_in)
+
+    worker = gui.LoginWorker(settings, registry.get(Platform.INSTAGRAM), gui.LoginAction.STATUS)
+    status = asyncio.run(worker._run())
+
+    assert status.logged_in is True
+    assert status.origin.managed is True
 
 
 def test_status_refresh_labels_the_instagram_fallback_origin(
