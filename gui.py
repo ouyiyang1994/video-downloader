@@ -1872,7 +1872,11 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
-        if answer is not QMessageBox.StandardButton.Yes:
+        # PySide6 hands back a plain ``int`` (``0x4000``) here even though the
+        # Qt API is typed as ``StandardButton``. Comparing with ``is`` would
+        # therefore treat a real "Yes" as "not Yes" and skip the deletion - the
+        # v1.07 logout did nothing at all. Normalise first, then compare.
+        if QMessageBox.StandardButton(answer) is not QMessageBox.StandardButton.Yes:
             return
 
         removed = delete_session(self.settings, adapter.platform)

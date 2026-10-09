@@ -793,9 +793,9 @@ def test_login_row_flags_a_session_that_came_from_env(
     assert ".env" in state_label.text()
 
 
-def test_logout_removes_only_this_application_session(
-    window: gui.MainWindow, settings: Settings, monkeypatch
-) -> None:
+def _write_both_sessions(settings: Settings) -> None:
+    """One managed session per platform, both inside the temporary root."""
+
     for platform, name, domain in (
         (Platform.BILIBILI, "SESSDATA", ".bilibili.com"),
         (Platform.INSTAGRAM, "sessionid", ".instagram.com"),
@@ -807,33 +807,80 @@ def test_logout_removes_only_this_application_session(
             domain_suffix=domain.lstrip("."),
         )
 
+
+@pytest.mark.parametrize("target", [Platform.BILIBILI, Platform.INSTAGRAM])
+def test_logout_removes_only_this_application_session(
+    window: gui.MainWindow, settings: Settings, monkeypatch, target: Platform
+) -> None:
+    """A confirmed logout deletes exactly one file, whatever Qt returns.
+
+    ``QMessageBox.question`` is documented as returning ``StandardButton`` but
+    PySide6 6.11 actually returns a plain ``int`` (``0x4000`` for Yes). The stub
+    returns that same ``int`` so this test exercises the comparison the user's
+    Qt build performs - returning the enum member is what hid the v1.07 bug.
+    """
+
+    _write_both_sessions(settings)
+
     monkeypatch.setattr(
-        gui.QMessageBox, "question", lambda *a, **k: gui.QMessageBox.StandardButton.Yes
+        gui.QMessageBox,
+        "question",
+        lambda *a, **k: int(gui.QMessageBox.StandardButton.Yes),
     )
     monkeypatch.setattr(window, "refresh_login_status", lambda: None)
 
-    window._logout(window.login_adapters[Platform.BILIBILI])
+    window._logout(window.login_adapters[target])
 
-    assert not session_store.has_session(settings, Platform.BILIBILI)
-    assert session_store.has_session(settings, Platform.INSTAGRAM), "另一个平台必须保留"
-    assert window.login_status[Platform.BILIBILI] is not None
-    assert window.login_status[Platform.BILIBILI].state is LoginState.LOGGED_OUT
+    other = Platform.INSTAGRAM if target is Platform.BILIBILI else Platform.BILIBILI
+    assert not session_store.has_session(settings, target)
+    assert session_store.has_session(settings, other), "另一个平台必须保留"
+    assert window.login_status[target] is not None
+    assert window.login_status[target].state is LoginState.LOGGED_OUT
 
 
 def test_logout_can_be_cancelled(window: gui.MainWindow, settings: Settings, monkeypatch) -> None:
-    session_store.write_session(
-        settings,
-        Platform.BILIBILI,
-        [session_store.make_cookie("SESSDATA", "v", domain=".bilibili.com")],
-        domain_suffix="bilibili.com",
-    )
+    """``No`` - an ``int`` again - must leave every session file alone."""
+
+    _write_both_sessions(settings)
     monkeypatch.setattr(
-        gui.QMessageBox, "question", lambda *a, **k: gui.QMessageBox.StandardButton.No
+        gui.QMessageBox,
+        "question",
+        lambda *a, **k: int(gui.QMessageBox.StandardButton.No),
     )
+    monkeypatch.setattr(window, "refresh_login_status", lambda: None)
 
-    window._logout(window.login_adapters[Platform.BILIBILI])
+    window._logout(window.login_adapters[Platform.INSTAGRAM])
 
+    assert session_store.has_session(settings, Platform.INSTAGRAM)
     assert session_store.has_session(settings, Platform.BILIBILI)
+
+
+def test_logout_only_ever_touches_the_temporary_session_directory(
+    window: gui.MainWindow, settings: Settings, monkeypatch, tmp_path: Path
+) -> None:
+    """The sign-in flow must never reach the developer's real ``secrets/``.
+
+    ``conftest.settings`` points ``session_dir`` at ``tmp_path``; a logout that
+    escaped that folder would delete a real session file, so the boundary is
+    asserted explicitly rather than assumed.
+    """
+
+    _write_both_sessions(settings)
+    managed = session_store.session_dir(settings)
+    assert managed == tmp_path / "secrets"
+    assert managed.is_relative_to(tmp_path)
+
+    monkeypatch.setattr(
+        gui.QMessageBox,
+        "question",
+        lambda *a, **k: int(gui.QMessageBox.StandardButton.Yes),
+    )
+    monkeypatch.setattr(window, "refresh_login_status", lambda: None)
+
+    window._logout(window.login_adapters[Platform.INSTAGRAM])
+
+    assert not (managed / "instagram_cookies.txt").exists()
+    assert (managed / "bilibili_cookies.txt").is_file()
 
 
 def test_wait_for_thread_tolerates_a_destroyed_worker() -> None:
