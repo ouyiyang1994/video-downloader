@@ -69,7 +69,16 @@ KEYWORD_EXEMPT_PREFIXES: tuple[str, ...] = ("chrome-extension",)
 KEYWORD_EXEMPT_FILENAMES: frozenset[str] = frozenset({".env.example"})
 
 #: Files that must never ship (``.env.example`` is explicitly allowed).
+#: Compared case-insensitively - see :func:`structural_violations`.
 FORBIDDEN_FILENAMES: frozenset[str] = frozenset({".env", "cookies.txt"})
+
+#: Filename *endings* that must never ship. A browser export is
+#: ``<domain>_cookies.txt`` at least as often as it is ``cookies.txt``, and every
+#: managed session under ``secrets/`` uses exactly that shape - so a session file
+#: that somehow escaped its folder is still caught by name, not only by the
+#: value check that depends on the developer's own credentials being readable.
+FORBIDDEN_FILENAME_SUFFIXES: tuple[str, ...] = ("_cookies.txt",)
+
 FORBIDDEN_DIRNAMES: frozenset[str] = frozenset({"secrets"})
 FORBIDDEN_SUFFIXES: frozenset[str] = frozenset({".db", ".part", ".log", ".sqlite", ".sqlite3"})
 
@@ -155,20 +164,27 @@ def collect_secret_values(project_root: Path) -> list[bytes]:
 
 
 def structural_violations(dist: Path) -> list[str]:
-    """Files and directories that must never be part of the distribution."""
+    """Files and directories that must never be part of the distribution.
+
+    Every name is folded to lower case before it is compared. Windows treats
+    ``.ENV``, ``Cookies.TXT`` and ``SECRETS\\`` as the very same files as their
+    lower-case spellings, so a case-sensitive check would report a clean tree
+    while the installer happily packed a real credential file.
+    """
 
     problems: list[str] = []
     for path in sorted(dist.rglob("*")):
         relative = path.relative_to(dist)
+        name = path.name.casefold()
         if path.is_dir():
-            if path.name in FORBIDDEN_DIRNAMES:
+            if name in FORBIDDEN_DIRNAMES:
                 problems.append(f"禁止的目录: {relative}")
             continue
         if not path.is_file():
             continue
-        if path.name in FORBIDDEN_FILENAMES:
+        if name in FORBIDDEN_FILENAMES or name.endswith(FORBIDDEN_FILENAME_SUFFIXES):
             problems.append(f"禁止的文件: {relative}")
-        elif path.suffix.lower() in FORBIDDEN_SUFFIXES:
+        elif path.suffix.casefold() in FORBIDDEN_SUFFIXES:
             problems.append(f"禁止的文件类型: {relative}")
     return problems
 

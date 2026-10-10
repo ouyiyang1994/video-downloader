@@ -7,7 +7,9 @@ Everything runs headless through the offscreen Qt platform (set in
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+import socket
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1462,6 +1464,30 @@ def test_dialog_survives_a_browser_that_raises(
     assert "无法自动打开浏览器" in dialog.status_label.text()
 
 
+def test_dialog_points_at_the_extension_when_no_session_was_delivered(
+    qtbot, settings: Settings, registry: PlatformRegistry
+) -> None:
+    """The extension is the route that works, so it must not be named last.
+
+    The old wording sent the user straight to 「手动填写会话」 even though the
+    session had simply not been handed over yet - the one case where sending
+    from the extension again is the whole fix.
+    """
+
+    dialog = gui.LoginDialog(settings, registry.get(Platform.INSTAGRAM))
+    qtbot.addWidget(dialog)
+
+    dialog._on_browser_unavailable(  # noqa: SLF001 - the callback is the contract
+        _unreadable_browser()
+    )
+
+    text = dialog.status_label.text()
+    assert "登录助手" in text
+    assert "发送到 Video Downloader" in text
+    assert text.index("登录助手") < text.index("手动填写会话"), "先发送会话，再考虑手动填写"
+    assert not dialog.manual_box.isHidden()
+
+
 def test_login_worker_failure_never_logs_the_pasted_value(
     settings: Settings, registry: PlatformRegistry, caplog
 ) -> None:
@@ -1599,6 +1625,170 @@ def test_acquire_never_asks_the_platform_when_nothing_is_stored(
     worker.run()
 
     assert unavailable == [error]
+
+
+def test_acquire_repairs_a_foreign_registration_before_relying_on_the_extension(
+    settings: Settings, registry: PlatformRegistry, monkeypatch
+) -> None:
+    """A stale registration sends the extension's delivery somewhere we never read.
+
+    Chrome gives a native-messaging message to whichever host the ``HKCU`` key
+    names. A development checkout - or an installation under a different data
+    root - that registered last therefore swallows the session into *its*
+    folder: the helper reports success, the file really is on disk, and
+    「自动获取」 still answers "no session", because nothing ever landed here.
+    Re-pointing the key before the user is asked to send is what closes that.
+    """
+
+    error = _unreadable_browser()
+    monkeypatch.setattr(gui, "extract_session", lambda domain: (_ for _ in ()).throw(error))
+
+    async def _never(  # noqa: ANN001 - stands in for LoginWorker._check
+        self: gui.LoginWorker, header: str | None, *, origin: SessionOrigin | None = None
+    ) -> SessionStatus:
+        raise AssertionError("没有已保存的会话时不应发起校验请求")
+
+    monkeypatch.setattr(gui.LoginWorker, "_check", _never)
+
+    asked: list[Settings] = []
+
+    def _repair(target: Settings) -> tuple[str, ...]:
+        asked.append(target)
+        return ("chrome",)
+
+    monkeypatch.setattr(gui, "repair_registration", _repair)
+
+    worker = gui.LoginWorker(settings, registry.get(Platform.INSTAGRAM), gui.LoginAction.ACQUIRE)
+    worker.run()
+
+    assert asked == [settings], "获取会话前必须先确认注册指向本程序"
+
+
+def test_a_registry_that_cannot_be_repaired_never_blocks_a_sign_in(
+    settings: Settings, registry: PlatformRegistry, monkeypatch
+) -> None:
+    """The re-point is best effort: a registry hiccup must not become an error."""
+
+    error = _unreadable_browser()
+    monkeypatch.setattr(gui, "extract_session", lambda domain: (_ for _ in ()).throw(error))
+
+    def _boom(target: Settings) -> tuple[str, ...]:
+        raise OSError("注册表不可用")
+
+    monkeypatch.setattr(gui, "repair_registration", _boom)
+
+    worker = gui.LoginWorker(settings, registry.get(Platform.INSTAGRAM), gui.LoginAction.ACQUIRE)
+    reported: list[object] = []
+    worker.browser_unavailable.connect(reported.append)
+
+    worker.run()
+
+    assert reported == [error], "注册表故障不应改变对用户的答复"
+
+
+def test_a_missing_session_is_recorded_in_the_log(
+    settings: Settings, registry: PlatformRegistry, monkeypatch, caplog
+) -> None:
+    """The two failure modes must be distinguishable after the fact.
+
+    "the extension never delivered" and "the delivery went to a folder this
+    application does not read" used to look identical *and* leave no trace at
+    all, which is what made this report so hard to diagnose.
+    """
+
+    error = _unreadable_browser()
+    monkeypatch.setattr(gui, "extract_session", lambda domain: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(gui, "repair_registration", lambda target: ())
+
+    worker = gui.LoginWorker(settings, registry.get(Platform.INSTAGRAM), gui.LoginAction.ACQUIRE)
+
+    with caplog.at_level(logging.INFO):
+        worker.run()
+
+    assert "没有已保存的 instagram 会话" in caplog.text
+
+
+def test_a_received_session_the_platform_rejects_is_logged_apart(
+    settings: Settings, registry: PlatformRegistry, monkeypatch, caplog
+) -> None:
+    """"Delivered, but the platform says no" must not read like "nothing arrived"."""
+
+    error = _unreadable_browser()
+    monkeypatch.setattr(gui, "extract_session", lambda domain: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(gui, "repair_registration", lambda target: ())
+    _store_session(settings, Platform.INSTAGRAM)
+
+    async def _expired(  # noqa: ANN001 - stands in for LoginWorker._check
+        self: gui.LoginWorker, header: str | None, *, origin: SessionOrigin | None = None
+    ) -> SessionStatus:
+        return SessionStatus(
+            platform=Platform.INSTAGRAM, state=LoginState.EXPIRED, detail="登录已过期"
+        )
+
+    monkeypatch.setattr(gui.LoginWorker, "_check", _expired)
+
+    worker = gui.LoginWorker(settings, registry.get(Platform.INSTAGRAM), gui.LoginAction.ACQUIRE)
+
+    with caplog.at_level(logging.INFO):
+        worker.run()
+
+    assert "已收到 instagram 的会话，但平台判定未登录" in caplog.text
+    assert "没有已保存的 instagram 会话" not in caplog.text
+
+
+def test_a_received_session_that_cannot_be_confirmed_is_logged_apart(
+    settings: Settings, registry: PlatformRegistry, monkeypatch, caplog
+) -> None:
+    """"Delivered, but we could not ask the platform" is its own sentence too."""
+
+    error = _unreadable_browser()
+    monkeypatch.setattr(gui, "extract_session", lambda domain: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(gui, "repair_registration", lambda target: ())
+    _store_session(settings, Platform.INSTAGRAM)
+
+    async def _unknown(  # noqa: ANN001 - stands in for LoginWorker._check
+        self: gui.LoginWorker, header: str | None, *, origin: SessionOrigin | None = None
+    ) -> SessionStatus:
+        return SessionStatus(
+            platform=Platform.INSTAGRAM,
+            state=LoginState.UNKNOWN,
+            detail="Instagram 触发限流（HTTP 429）",
+        )
+
+    monkeypatch.setattr(gui.LoginWorker, "_check", _unknown)
+
+    worker = gui.LoginWorker(settings, registry.get(Platform.INSTAGRAM), gui.LoginAction.ACQUIRE)
+
+    with caplog.at_level(logging.INFO):
+        worker.run()
+
+    assert "已收到 instagram 的会话，但暂时无法向平台确认" in caplog.text
+    assert "平台判定未登录" not in caplog.text
+    assert "没有已保存的 instagram 会话" not in caplog.text
+
+
+def test_the_login_dialog_repairs_the_registration_before_inviting_a_send(
+    qtbot, settings: Settings, registry: PlatformRegistry, monkeypatch
+) -> None:
+    """The dialog is where the user is told to send, so it must be reachable.
+
+    Sending from the extension only delivers to *this* installation while the
+    HKCU key names our host, and this box is what tells the user to go and send.
+    """
+
+    monkeypatch.setattr(gui.webbrowser, "open", lambda *a, **k: True)
+    asked: list[Settings] = []
+
+    def _repair(target: Settings) -> tuple[str, ...]:
+        asked.append(target)
+        return ("chrome",)
+
+    monkeypatch.setattr(gui, "repair_registration", _repair)
+
+    dialog = gui.LoginDialog(settings, registry.get(Platform.BILIBILI))
+    qtbot.addWidget(dialog)
+
+    assert asked == [settings], "登录对话框出现前必须先把注册指向本程序"
 
 
 def test_acquire_keeps_the_stored_session_when_it_cannot_be_confirmed(
@@ -2135,13 +2325,29 @@ def test_closing_the_debug_browser_is_reported(login_dialog, monkeypatch) -> Non
     assert "没有在运行" in login_dialog.status_label.text()
 
 
+def _free_port() -> int:
+    """An ephemeral port nothing is listening on.
+
+    Same trick as ``test_local_bridge``'s fixture: production pins the bridge to
+    8765 because the extension has to know it, so a test has to be handed a port
+    of its own - otherwise a Video Downloader already running on this machine
+    holds 8765 and fails a test that has nothing to do with it.
+    """
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
 def test_the_login_dialog_starts_the_loopback_fallback_when_shown(
     qtbot, settings: Settings, registry: PlatformRegistry, monkeypatch
 ) -> None:
     """The fallback only listens while the window is open - no idle socket."""
 
     monkeypatch.setattr(gui.webbrowser, "open", lambda *a, **k: True)
-    dialog = gui.LoginDialog(settings, registry.get(Platform.BILIBILI))
+    dialog = gui.LoginDialog(
+        settings, registry.get(Platform.BILIBILI), bridge_port=_free_port()
+    )
     qtbot.addWidget(dialog)
 
     assert dialog.bridge.running is False, "构造对话框不应开监听端口"
@@ -2152,6 +2358,19 @@ def test_the_login_dialog_starts_the_loopback_fallback_when_shown(
 
     dialog.close()
     assert dialog.bridge.running is False, "关闭后必须释放端口"
+
+
+def test_the_production_bridge_port_is_still_the_fixed_one(
+    qtbot, settings: Settings, registry: PlatformRegistry, monkeypatch
+) -> None:
+    """The override above must not become a way to move the real port."""
+
+    monkeypatch.setattr(gui.webbrowser, "open", lambda *a, **k: True)
+
+    dialog = gui.LoginDialog(settings, registry.get(Platform.BILIBILI))
+    qtbot.addWidget(dialog)
+
+    assert dialog.bridge.port == gui.BRIDGE_DEFAULT_PORT == 8765
 
 
 def test_a_busy_bridge_port_does_not_break_the_dialog(

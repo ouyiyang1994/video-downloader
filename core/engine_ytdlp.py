@@ -188,9 +188,12 @@ class YtDlpEngine:
     def _fallback_disabled(self) -> bool:
         """True when the user switched this platform's ``.env`` fallback off."""
 
-        return self.platform is not None and fallback_policy.is_disabled(
-            self.settings, self.platform
-        )
+        return self.platform is not None and self._fallback_disabled_for(self.platform)
+
+    def _fallback_disabled_for(self, platform: Platform) -> bool:
+        """True when ``platform``'s ``.env`` credentials must not be used."""
+
+        return fallback_policy.is_disabled(self.settings, platform)
 
     @property
     def browser_cookie_source(self) -> str | None:
@@ -259,9 +262,14 @@ class YtDlpEngine:
         elif browser:
             # yt-dlp accepts a 1-tuple: (browser, profile, keyring, container).
             options["cookiesfrombrowser"] = (browser,)
-        cookie = self.settings.bilibili_cookie_header()
-        if referer and "bilibili" in referer and cookie:
-            options["http_headers"]["Cookie"] = cookie
+        # Bilibili's credentials also live in ``.env``, so the switch that hides
+        # them for a signed-out Bilibili has to apply to this branch as well -
+        # otherwise a "disabled" platform would still authenticate through
+        # yt-dlp's headers.
+        if referer and "bilibili" in referer and not self._fallback_disabled_for(Platform.BILIBILI):
+            cookie = self.settings.bilibili_cookie_header()
+            if cookie:
+                options["http_headers"]["Cookie"] = cookie
         return options
 
     def _extract_sync(self, url: str, referer: str | None) -> dict[str, Any]:

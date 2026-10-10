@@ -93,7 +93,13 @@ else {
         -What 'dist 敏感信息扫描'
     $forbidden = Get-ChildItem -LiteralPath $AppDir -Recurse -Force -ErrorAction SilentlyContinue |
         Where-Object {
-            $_.Name -in @('.env', 'cookies.txt') -or $_.Name -eq 'secrets' -or
+            # Same rules as scan_secrets.py and installer.iss: a browser export is
+            # <domain>_cookies.txt as often as it is cookies.txt, so the suffix is
+            # checked as well. -in / -like are case-insensitive, which is exactly
+            # what a Windows path comparison needs.
+            $_.Name -in @('.env', 'cookies.txt') -or
+            $_.Name -like '*_cookies.txt' -or
+            $_.Name -eq 'secrets' -or
             $_.Extension -in @('.db', '.log', '.part', '.sqlite', '.sqlite3')
         }
     if ($forbidden) {

@@ -24,6 +24,7 @@ user's own browser on this machine.
 
 from __future__ import annotations
 
+import contextlib
 import http.server
 import json
 import logging
@@ -43,6 +44,14 @@ ROUTE = "/session"
 
 #: A session is a few kilobytes; anything larger is a mistake or an attack.
 MAX_BODY_BYTES = 512 * 1024
+
+#: How much of a *refused* request's body we are still willing to read. Bounded,
+#: so a hostile ``Content-Length`` cannot pin a worker thread on a body we are
+#: about to reject anyway.
+DRAIN_LIMIT_BYTES = MAX_BODY_BYTES + 1
+
+#: A peer that stops mid-body must not hold the worker thread open forever.
+DRAIN_TIMEOUT_SECONDS = 2.0
 
 
 def bridge_url(port: int = DEFAULT_PORT) -> str:
@@ -73,6 +82,40 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib name
         logger.debug("本地桥接 %s：%s", self.address_string(), format % args)
 
+    def _drain_request_body(self) -> None:
+        """Swallow the rest of a refused request's body before we close.
+
+        Closing a socket while unread bytes are still queued makes Windows send
+        RST instead of FIN, and the client then loses the refusal we just wrote
+        - it reports ``WinError 10053`` rather than reading the 403/413. The
+        oversized case is exactly that: we answer while the peer is still
+        sending. Reading the body first keeps the close orderly.
+        """
+
+        try:
+            remaining = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return
+        remaining = min(remaining, DRAIN_LIMIT_BYTES)
+        if remaining <= 0:
+            return
+
+        previous = self.connection.gettimeout()
+        self.connection.settimeout(DRAIN_TIMEOUT_SECONDS)
+        try:
+            while remaining > 0:
+                chunk = self.rfile.read(min(remaining, 64 * 1024))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except OSError:
+            # The peer stalled or vanished; there is nothing left to drain and
+            # the refusal has already been written.
+            logger.debug("本地桥接：拒绝请求时未能读完请求体")
+        finally:
+            with contextlib.suppress(OSError):
+                self.connection.settimeout(previous)
+
     def _reply(self, status: int, payload: dict[str, Any], *, cors: bool = False) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -91,6 +134,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", self.headers["Origin"])
         self.end_headers()
         self.wfile.write(body)
+        if status != 200:
+            self._drain_request_body()
 
     def _origin_allowed(self) -> bool:
         return self.headers.get("Origin", "") in self._allowed_origins

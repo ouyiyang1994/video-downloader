@@ -5,10 +5,15 @@ A Windows release touches four files that must never drift apart:
 
 ==============================  ==========================================
 ``pyproject.toml``              ``[project].version``
-``packaging/installer.iss``     ``#define AppVersion``
+``packaging/installer.iss``     ``#define AppVersion`` *and*
+                                ``VersionInfoVersion``
 ``packaging/version_info.txt``  ``filevers`` / ``prodvers`` / the strings
 ``uv.lock``                     the root package entry (PEP 440 normalised)
 ==============================  ==========================================
+
+``VersionInfoVersion`` is the one Setup.exe's own file properties report, so it
+is checked as well: a stale value there ships an installer Windows believes is
+a different release than the one the application calls itself.
 
 ``uv.lock`` stores the *normalised* form, so ``1.03`` is written as ``1.3``
 by uv itself.  That is expected and is handled here.
@@ -54,6 +59,10 @@ _VERSION_RE = re.compile(
 _ISS_RE = re.compile(
     r'^(?P<prefix>[ \t]*#define[ \t]+AppVersion[ \t]+)"(?P<value>[^"]*)"', re.MULTILINE
 )
+#: ``VersionInfoVersion=1.11.0.0`` - a dotted quad, not a ``#define``.
+_ISS_VERSIONINFO_RE = re.compile(
+    r"^(?P<prefix>[ \t]*VersionInfoVersion[ \t]*=[ \t]*)(?P<value>[0-9][0-9.]*)", re.MULTILINE
+)
 _QUAD_RE = re.compile(
     r"^(?P<prefix>[ \t]*(?:filevers|prodvers)[ \t]*=[ \t]*)\((?P<value>[^)]*)\)", re.MULTILINE
 )
@@ -64,6 +73,7 @@ _STRING_RE = re.compile(
 
 #: Keys reported by :func:`snapshot`, in a stable order.
 QUAD_KEY = "packaging/version_info.txt (quad)"
+ISS_VERSIONINFO_KEY = "packaging/installer.iss (VersionInfoVersion)"
 
 
 def use_utf8_output() -> None:
@@ -106,6 +116,12 @@ def version_quad(raw: str) -> str:
     return ", ".join(str(number) for number in numbers)
 
 
+def version_info_dotted(raw: str) -> str:
+    """``"1.03"`` -> ``"1.3.0.0"`` - the form Inno Setup's ``VersionInfoVersion`` wants."""
+
+    return version_quad(raw).replace(", ", ".")
+
+
 def normalised(raw: str) -> str:
     """The form uv writes into ``uv.lock`` (PEP 440 drops leading zeros)."""
 
@@ -138,6 +154,15 @@ def read_installer(text: str) -> str:
     match = _ISS_RE.search(text)
     if not match:
         raise VersionError("installer.iss 中找不到 #define AppVersion")
+    return match.group("value")
+
+
+def read_installer_versioninfo(text: str) -> str:
+    """The dotted quad Inno Setup stamps onto Setup.exe itself."""
+
+    match = _ISS_VERSIONINFO_RE.search(text)
+    if not match:
+        raise VersionError("installer.iss 中找不到 VersionInfoVersion")
     return match.group("value")
 
 
@@ -177,7 +202,12 @@ def write_pyproject(text: str, version: str) -> str:
 def write_installer(text: str, version: str) -> str:
     new_text, count = _ISS_RE.subn(lambda m: f'{m.group("prefix")}"{version}"', text, count=1)
     if count != 1:
-        raise VersionError("无法写入 installer.iss")
+        raise VersionError("无法写入 installer.iss 的 AppVersion")
+    new_text, info_count = _ISS_VERSIONINFO_RE.subn(
+        lambda m: f"{m.group('prefix')}{version_info_dotted(version)}", new_text, count=1
+    )
+    if info_count != 1:
+        raise VersionError("无法写入 installer.iss 的 VersionInfoVersion")
     return new_text
 
 
@@ -222,9 +252,11 @@ def snapshot() -> dict[str, str]:
     """Every declared version, as it is on disk right now."""
 
     display, quad = read_version_info(_read(VERSION_INFO))
+    installer_text = _read(INSTALLER)
     return {
         "pyproject.toml": read_pyproject(_read(PYPROJECT)),
-        "packaging/installer.iss": read_installer(_read(INSTALLER)),
+        "packaging/installer.iss": read_installer(installer_text),
+        ISS_VERSIONINFO_KEY: read_installer_versioninfo(installer_text),
         "packaging/version_info.txt": display,
         QUAD_KEY: quad,
         "uv.lock": read_uv_lock(_read(UV_LOCK)),
@@ -235,12 +267,16 @@ def check(version: str) -> list[str]:
     """Return a list of human readable mismatches (empty when consistent)."""
 
     expected_quad = version_quad(version).replace(" ", "")
+    expected_dotted = version_info_dotted(version)
     expected_normalised = normalised(version)
     problems: list[str] = []
     for name, actual in snapshot().items():
         if name == QUAD_KEY:
             if actual != expected_quad:
                 problems.append(f"{name}: 期望 {expected_quad}，实际 {actual}")
+        elif name == ISS_VERSIONINFO_KEY:
+            if actual != expected_dotted:
+                problems.append(f"{name}: 期望 {expected_dotted}，实际 {actual}")
         elif name == "uv.lock":
             if actual != expected_normalised:
                 problems.append(

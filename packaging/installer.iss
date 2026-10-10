@@ -34,7 +34,7 @@
 ; exactly our host key - never another extension's.
 
 #define AppName "Video Downloader"
-#define AppVersion "1.1"
+#define AppVersion "1.12"
 #define AppPublisher "Video Downloader"
 #define AppExeName "VideoDownloader.exe"
 ; Must equal core.chrome_bridge.HOST_NAME (and core.native_host.HOST_NAME).
@@ -74,7 +74,11 @@ MinVersion=10.0
 UninstallDisplayName={#AppName}
 UninstallDisplayIcon={app}\{#AppExeName}
 SetupIconFile={#IconFile}
-VersionInfoVersion=1.1.0.0
+; Must equal {#AppVersion} as a dotted quad - Windows shows this in the file's
+; properties and an upgrade compares it, so a stale value would ship an
+; installer whose file version contradicts the product version.
+; packaging/sync_version.py keeps it in step.
+VersionInfoVersion=1.12.0.0
 VersionInfoTextVersion={#AppVersion}
 VersionInfoProductTextVersion={#AppVersion}
 VersionInfoDescription={#AppName} Setup
@@ -99,9 +103,13 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; \
 ; Excludes is defence in depth: the staging folder is scanned before this runs.
 ; recursesubdirs carries chrome-extension\ and native_host\ as well - see the
 ; header for why both must be present.
+; ``cookies.txt`` alone is not enough: a browser export is named
+; ``<domain>_cookies.txt`` just as often, and every managed session is
+; ``<platform>_cookies.txt`` - so the wildcard form is listed too. Matching is
+; case-insensitive on Windows, which is what we want here.
 Source: "{#SourceDir}\*"; DestDir: "{app}"; \
     Flags: ignoreversion recursesubdirs createallsubdirs; \
-    Excludes: ".env,secrets\*,secrets,cookies.txt,downloads\*,downloads,logs\*,logs,*.db,*.db-shm,*.db-wal,*.sqlite,*.sqlite3,*.log,*.part"
+    Excludes: ".env,secrets\*,secrets,cookies.txt,*_cookies.txt,downloads\*,downloads,logs\*,logs,*.db,*.db-shm,*.db-wal,*.sqlite,*.sqlite3,*.log,*.part"
 
 [Registry]
 ; Clean-up only - see the header. Setup never creates these keys, so it can

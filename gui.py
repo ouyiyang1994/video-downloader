@@ -119,6 +119,7 @@ from core.exceptions import (
 )
 from core.http import build_client, check_proxy
 from core.interfaces import PlatformAdapter
+from core.local_bridge import DEFAULT_PORT as BRIDGE_DEFAULT_PORT
 from core.local_bridge import LocalBridge
 from core.logging_setup import setup_logging
 from core.login import (
@@ -174,6 +175,15 @@ CHROME_OPEN_FOLDER_TEXT = "打开扩展文件夹"
 CHROME_CHECK_TEXT = "检查安装状态"
 CHROME_UNINSTALL_TEXT = "卸载登录助手"
 
+#: Shown when the automatic read failed *and* nothing was handed over. Sending
+#: from the helper extension is the step that actually works, so it is named
+#: first - 「手动填写会话」 is the last resort, not the first.
+ACQUIRE_FAILED_TEXT = (
+    "自动获取会话失败：本程序还没有收到该平台的会话。请先在 Chrome 的「登录助手」"
+    f"扩展里点「发送到 Video Downloader」，再点上面的「{DETECT_BUTTON_TEXT}」；"
+    "仍不行再用下面的「手动填写会话」"
+)
+
 #: DevTools-protocol fallback, for a user who would rather not install anything.
 CDP_LAUNCH_TEXT = "1. 打开独立 Chrome"
 CDP_FETCH_TEXT = "2. 我已登录，自动获取"
@@ -227,21 +237,34 @@ def _safe_bridge_status(settings: Settings) -> BridgeStatus | None:
         return None
 
 
-def _safe_repair_registration(settings: Settings) -> None:
-    """Restore a registration an upgrade's uninstaller removed.
+def _safe_repair_registration(settings: Settings) -> tuple[str, ...]:
+    """Re-point the native-messaging registry at *this* installation's host.
 
-    Inno Setup uninstalls the previous version before installing the new one,
-    and that uninstaller deletes the ``HKCU`` keys the helper registered. The
-    manifest and the host are in the data root, which the installer never
-    touches, so the registration can simply be re-pointed. It is done when the
-    helper dialog opens, and it only ever touches an installation that already
-    exists - a machine that never installed the helper is left alone.
+    Two situations need it, and both are silent failures otherwise:
+
+    * Inno Setup uninstalls the previous version before installing the new one,
+      and that uninstaller deletes the ``HKCU`` keys the helper registered. The
+      manifest and the host are in the data root, which the installer never
+      touches, so the registration can simply be re-pointed.
+    * Something else registered last - a development checkout, or an
+      installation under a different data root. Chrome then hands the
+      extension's session to *that* host, which writes it into a folder this
+      application never reads, and the delivery leaves no trace here at all.
+
+    Runs when the helper dialog opens and before the sign-in dialog invites the
+    user to send from the extension, so the invite is never made against a
+    registration that would swallow the session.
+
+    Only ever touches an installation that already exists: with no manifest on
+    disk it does not read the registry at all, so a machine that never installed
+    the helper is left completely alone. Returns the browsers it re-pointed.
     """
 
     try:
-        repair_registration(settings)
-    except Exception:  # noqa: BLE001 - a repair must never break the dialog
+        return repair_registration(settings)
+    except Exception:  # noqa: BLE001 - a repair must never break a dialog
         logger.exception("修复登录助手注册失败")
+        return ()
 
 
 def detect_platform(url: str, registry: PlatformRegistry | None) -> tuple[Platform | None, str]:
@@ -667,6 +690,28 @@ class LoginWorker(QThread):
         self.adapter.reload_session()
         return self.adapter.session_origin()
 
+    def _ensure_helper_registration(self) -> None:
+        """Make sure the extension's next delivery lands in *our* session folder.
+
+        Chrome hands a native-messaging message to whichever host the ``HKCU``
+        key names. When a development checkout - or an installation under a
+        different data root - registered it last, that host writes the session
+        into *its* folder, which this application never reads. The delivery then
+        leaves no trace here at all: the helper reports success, the session
+        file exists somewhere on disk, and 「自动获取」 still answers "no
+        session". Re-pointing the key before the user is asked to send closes
+        that hole.
+
+        Conservative by construction: :func:`core.chrome_bridge.repair_registration`
+        only ever re-points an entry when this installation's own manifest is
+        already on disk, so a machine that never installed the helper is left
+        completely untouched.
+        """
+
+        repaired = _safe_repair_registration(self.settings)
+        if repaired:
+            logger.info("获取会话前修复了登录助手注册：%s", ", ".join(repaired))
+
     async def _acquire(self) -> SessionStatus:
         """Read the session from the browser, prove it works, then store it.
 
@@ -676,8 +721,12 @@ class LoginWorker(QThread):
         platform's session to the application - so what is on disk is validated
         first, and only when that cannot be confirmed does the browser error
         (with its "use the extension / type it in" advice) reach the user.
+
+        The helper's delivery only reaches us while the native-messaging
+        registration names *our* host, so that is verified up front.
         """
 
+        self._ensure_helper_registration()
         try:
             session = extract_session(self.adapter.session_domain)
         except BrowserCookieError as exc:
@@ -704,6 +753,11 @@ class LoginWorker(QThread):
         there is nothing stored or it could not be confirmed - in which case the
         caller re-raises the browser error, which is the more actionable answer.
 
+        Every outcome is logged as its own sentence, because the three of them
+        look identical from the user's side but need different fixes: nothing was
+        delivered, the delivery arrived and the platform rejected it, or the
+        delivery arrived and the platform could not be reached.
+
         Nothing is written and nothing is deleted here: this only reads the
         platform's own verdict about a file that already exists.
         """
@@ -716,19 +770,40 @@ class LoginWorker(QThread):
         self.adapter.reload_session()
         header = self.adapter.session_cookie_header()
         if header is None:
-            return None
-
-        status = await self._check(header, origin=self.adapter.session_origin())
-        if not status.logged_in:
+            # Silence here used to be the whole story: the user saw the browser
+            # error and nothing else, with no way to tell "the extension never
+            # delivered" from "the delivery went to another folder". Say it.
             logger.info(
-                "已保存的 %s 会话未被平台确认（%s）",
+                "本机没有已保存的 %s 会话：登录助手尚未把会话交给本程序"
+                "（发送会话时若注册指向了另一个程序目录，会话不会落到这里）",
                 self.adapter.platform.value,
-                status.state.value,
             )
             return None
 
-        logger.info("已确认扩展保存的 %s 会话，无需再读取浏览器", self.adapter.platform.value)
-        return status
+        status = await self._check(header, origin=self.adapter.session_origin())
+        if status.logged_in:
+            logger.info("已确认扩展保存的 %s 会话，无需再读取浏览器", self.adapter.platform.value)
+            return status
+        if status.state is LoginState.UNKNOWN:
+            # The session is on disk and untouched - the platform simply could
+            # not be reached (offline, rate limit, risk control). That is a
+            # different answer from "the platform said no", and the log has to
+            # say which of the two it was.
+            logger.info(
+                "已收到 %s 的会话，但暂时无法向平台确认（%s）：%s",
+                self.adapter.platform.value,
+                status.state.value,
+                status.detail or "网络异常",
+            )
+            return None
+
+        logger.info(
+            "已收到 %s 的会话，但平台判定未登录（%s）：%s",
+            self.adapter.platform.value,
+            status.state.value,
+            status.detail or "请重新登录",
+        )
+        return None
 
     async def _save_pasted(self) -> SessionStatus:
         """Validate a pasted session value first, and only then store it."""
@@ -1107,6 +1182,8 @@ class LoginDialog(QDialog):
         settings: Settings,
         adapter: PlatformAdapter,
         parent: QWidget | None = None,
+        *,
+        bridge_port: int = BRIDGE_DEFAULT_PORT,
     ) -> None:
         super().__init__(parent)
         self.settings = settings
@@ -1118,7 +1195,10 @@ class LoginDialog(QDialog):
         #: Which step is running, so a status reply can be interpreted correctly.
         self._last_action: LoginAction | None = None
         #: Loopback transport for the extension, live only while this window is.
-        self.bridge = LocalBridge(settings)
+        #: The port is fixed in production - the extension has to know it - and
+        #: only overridable so a test never collides with an already-running
+        #: Video Downloader holding 8765 on the same machine.
+        self.bridge = LocalBridge(settings, port=bridge_port)
         self._bridge_error = ""
 
         self.setWindowTitle(f"登录 {adapter.display_name}")
@@ -1334,8 +1414,14 @@ class LoginDialog(QDialog):
         self._refresh_chrome_box()
 
     def _refresh_chrome_box(self) -> None:
-        """Describe the bridge state, and the one step the user has to take."""
+        """Describe the bridge state, and the one step the user has to take.
 
+        The registration is re-pointed first: this box is where the user is told
+        to go and send the session from the extension, and that only delivers to
+        *us* while the registry names our own host.
+        """
+
+        _safe_repair_registration(self.settings)
         status = _safe_bridge_status(self.settings)
         if status is None:
             self.chrome_status_label.setText("登录助手状态未知，请点「安装 / 检查登录助手」。")
@@ -1412,7 +1498,7 @@ class LoginDialog(QDialog):
         self.failure_label.setText(error.message)
         self.hint_label.setText(error.detail or "")
         self.manual_box.show()
-        self._set_status("自动获取会话失败，请使用下面的「手动填写会话」", ok=False)
+        self._set_status(ACQUIRE_FAILED_TEXT, ok=False)
 
     def _on_failed(self, message: str, detail: str) -> None:
         self.failure_label.setText(message)

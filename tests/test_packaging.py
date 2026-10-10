@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -16,6 +17,7 @@ from config import settings as settings_module
 
 SCANNER_PATH = Path(__file__).resolve().parent.parent / "packaging" / "scan_secrets.py"
 PORTABLE_PATH = Path(__file__).resolve().parent.parent / "packaging" / "make_portable_zip.py"
+SYNC_VERSION_PATH = Path(__file__).resolve().parent.parent / "packaging" / "sync_version.py"
 
 
 def _load_scanner():
@@ -38,8 +40,19 @@ def _load_portable():
     return module
 
 
+def _load_sync_version():
+    """Load packaging/sync_version.py the same way."""
+
+    spec = importlib.util.spec_from_file_location("sync_version_under_test", SYNC_VERSION_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 scan = _load_scanner()
 portable = _load_portable()
+sync_version = _load_sync_version()
 
 # --- app root ---------------------------------------------------------------
 
@@ -462,12 +475,172 @@ def test_clean_distribution_passes(tmp_path: Path) -> None:
     assert any("8090" in note for note in notes)
 
 
-@pytest.mark.parametrize("name", [".env", "cookies.txt"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        ".env",
+        "cookies.txt",
+        "instagram_cookies.txt",
+        "www.bilibili.com_cookies.txt",
+    ],
+)
 def test_structural_scan_rejects_credentials_files(tmp_path: Path, name: str) -> None:
+    """A browser export is ``<domain>_cookies.txt`` as often as ``cookies.txt``."""
+
     dist = _fake_dist(tmp_path)
     (dist / name).write_text("secret", encoding="utf-8")
     failures = scan.structural_violations(dist)
     assert any(name in failure for failure in failures)
+
+
+@pytest.mark.parametrize("name", [".ENV", "Cookies.TXT", "Instagram_Cookies.TXT"])
+def test_the_structural_scan_folds_the_case_of_a_filename(tmp_path: Path, name: str) -> None:
+    """Windows packages ``.ENV`` and ``.env`` as the very same file.
+
+    A case-sensitive name check therefore reports a clean tree while the
+    installer packs a real credential file.
+    """
+
+    dist = _fake_dist(tmp_path)
+    (dist / name).write_text("secret", encoding="utf-8")
+
+    assert scan.structural_violations(dist) != []
+
+
+def test_the_structural_scan_folds_the_case_of_a_directory(tmp_path: Path) -> None:
+    dist = _fake_dist(tmp_path)
+    (dist / "Secrets").mkdir()
+
+    assert scan.structural_violations(dist) != []
+
+
+def test_a_session_that_escaped_its_folder_is_still_rejected(tmp_path: Path) -> None:
+    """The name rule has to work at any depth, not only at the top level."""
+
+    dist = _fake_dist(tmp_path)
+    nested = dist / "chrome-extension" / "icons"
+    nested.mkdir(parents=True)
+    (nested / "instagram_cookies.txt").write_text("sessionid=x", encoding="utf-8")
+
+    failures = scan.structural_violations(dist)
+    assert any("instagram_cookies.txt" in failure for failure in failures)
+
+
+def test_the_installer_excludes_every_cookie_export() -> None:
+    """The staging scan and the installer must agree on what may ship.
+
+    ``installer.iss`` copies ``{#SourceDir}\\*`` recursively, so any name it does
+    not exclude is a name that reaches the user's disk - and no single wildcard
+    covers ``cookies.txt`` and ``instagram_cookies.txt`` at once.
+    """
+
+    script = (Path(__file__).resolve().parent.parent / "packaging" / "installer.iss").read_text(
+        encoding="utf-8"
+    )
+    excludes = next(line for line in script.splitlines() if "Excludes:" in line)
+
+    for pattern in (
+        ".env",
+        "secrets",
+        "cookies.txt",
+        "*_cookies.txt",
+        "downloads",
+        "logs",
+        "*.db",
+        "*.log",
+        "*.part",
+    ):
+        assert pattern in excludes, f"安装包 Excludes 缺少 {pattern}"
+
+
+def _build_script() -> str:
+    """``build-installer.ps1`` as text, BOM stripped."""
+
+    return (
+        Path(__file__).resolve().parent.parent / "packaging" / "build-installer.ps1"
+    ).read_text(encoding="utf-8-sig")
+
+
+def _installer_forbidden_filter() -> str:
+    """The ``Where-Object`` body that rejects staging files, read from the script.
+
+    Taken out of ``build-installer.ps1`` itself rather than copied, so the test
+    exercises the rules that actually run instead of a duplicate that can drift.
+    """
+
+    script = _build_script()
+    start = script.index("Where-Object {") + len("Where-Object {")
+    end = script.index("\n        }", start)
+    return "\n".join(
+        line for line in script[start:end].splitlines() if not line.strip().startswith("#")
+    )
+
+
+def test_the_installer_script_rejects_cookie_exports_like_the_scanner(tmp_path: Path) -> None:
+    """The inline check is the last gate before Inno Setup copies the folder.
+
+    It runs straight after ``scan_secrets.py``, and the point of a second gate is
+    that it still holds when the first one is skipped (``-SkipScan``). A
+    ``<domain>_cookies.txt`` the scanner rejects therefore has to be rejected
+    here too - whatever the case of its name, because Windows does not
+    distinguish them.
+    """
+
+    interpreter = shutil.which("powershell") or shutil.which("pwsh")
+    assert interpreter, "构建脚本是 PowerShell，这个测试需要它的解释器"
+
+    # Two folders, not one: Windows cannot hold ``.env`` and ``.ENV`` at the same
+    # time - they are one and the same file there, which is precisely the trap
+    # the check has to survive. Each folder therefore gets a set of names that
+    # are distinct from each other whatever their case.
+    spellings = {
+        "lower": [
+            ".env",
+            "cookies.txt",
+            "instagram_cookies.txt",
+            "www.bilibili.com_cookies.txt",
+            "downloads.db",
+            "downloader.log",
+        ],
+        "mixed": [
+            ".ENV",
+            "Cookies.TXT",
+            "Instagram_Cookies.TXT",
+            "WWW.BILIBILI.COM_COOKIES.TXT",
+            "Downloads.DB",
+            "Downloader.LOG",
+        ],
+    }
+
+    body = _installer_forbidden_filter()
+    for label, names in spellings.items():
+        staging = tmp_path / label / "VideoDownloader"
+        staging.mkdir(parents=True)
+        for name in names:
+            (staging / name).write_text("x", encoding="utf-8")
+        # The two files that have to survive, or no build could ever pass.
+        (staging / "VideoDownloader.exe").write_bytes(b"MZ")
+        (staging / ".env.example").write_text("HTTP_PROXY=\n", encoding="utf-8")
+
+        probe = (
+            f"$items = Get-ChildItem -LiteralPath '{staging}' -Recurse -Force\n"
+            f"$items | Where-Object {{ {body} }} | ForEach-Object {{ $_.Name }}\n"
+        )
+        result = subprocess.run(
+            [interpreter, "-NoProfile", "-NonInteractive", "-Command", probe],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        )
+        assert result.returncode == 0, result.stderr
+
+        blocked = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+        missing = [name for name in names if name not in blocked]
+        assert not missing, f"[{label}] 内联检查漏掉了: {missing}"
+        assert "VideoDownloader.exe" not in blocked, "主程序不该被拦"
+        assert ".env.example" not in blocked, "模板必须放行，否则构建永远失败"
 
 
 def test_structural_scan_rejects_secrets_directory(tmp_path: Path) -> None:
@@ -757,6 +930,50 @@ def test_the_whole_chain_stages_the_same_directory() -> None:
     assert "$AppDir = Join-Path $ProjectRoot 'dist\\VideoDownloader'" in installer
     assert '"/DSourceDir=$AppDir"' in installer
     assert 'Source: "{#SourceDir}\\*"; DestDir: "{app}";' in script
+
+
+def test_the_installer_declares_the_same_version_as_the_project() -> None:
+    """Setup.exe must not claim a version the application never heard of.
+
+    ``installer.iss`` carries two numbers: ``AppVersion`` (what the wizard and
+    the uninstall entry show) and ``VersionInfoVersion`` (the dotted quad
+    Windows stamps onto Setup.exe, and the one an upgrade compares). The two
+    drifted apart for eight releases - Setup.exe reported 1.1.0.0 while the
+    product was 1.09 - so both are pinned to ``pyproject.toml`` here.
+    """
+
+    root = Path(__file__).resolve().parent.parent
+    version = sync_version.read_pyproject((root / "pyproject.toml").read_text(encoding="utf-8"))
+    installer = (root / "packaging" / "installer.iss").read_text(encoding="utf-8")
+
+    assert sync_version.read_installer(installer) == version
+    assert sync_version.read_installer_versioninfo(installer) == sync_version.version_info_dotted(
+        version
+    )
+
+
+def test_the_version_gate_covers_every_declared_location() -> None:
+    """``--check`` is the release gate, so it has to see all five numbers."""
+
+    root = Path(__file__).resolve().parent.parent
+    version = sync_version.read_pyproject((root / "pyproject.toml").read_text(encoding="utf-8"))
+
+    assert sync_version.ISS_VERSIONINFO_KEY in sync_version.snapshot()
+    assert sync_version.check(version) == []
+
+
+def test_a_stale_version_info_version_is_caught() -> None:
+    """The drift this release fixed must fail ``--check`` if it returns."""
+
+    text = '#define AppVersion "1.11"\nVersionInfoVersion=1.1.0.0\n'
+
+    assert sync_version.read_installer(text) == "1.11"
+    assert sync_version.read_installer_versioninfo(text) == "1.1.0.0"
+    assert sync_version.version_info_dotted("1.11") == "1.11.0.0"
+
+    rewritten = sync_version.write_installer(text, "1.11")
+    assert "VersionInfoVersion=1.11.0.0" in rewritten
+    assert '#define AppVersion "1.11"' in rewritten
 
 
 # --- what the portable archive must (and must not) contain -------------------

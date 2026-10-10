@@ -14,6 +14,7 @@ import httpx
 
 from config.settings import Settings
 from core import fallback_policy, session_store
+from core.engine_ytdlp import YtDlpEngine
 from core.login import LoginSource
 from core.models import Platform
 from platforms.bilibili.adapter import BilibiliAdapter
@@ -247,3 +248,108 @@ async def test_disabling_instagram_leaves_bilibili_untouched(
 
     assert bilibili == "SESSDATA=FROMFALLBACK"
     assert fallback_policy.is_disabled(settings, Platform.BILIBILI) is False
+
+
+# --- the download path (yt-dlp options) --------------------------------------
+
+
+def _download_options(settings: Settings, *, referer: str | None = None) -> dict[str, object]:
+    """The options a download task would hand to yt-dlp."""
+
+    adapter_engine = YtDlpEngine(
+        settings,
+        use_browser_cookies=True,
+        managed_session_file=session_store.session_file(settings, Platform.INSTAGRAM),
+        platform=Platform.INSTAGRAM,
+    )
+    return adapter_engine._ydl_options(referer)  # noqa: SLF001 - the options are the contract
+
+
+def test_instagram_download_options_drop_the_env_cookie_file_while_disabled(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """The path that actually feeds yt-dlp must obey the switch too."""
+
+    _instagram_settings(settings, tmp_path)
+
+    enabled = _download_options(settings)
+    assert enabled["cookiefile"] == settings.ytdlp_cookiefile
+
+    fallback_policy.set_disabled(settings, Platform.INSTAGRAM, disabled=True)
+    disabled = _download_options(settings)
+
+    assert "cookiefile" not in disabled
+    assert "cookiesfrombrowser" not in disabled
+
+    fallback_policy.set_disabled(settings, Platform.INSTAGRAM, disabled=False)
+    assert _download_options(settings)["cookiefile"] == settings.ytdlp_cookiefile
+
+
+def test_instagram_download_options_drop_the_browser_source_while_disabled(
+    settings: Settings,
+) -> None:
+    """``YTDLP_COOKIES_FROM_BROWSER`` is an ``.env`` fallback as well."""
+
+    settings.ytdlp_cookiefile = None
+    settings.ytdlp_cookies_from_browser = "chrome"
+    assert _download_options(settings)["cookiesfrombrowser"] == ("chrome",)
+
+    fallback_policy.set_disabled(settings, Platform.INSTAGRAM, disabled=True)
+    assert "cookiesfrombrowser" not in _download_options(settings)
+
+    fallback_policy.set_disabled(settings, Platform.INSTAGRAM, disabled=False)
+    assert _download_options(settings)["cookiesfrombrowser"] == ("chrome",)
+
+
+def test_a_download_task_reads_the_switch_from_disk(settings: Settings, tmp_path: Path) -> None:
+    """A task started later - a restart, or another worker - sees the flag."""
+
+    _instagram_settings(settings, tmp_path)
+    fallback_policy.set_disabled(settings, Platform.INSTAGRAM, disabled=True)
+
+    # A separate Settings object, exactly like a worker that starts later.
+    later = Settings(
+        _env_file=None,
+        session_dir=settings.resolve_path(settings.session_dir),
+        ytdlp_cookiefile=settings.ytdlp_cookiefile,
+    )
+
+    assert "cookiefile" not in _download_options(later)
+
+
+def test_bilibili_credentials_stay_out_of_ytdlp_options_while_disabled(
+    settings: Settings,
+) -> None:
+    """Bilibili's ``.env`` value must not be injected either."""
+
+    settings.bilibili_cookie = None
+    settings.bilibili_sessdata = "FAKE-SESSDATA"
+
+    engine = YtDlpEngine(settings, use_browser_cookies=True)
+    referer = "https://www.bilibili.com/video/BV1"
+    assert engine._ydl_options(referer)["http_headers"]["Cookie"] == "SESSDATA=FAKE-SESSDATA"
+
+    fallback_policy.set_disabled(settings, Platform.BILIBILI, disabled=True)
+    assert "Cookie" not in engine._ydl_options(referer)["http_headers"]
+
+    fallback_policy.set_disabled(settings, Platform.BILIBILI, disabled=False)
+    assert engine._ydl_options(referer)["http_headers"]["Cookie"] == "SESSDATA=FAKE-SESSDATA"
+
+
+def test_a_missing_fallback_file_does_not_fail_a_disabled_download(
+    settings: Settings, tmp_path: Path
+) -> None:
+    """Disabling means "anonymous", not "error out about a file we ignore"."""
+
+    settings.ytdlp_cookiefile = str(tmp_path / "gone.txt")
+    fallback_policy.set_disabled(settings, Platform.INSTAGRAM, disabled=True)
+
+    engine = YtDlpEngine(
+        settings,
+        use_browser_cookies=True,
+        managed_session_file=session_store.session_file(settings, Platform.INSTAGRAM),
+        platform=Platform.INSTAGRAM,
+    )
+
+    engine._ensure_cookie_file()  # noqa: SLF001 - must not raise while disabled
+    assert engine.cookie_file is None
