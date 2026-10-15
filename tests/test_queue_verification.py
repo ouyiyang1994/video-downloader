@@ -47,6 +47,17 @@ LARGE_PATH = "/media/long-stream.bin"
 LARGE_CHUNK_SIZE = 64 * 1024
 LARGE_CHUNK_DELAY = 0.01
 
+#: Safety valve for the opt-in mid-response gate: a handler parked by
+#: ``_FleetHandler.hold_path`` gives up after this long so a test that dies
+#: mid-way cannot leak a blocked thread into the rest of the session.
+HOLD_TIMEOUT_SECONDS = 60.0
+
+#: How far into its body a held response is parked.  Late enough that the
+#: client - which reads in ``Settings.chunk_size`` buffers - has already
+#: flushed bytes into ``.part``, early enough that a quarter of the response is
+#: still behind it, which is what makes the interruption land mid-transfer.
+HOLD_AFTER_FRACTION = 0.75
+
 #: Range headers the test server has seen, cleared by the fixture.
 _RANGES: list[str] = []
 
@@ -742,12 +753,25 @@ class _FleetHandler(http.server.BaseHTTPRequestHandler):
     #: is what makes this a threshold-free way to ask "did the cancel land?".
     _delivered: dict[str, list[int]] = {}
     _path_config: dict[str, tuple[int, int, float]] = {}
+    #: Opt-in, one-shot mid-response gate.  A test that has to interrupt a
+    #: transfer *while it is running* registers a path with ``hold_path``; the
+    #: first request for that path is parked once
+    #: ``HOLD_AFTER_FRACTION`` of its body is on the wire and stays parked until
+    #: ``release_path`` runs.  That turns "the transfer is still in flight" from
+    #: a race against a fixed-duration response into a property of the fixture:
+    #: a starved test thread can no longer miss the window and then wait out a
+    #: timeout on a condition that can never become true again.
+    _holds: dict[str, threading.Event] = {}
+    _hold_pending: set[str] = set()
+    #: Set when a held response reaches its parking point.
+    _parked: dict[str, threading.Event] = {}
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib name
         return None
 
     @classmethod
     def reset(cls) -> None:
+        cls.release_all_holds()
         with cls._lock:
             cls._inflight = 0
             cls._max_inflight = 0
@@ -758,6 +782,60 @@ class _FleetHandler(http.server.BaseHTTPRequestHandler):
             cls._ranges = {}
             cls._delivered = {}
             cls._path_config = {}
+
+    @classmethod
+    def hold_path(cls, path: str) -> None:
+        """Park the first response for ``path`` part-way through its body.
+
+        Call it *before* the request is made.  The response is parked once
+        ``HOLD_AFTER_FRACTION`` of the body has been written and cannot finish
+        until :meth:`release_path`, so a test that interrupts the transfer is
+        guaranteed to land inside it.
+
+        Parking that late is deliberate: the client reads in large buffers
+        (``Settings.chunk_size`` is 1 MiB), so parking early would leave it
+        with nothing to flush into its ``.part`` file and the test would wait
+        forever on bytes that only arrive at the end of an unparked response.
+        """
+
+        with cls._lock:
+            cls._holds[path] = threading.Event()
+            cls._hold_pending.add(path)
+            cls._parked[path] = threading.Event()
+
+    @classmethod
+    def release_path(cls, path: str) -> None:
+        """Let a held response continue; later requests are not held again."""
+
+        with cls._lock:
+            cls._hold_pending.discard(path)
+            event = cls._holds.pop(path, None)
+        if event is not None:
+            event.set()
+
+    @classmethod
+    def release_all_holds(cls) -> None:
+        """Unpark every held response.
+
+        Teardown must never leave a handler parked: the thread would outlive
+        the test and show up in the next one's thread count.
+        """
+
+        with cls._lock:
+            cls._hold_pending = set()
+            events = list(cls._holds.values())
+            cls._holds = {}
+            cls._parked = {}
+        for event in events:
+            event.set()
+
+    @classmethod
+    def wait_parked(cls, path: str, timeout: float = 30.0) -> bool:
+        """Block until a held response reaches its parking point."""
+
+        with cls._lock:
+            event = cls._parked.get(path)
+        return bool(event is not None and event.wait(timeout))
 
     @classmethod
     def configure_path(
@@ -823,6 +901,30 @@ class _FleetHandler(http.server.BaseHTTPRequestHandler):
             type(self)._inflight -= 1
             type(self)._path_inflight[path] -= 1
 
+    def _arrive_at_gate(self, sent: int, body_size: int) -> None:
+        """Announce (and, if this path is held, reach) the parking point.
+
+        Parking is what makes the gate useful: the client already has real bytes
+        to put in its ``.part`` file, and the response cannot finish until the
+        test releases it.
+        """
+
+        held = False
+        if body_size > 0 and sent >= body_size * HOLD_AFTER_FRACTION:
+            with type(self)._lock:
+                held = self.path in type(self)._hold_pending
+                if held:
+                    type(self)._hold_pending.discard(self.path)
+                signal = type(self)._parked.get(self.path)
+                event = type(self)._holds.get(self.path)
+            if signal is not None:
+                signal.set()
+            if held and event is not None:
+                # Bounded so a test that dies mid-way cannot park a handler
+                # thread for the rest of the session; the normal path releases
+                # at once.
+                event.wait(HOLD_TIMEOUT_SECONDS)
+
     def _note_range(self, path: str, header: str) -> None:
         with type(self)._lock:
             type(self)._ranges.setdefault(path, []).append(header)
@@ -887,6 +989,7 @@ class _FleetHandler(http.server.BaseHTTPRequestHandler):
                 except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                     return
                 sent += len(piece)
+                self._arrive_at_gate(sent, body_size)
                 if delay:
                     time.sleep(delay)
         finally:
@@ -966,6 +1069,9 @@ def fleet_server() -> Iterator[str]:
     try:
         yield f"http://127.0.0.1:{server.server_address[1]}"
     finally:
+        # Unpark anything the test left on a gate before the server goes away,
+        # so a failed test cannot leak a blocked handler thread into the next.
+        _FleetHandler.release_all_holds()
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
@@ -1265,6 +1371,22 @@ def _await_server_idle(timeout: float = 30.0) -> None:
     )
 
 
+def _assert_queue_drained(
+    queue: DownloadQueue, *, message: str = "队列没有释放全部槽位"
+) -> None:
+    """Every slot must be handed back once the tasks have settled.
+
+    ``_run`` writes the task's terminal state and the worker's ``finally``
+    releases the slot immediately afterwards, so the two are ordered but not
+    simultaneous: asserting ``_active == 0`` the instant the states look done
+    reads a count the worker has not decremented yet.  Waiting turns that flake
+    into a real check - a slot that is never released now fails instead of
+    passing or failing depending on scheduling.
+    """
+
+    _wait_until(lambda: queue._active == 0, message=message)
+
+
 def test_cancelling_one_of_five_transfers_leaves_the_others_intact(
     settings: Settings, tmp_path: Path, fleet_server: str
 ) -> None:
@@ -1553,7 +1675,7 @@ def test_cancelling_multiple_real_transfers_does_not_disturb_the_survivors(
             assert calls.count(task.task_id) == 1
             _assert_one_transfer_at_a_time(spans, task.task_id)
             assert _task_destination(tmp_path, task).read_bytes() == _payload_for(path)
-        assert queue._active == 0
+        _assert_queue_drained(queue, message="取消后队列没有释放全部槽位")
     finally:
         queue.stop(timeout=15)
 
@@ -1627,7 +1749,7 @@ def test_pausing_multiple_real_transfers_then_resuming_preserves_each_file(
                 f"{task.task_id}.bin.part"
             ).exists()
         assert all(task.state is QueueState.COMPLETED for task in tasks)
-        assert queue._active == 0
+        _assert_queue_drained(queue, message="恢复后队列没有释放全部槽位")
     finally:
         queue.stop(timeout=15)
 
@@ -1723,7 +1845,7 @@ def test_mixed_cancel_pause_resume_and_retry_does_not_deadlock_or_cross_files(
             assert calls.count(paused[1].task_id) == 2
         assert all(task.state is QueueState.COMPLETED for task in paused + [retried, untouched])
         assert cancelled.state is QueueState.CANCELLED
-        assert queue._active == 0
+        _assert_queue_drained(queue, message="混合操作后队列没有释放全部槽位")
     finally:
         queue.stop(timeout=15)
 
@@ -1984,6 +2106,12 @@ def test_bounded_http_queue_soak_keeps_tasks_threads_and_memory_stable(
                 )
                 if role == "network-retry":
                     _FleetHandler.fail_first(request_path, 1)
+                if role in ("cancel", "pause", "retry"):
+                    # These three get interrupted below.  Holding their first
+                    # response part-way through its body makes "the transfer is
+                    # still running" a property of the fixture rather than a
+                    # race against a response that may already be over.
+                    _FleetHandler.hold_path(request_path)
                 task = queue.submit(task_url, max_attempts=2, output_dir=str(tmp_path))
                 round_tasks[role] = task
                 all_tasks.append(task)
@@ -1999,6 +2127,18 @@ def test_bounded_http_queue_soak_keeps_tasks_threads_and_memory_stable(
             peak_threads = max(peak_threads, threading.active_count())
 
             controlled = [round_tasks[role] for role in ("cancel", "pause", "retry")]
+            # The gate is the synchronisation point: once a held response has
+            # reached its parking point it is stuck there, so the transfer
+            # cannot finish - and its ``.part`` cannot be renamed away - before
+            # the interruption below lands.  Waiting on the file alone used to
+            # be a race: a transfer that completed first made the condition
+            # permanently false and the wait burned its whole timeout.
+            remaining = deadline - time.monotonic()
+            assert remaining > 0, "soak test exceeded its hard deadline"
+            for role in ("cancel", "pause", "retry"):
+                assert _FleetHandler.wait_parked(
+                    round_urls[role], timeout=min(30.0, max(0.1, remaining))
+                ), f"第 {round_number} 轮 {role} 没有走到响应闸门"
             wait_for(
                 lambda controlled=controlled: all(
                     _part_of(destination_for(task)).exists()
@@ -2016,6 +2156,13 @@ def test_bounded_http_queue_soak_keeps_tasks_threads_and_memory_stable(
             assert queue.pause(paused_task.task_id) is True
             assert queue.cancel(retry_task.task_id) is True
             assert queue.retry(retry_task.task_id) is True
+
+            # The interruption has landed.  Let the held responses continue:
+            # the aborted ones will fail their next write, the retried task's
+            # new request must not be parked, and nothing may stay on a gate
+            # by the time the round checks its thread and in-flight counts.
+            for role in ("cancel", "pause", "retry"):
+                _FleetHandler.release_path(round_urls[role])
 
             normal_task = round_tasks["normal"]
             network_task = round_tasks["network-retry"]
@@ -2152,7 +2299,7 @@ def test_bounded_http_queue_soak_keeps_tasks_threads_and_memory_stable(
         assert sum(task.state is QueueState.COMPLETED for task in all_tasks) == SOAK_ROUNDS * 4
         assert sum(task.state is QueueState.CANCELLED for task in all_tasks) == SOAK_ROUNDS
         assert sum(task.state is QueueState.FAILED for task in all_tasks) == 0
-        assert queue._active == 0
+        _assert_queue_drained(queue, message="soak 结束后队列没有释放全部槽位")
         max_live_growth = max(item["memory_live_delta_bytes"] for item in round_metrics)
         assert max_live_growth < 16 * 1024 * 1024, (
             f"soak 期间 Python 活内存增长峰值 {max_live_growth} 字节"
@@ -2175,6 +2322,9 @@ def test_bounded_http_queue_soak_keeps_tasks_threads_and_memory_stable(
             f"peak_round_delta={peak_memory_delta} total_peak={total_peak - baseline_memory}"
         )
     finally:
+        # Defence in depth: a failed round must not leave a response parked on a
+        # gate, or the handler thread outlives the test and skews the next one.
+        _FleetHandler.release_all_holds()
         queue.stop(timeout=15)
         if not tracing_was_active:
             tracemalloc.stop()
