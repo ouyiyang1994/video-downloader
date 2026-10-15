@@ -23,7 +23,7 @@ from core.exceptions import (
     VideoDownloaderError,
 )
 from core.login import LoginSource, SessionOrigin
-from core.models import MediaStream, Platform, VideoInfo
+from core.models import MediaStream, Platform, PlaylistEntry, VideoInfo
 
 logger = logging.getLogger(__name__)
 
@@ -239,19 +239,34 @@ class YtDlpEngine:
             SessionOrigin(LoginSource.ENV_COOKIEFILE, "YTDLP_COOKIEFILE"),
         )
 
-    def _ydl_options(self, referer: str | None = None) -> dict[str, Any]:
+    def _ydl_options(
+        self,
+        referer: str | None = None,
+        *,
+        playlist: bool = False,
+        playlist_limit: int | None = None,
+    ) -> dict[str, Any]:
         headers = {"User-Agent": self.settings.user_agent}
         if referer:
             headers["Referer"] = referer
         options: dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
-            "noplaylist": True,
+            # Extraction is single-video unless a playlist listing was asked
+            # for, which is what keeps a plain download from silently turning
+            # into "the whole channel".
+            "noplaylist": not playlist,
             "skip_download": True,
             "nocheckcertificate": False,
             "http_headers": headers,
             "socket_timeout": self.settings.request_timeout,
         }
+        if playlist:
+            # Flat extraction: one request for the whole listing, no per-video
+            # metadata. The entries are resolved properly when each is queued.
+            options["extract_flat"] = "in_playlist"
+            if playlist_limit:
+                options["playlistend"] = int(playlist_limit)
         if self.settings.proxy:
             options["proxy"] = self.settings.proxy
         cookie_file = self.cookie_file
@@ -346,6 +361,72 @@ class YtDlpEngine:
                 "engine": "yt-dlp",
             },
         )
+
+    def _extract_playlist_sync(
+        self, url: str, limit: int, referer: str | None
+    ) -> list[PlaylistEntry]:
+        """Enumerate a playlist without fetching per-video metadata."""
+
+        try:
+            from yt_dlp import YoutubeDL
+        except ImportError as exc:  # pragma: no cover - dependency is declared
+            raise MetadataError("未安装 yt-dlp", detail=str(exc)) from exc
+
+        with YoutubeDL(
+            self._ydl_options(referer, playlist=True, playlist_limit=limit)
+        ) as ydl:
+            data = ydl.extract_info(url, download=False)
+        if data is None:
+            raise MetadataError("yt-dlp 未返回任何数据", detail=url)
+
+        raw_entries = data.get("entries")
+        if raw_entries is None:
+            return []  # a single video, not a playlist
+
+        # Flat extraction does not always carry an entry's own title (Bilibili's
+        # 分P entries have none), and the listing's title is a better answer than
+        # a blank row. It is not extra metadata: it arrived with this response.
+        listing_title = data.get("title")
+
+        entries: list[PlaylistEntry] = []
+        for index, entry in enumerate(raw_entries, start=1):
+            if not entry:
+                continue
+            entry_url = entry.get("url") or entry.get("webpage_url")
+            if not entry_url:
+                continue
+            entries.append(
+                PlaylistEntry(
+                    url=str(entry_url),
+                    title=entry.get("title") or listing_title,
+                    video_id=str(entry["id"]) if entry.get("id") else None,
+                    index=index,
+                )
+            )
+        return entries
+
+    async def extract_playlist(
+        self,
+        url: str,
+        *,
+        limit: int = 200,
+        referer: str | None = None,
+    ) -> list[PlaylistEntry]:
+        """List a playlist's entries in order, or ``[]`` when it is one video.
+
+        An empty result is the normal answer for an ordinary video link, which
+        is what lets the caller treat "playlist" and "single video" through one
+        code path instead of guessing from the URL.
+        """
+
+        logger.debug("yt-dlp 枚举播放列表 %s", url)
+        self._ensure_cookie_file()
+        try:
+            return await asyncio.to_thread(self._extract_playlist_sync, url, limit, referer)
+        except MetadataError:
+            raise
+        except Exception as exc:  # yt-dlp raises a wide variety of errors
+            raise self._translate(exc) from exc
 
     def _translate(self, exc: Exception) -> VideoDownloaderError:
         """Turn a yt-dlp failure into an actionable, credential-free error.

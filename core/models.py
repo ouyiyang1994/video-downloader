@@ -162,3 +162,18 @@ class DownloadRecord(BaseModel):
     downloaded_at: datetime | None = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class PlaylistEntry(BaseModel):
+    """One item of a playlist, before it becomes a queue task.
+
+    Kept deliberately thin: enumerating a playlist must not fetch per-video
+    metadata, so this carries only what yt-dlp's flat extraction already knows.
+    The real metadata is fetched when the entry is downloaded.
+    """
+
+    url: str
+    title: str | None = None
+    video_id: str | None = None
+    #: 1-based position in the playlist, so the queue keeps the original order.
+    index: int = 0

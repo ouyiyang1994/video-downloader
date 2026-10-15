@@ -23,7 +23,7 @@ from core.exceptions import NotDownloadableError, UnsupportedUrlError, VideoDown
 from core.http import load_cookie_header
 from core.interfaces import PlatformAdapter
 from core.login import LoginState, SessionOrigin, SessionStatus, header_has_cookie
-from core.models import DownloadPlan, MediaStream, Platform, VideoInfo
+from core.models import DownloadPlan, MediaStream, Platform, PlaylistEntry, VideoInfo
 from core.session_store import session_file
 from platforms.instagram import graph, urls
 
@@ -234,6 +234,16 @@ class InstagramAdapter(PlatformAdapter):
         elif "://" not in cleaned:
             cleaned = f"https://{cleaned}"
         return cleaned
+
+    async def expand_playlist(self, url: str, *, limit: int = 200) -> list[PlaylistEntry]:
+        """Enumerate a carousel or profile listing when yt-dlp can see one.
+
+        Instagram exposes no playlist API for public content, so this answers
+        ``[]`` for the ordinary single-post link and only returns entries when
+        yt-dlp genuinely finds several.
+        """
+
+        return await self.engine.extract_playlist(url, limit=limit, referer=PUBLIC_REFERER)
 
     async def fetch_info(self, url: str) -> VideoInfo:
         normalized = self.normalize_url(url)

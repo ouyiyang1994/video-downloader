@@ -11,6 +11,7 @@ import logging
 import os
 import socket
 import time
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -43,7 +44,8 @@ from core.exceptions import (
     UnsupportedUrlError,
 )
 from core.login import LoginSource, LoginState, SessionOrigin, SessionStatus, parse_session_text
-from core.models import DownloadRecord, DownloadResult, DownloadStatus, Platform
+from core.models import DownloadRecord, DownloadResult, DownloadStatus, Platform, PlaylistEntry
+from core.queue import DownloadQueue, QueueState
 from core.registry import PlatformRegistry, build_registry
 
 
@@ -58,10 +60,13 @@ def registry(settings: Settings) -> PlatformRegistry:
 
 
 @pytest.fixture
-def window(qtbot, settings: Settings, registry: PlatformRegistry) -> gui.MainWindow:
+def window(qtbot, settings: Settings, registry: PlatformRegistry) -> Iterator[gui.MainWindow]:
     main = gui.MainWindow(settings, registry=registry)
     qtbot.addWidget(main)
-    return main
+    yield main
+    # The window is never shown in tests, so closeEvent never runs; release the
+    # queue's database handle explicitly.
+    main.queue.stop(timeout=5)
 
 
 # --- platform recognition ---------------------------------------------------
@@ -254,12 +259,14 @@ def test_rights_checkbox_required_for_youtube(window: gui.MainWindow) -> None:
 
 
 def test_bilibili_needs_no_rights_confirmation(window: gui.MainWindow) -> None:
+    # Playlist expansion is a network call; the queue path is what is under test.
+    window.expand_check.setChecked(False)
     window.url_edit.setText("https://www.bilibili.com/video/BV1GJ411x7h7")
     window.rights_check.setChecked(False)
     window.start_download()
-    assert window.worker is not None
-    window.worker.cancel()
-    window.worker.wait(5000)
+
+    assert window.worker is None, "队列流程不应再创建单任务 worker"
+    assert len(window.queue.tasks()) == 1
 
 
 def test_progress_updates_the_window(window: gui.MainWindow) -> None:
@@ -2409,3 +2416,399 @@ def test_the_login_dialog_reports_the_bridge_in_its_hint(login_dialog, monkeypat
     login_dialog._refresh_chrome_box()
 
     assert "127.0.0.1:8765" in login_dialog.chrome_send_hint.text()
+
+
+# --- download queue ---------------------------------------------------------
+
+
+def _enqueue_bilibili(
+    window: gui.MainWindow,
+    url: str = "https://www.bilibili.com/video/BV1GJ411x7h7",
+) -> None:
+    """Put one link in the queue without touching the network."""
+
+    window.expand_check.setChecked(False)
+    window.url_edit.setText(url)
+    window.start_download()
+
+
+def test_the_queue_is_not_started_until_the_window_is_shown(window: gui.MainWindow) -> None:
+    """Constructing the window must not spawn worker threads or restore tasks."""
+
+    assert window.queue.running is False
+    assert window.queue_table.rowCount() == 0
+    assert gui.QUEUE_EMPTY_TEXT in window.queue_summary_label.text()
+
+
+def test_the_start_button_queues_instead_of_downloading(window: gui.MainWindow) -> None:
+    _enqueue_bilibili(window)
+
+    tasks = window.queue.tasks()
+    assert len(tasks) == 1
+    assert tasks[0].state is QueueState.PENDING
+    assert window.worker is None, "队列流程不应再创建单任务 worker"
+    assert window.url_edit.text() == "", "加入队列后应清空输入框"
+    assert "已加入队列" in window.done_label.text()
+
+
+def test_the_same_link_is_not_queued_twice(window: gui.MainWindow) -> None:
+    _enqueue_bilibili(window)
+    _enqueue_bilibili(window)
+
+    assert len(window.queue.tasks()) == 1
+    assert "已在队列中" in window.done_label.text()
+
+
+def test_the_queue_table_shows_position_state_and_progress(window: gui.MainWindow) -> None:
+    _enqueue_bilibili(window)
+    task = window.queue.tasks()[0]
+    task.update_progress(
+        ProgressUpdate(stream_kind="video", downloaded=50, total=100, speed_bps=10.0)
+    )
+    window._refresh_queue()
+
+    assert window.queue_table.rowCount() == 1
+    assert window.queue_table.item(0, 0).text() == "1"  # 位置
+    assert window.queue_table.item(0, 2).text() == "排队中"  # 状态
+    assert window.queue_table.item(0, 3).text() == "50%"  # 进度
+    # Speed and ETA are only meaningful while a transfer is running.
+    assert window.queue_table.item(0, 4).text() == "-"
+
+
+def test_a_running_task_shows_speed_and_eta(window: gui.MainWindow) -> None:
+    _enqueue_bilibili(window)
+    task = window.queue.tasks()[0]
+    task.state = QueueState.RUNNING
+    task.update_progress(
+        ProgressUpdate(stream_kind="video", downloaded=50, total=100, speed_bps=10.0)
+    )
+    window._refresh_queue()
+
+    assert window.queue_table.item(0, 2).text().startswith("下载中")
+    assert window.queue_table.item(0, 4).text() != "-"  # 速度
+    assert window.queue_table.item(0, 5).text() != "-"  # 剩余
+
+
+def test_the_detail_panel_mirrors_the_selected_task(window: gui.MainWindow) -> None:
+    _enqueue_bilibili(window)
+    task = window.queue.tasks()[0]
+    task.update_progress(
+        ProgressUpdate(stream_kind="video", downloaded=25, total=100, speed_bps=5.0)
+    )
+    window._refresh_queue()
+
+    assert "25%" in window.progress_bar.format()
+    assert "已下载" in window.size_label.text()
+    assert "排队中" in window.status_label.text()
+
+
+def test_pausing_and_resuming_the_selected_task(window: gui.MainWindow) -> None:
+    _enqueue_bilibili(window)
+    window.queue_table.selectRow(0)
+
+    window._on_queue_pause()
+    assert window.queue.tasks()[0].state is QueueState.PAUSED
+
+    window._on_queue_resume()
+    assert window.queue.tasks()[0].state is QueueState.PENDING
+
+
+def test_queue_actions_without_a_selection_explain_themselves(window: gui.MainWindow) -> None:
+    _enqueue_bilibili(window)
+    window.queue_table.clearSelection()
+    window.queue_table.setCurrentCell(-1, -1)
+
+    window._on_queue_pause()
+
+    assert "选择" in window.error_label.text()
+
+
+def test_selecting_a_row_enables_the_cancel_button(window: gui.MainWindow) -> None:
+    _enqueue_bilibili(window)
+    assert not window.cancel_button.isEnabled()
+
+    window.queue_table.selectRow(0)
+    assert window.cancel_button.isEnabled()
+
+
+def test_cancelling_the_selected_task_from_the_toolbar(window: gui.MainWindow) -> None:
+    _enqueue_bilibili(window)
+    window.queue_table.selectRow(0)
+
+    window.cancel_download()
+
+    assert window.queue.tasks()[0].state is QueueState.CANCELLED
+
+
+def test_retry_explains_when_the_task_cannot_be_retried(window: gui.MainWindow) -> None:
+    _enqueue_bilibili(window)
+    window.queue_table.selectRow(0)  # pending, not failed
+
+    window._on_queue_retry()
+
+    assert "重试" in window.error_label.text()
+
+
+def test_the_concurrency_spinbox_applies_the_limit(window: gui.MainWindow) -> None:
+    window.concurrency_spin.setValue(3)
+    assert window.queue.max_concurrent == 3
+
+    # Above the hard limit the value is clamped back into the box.
+    window.concurrency_spin.setValue(gui.MAX_CONCURRENT_LIMIT)
+    assert window.queue.max_concurrent == gui.MAX_CONCURRENT_LIMIT
+
+
+def test_clear_finished_keeps_the_pending_work(window: gui.MainWindow) -> None:
+    _enqueue_bilibili(window, "https://www.bilibili.com/video/BV1GJ411x7h7")
+    _enqueue_bilibili(window, "https://www.bilibili.com/video/BV1GJ411x7h8")
+    first, second = window.queue.tasks()
+    window.queue.cancel(first.task_id)
+
+    window._on_queue_clear_finished()
+
+    assert [task.task_id for task in window.queue.tasks()] == [second.task_id]
+    assert window.queue_table.rowCount() == 1
+
+
+def test_removing_a_task_takes_it_out_of_the_table(window: gui.MainWindow) -> None:
+    _enqueue_bilibili(window)
+    window.queue_table.selectRow(0)
+
+    window._on_queue_remove()
+
+    assert window.queue.tasks() == []
+    assert window.queue_table.rowCount() == 0
+
+
+def test_removing_a_running_task_is_refused(window: gui.MainWindow) -> None:
+    _enqueue_bilibili(window)
+    task = window.queue.tasks()[0]
+    task.state = QueueState.RUNNING
+    window.queue_table.selectRow(0)
+
+    window._on_queue_remove()
+
+    assert len(window.queue.tasks()) == 1
+    assert "移除" in window.error_label.text()
+
+
+def test_closing_the_window_stops_the_queue(
+    qtbot, settings: Settings, registry: PlatformRegistry
+) -> None:
+    """A queue left running would keep downloading after the window is gone."""
+
+    def _never(task, progress, cancel_event):  # pragma: no cover - must not run
+        raise AssertionError("关闭窗口后不应还有任务在执行")
+
+    queue = DownloadQueue(settings, executor=_never)
+    main = gui.MainWindow(settings, registry=registry, queue=queue)
+    qtbot.addWidget(main)
+    queue.start()
+    assert queue.running is True
+
+    main.close()
+
+    assert queue.running is False
+
+
+def test_an_injected_queue_is_used_instead_of_a_real_one(
+    qtbot, settings: Settings, registry: PlatformRegistry
+) -> None:
+    """The seam that keeps the queue tests off the network."""
+
+    queue = DownloadQueue(settings, executor=lambda task, progress, cancel_event: None)
+    main = gui.MainWindow(settings, registry=registry, queue=queue)
+    qtbot.addWidget(main)
+    try:
+        assert main.queue is queue
+    finally:
+        queue.stop(timeout=5)
+
+
+def test_a_failed_task_shows_its_error_in_the_table(window: gui.MainWindow) -> None:
+    """The reason has to be visible without opening a log file."""
+
+    _enqueue_bilibili(window)
+    task = window.queue.tasks()[0]
+    task.state = QueueState.FAILED
+    task.error = "网络连接被重置"
+    window._refresh_queue()
+
+    assert "失败" in window.queue_table.item(0, 2).text()
+    assert "网络连接被重置" in window.queue_table.item(0, 2).text()
+    assert window.queue_table.item(0, 3).text() == "-"
+
+
+def test_a_paused_task_renders_as_paused(window: gui.MainWindow) -> None:
+    _enqueue_bilibili(window)
+    task = window.queue.tasks()[0]
+    task.update_progress(
+        ProgressUpdate(stream_kind="video", downloaded=50, total=100, speed_bps=10.0)
+    )
+    task.state = QueueState.PAUSED
+    window._refresh_queue()
+
+    assert window.queue_table.item(0, 2).text() == "已暂停"
+    assert window.queue_table.item(0, 3).text() == "50%"
+    # Speed and ETA belong to a running transfer only.
+    assert window.queue_table.item(0, 4).text() == "-"
+    assert window.queue_table.item(0, 5).text() == "-"
+
+
+def test_a_completed_task_renders_at_full_progress(window: gui.MainWindow) -> None:
+    _enqueue_bilibili(window)
+    task = window.queue.tasks()[0]
+    task.state = QueueState.COMPLETED
+    window._refresh_queue()
+
+    assert window.queue_table.item(0, 2).text() == "已完成"
+    assert window.queue_table.item(0, 3).text() == "100%"
+
+
+def test_a_running_task_shows_its_attempt_count(window: gui.MainWindow) -> None:
+    _enqueue_bilibili(window)
+    task = window.queue.tasks()[0]
+    task.state = QueueState.RUNNING
+    task.attempts = 2
+    task.max_attempts = 3
+    window._refresh_queue()
+
+    assert "下载中" in window.queue_table.item(0, 2).text()
+    assert "2/3" in window.queue_table.item(0, 2).text()
+
+
+def test_the_summary_counts_every_state(window: gui.MainWindow) -> None:
+    _enqueue_bilibili(window, "https://www.bilibili.com/video/BV1GJ411x7h7")
+    _enqueue_bilibili(window, "https://www.bilibili.com/video/BV1GJ411x7h8")
+    _enqueue_bilibili(window, "https://www.bilibili.com/video/BV1GJ411x7h9")
+    first, second, third = window.queue.tasks()
+    first.state = QueueState.RUNNING
+    second.state = QueueState.COMPLETED
+    third.state = QueueState.FAILED
+    window._refresh_queue()
+
+    summary = window.queue_summary_label.text()
+    assert "下载中 1" in summary
+    assert "完成 1" in summary
+    assert "失败 1" in summary
+    assert "共 3" in summary
+
+
+def test_retrying_a_failed_task_from_the_toolbar(window: gui.MainWindow) -> None:
+    _enqueue_bilibili(window)
+    task = window.queue.tasks()[0]
+    task.state = QueueState.FAILED
+    task.error = "临时故障"
+    window.queue_table.selectRow(0)
+
+    window._on_queue_retry()
+
+    assert task.state is QueueState.PENDING
+    assert task.error is None
+    assert window.queue_table.item(0, 2).text() == "排队中"
+
+
+def test_pausing_a_finished_task_from_the_toolbar_does_nothing(
+    window: gui.MainWindow,
+) -> None:
+    _enqueue_bilibili(window)
+    task = window.queue.tasks()[0]
+    task.state = QueueState.COMPLETED
+    window.queue_table.selectRow(0)
+
+    window._on_queue_pause()
+
+    assert task.state is QueueState.COMPLETED, "已完成的任务不应被改回暂停"
+
+
+# --- playlist rows ----------------------------------------------------------
+#
+# A playlist listing already knows each entry's title and identity. Using them
+# means a queued part shows its real name straight away - and two parts of one
+# Bilibili video stay distinguishable, because their identities differ even
+# though their bvid does not.
+
+MULTI_URL = "https://www.bilibili.com/video/BV1fkHD6wEXt"
+
+
+def _playlist(*specs: tuple[str, str | None, str | None]) -> list[PlaylistEntry]:
+    return [
+        PlaylistEntry(url=url, title=title, video_id=video_id, index=index)
+        for index, (url, title, video_id) in enumerate(specs, start=1)
+    ]
+
+
+def test_expanding_a_playlist_labels_every_row_from_the_entry(
+    window: gui.MainWindow,
+) -> None:
+    """The entry's title is what the row shows - not a raw URL."""
+
+    window._on_expanded(
+        _playlist(
+            (f"{MULTI_URL}?p=1", "投稿 - P1", "BV1fkHD6wEXt_p1"),
+            (f"{MULTI_URL}?p=2", "投稿 - P2", "BV1fkHD6wEXt_p2"),
+        ),
+        MULTI_URL,
+        "best",
+    )
+
+    tasks = window.queue.tasks()
+    assert [task.url for task in tasks] == [f"{MULTI_URL}?p=1", f"{MULTI_URL}?p=2"]
+    assert [task.title for task in tasks] == ["投稿 - P1", "投稿 - P2"]
+    assert [task.video_id for task in tasks] == ["BV1fkHD6wEXt_p1", "BV1fkHD6wEXt_p2"]
+    assert len(tasks) == 2, "两个分P 必须各自成任务，不能被合并"
+
+    window._refresh_queue()
+    assert window.queue_table.item(0, 1).text() == "投稿 - P1"
+    assert window.queue_table.item(1, 1).text() == "投稿 - P2"
+
+
+def test_a_playlist_entry_without_a_title_falls_back_to_its_url(
+    window: gui.MainWindow,
+) -> None:
+    """A listing that gave no title must not leave the row blank."""
+
+    window._on_expanded(
+        _playlist((f"{MULTI_URL}?p=1", None, None), (f"{MULTI_URL}?p=2", None, None)),
+        MULTI_URL,
+        "best",
+    )
+    window._refresh_queue()
+
+    assert window.queue_table.item(0, 1).text() == f"{MULTI_URL}?p=1"
+    assert window.queue_table.item(1, 1).text() == f"{MULTI_URL}?p=2"
+
+
+def test_a_youtube_playlist_keeps_each_entry_apart(window: gui.MainWindow) -> None:
+    """The same path has to keep working for a platform whose ids are per-video."""
+
+    window._on_expanded(
+        _playlist(
+            ("https://www.youtube.com/watch?v=aaa", "第一首", "aaa"),
+            ("https://www.youtube.com/watch?v=bbb", "第二首", "bbb"),
+        ),
+        "https://www.youtube.com/playlist?list=L1",
+        "best",
+    )
+
+    tasks = window.queue.tasks()
+    assert [task.title for task in tasks] == ["第一首", "第二首"]
+    assert [task.video_id for task in tasks] == ["aaa", "bbb"]
+
+
+def test_a_single_result_queues_the_link_the_user_typed(window: gui.MainWindow) -> None:
+    """One entry is not a playlist: the typed link is what gets queued.
+
+    Its title arrives with the download, so nothing is invented here.
+    """
+
+    typed = f"{MULTI_URL}?p=3"
+    window._on_expanded(
+        _playlist((typed, "投稿 - P3", "BV1fkHD6wEXt_p3")), typed, "best"
+    )
+
+    tasks = window.queue.tasks()
+    assert len(tasks) == 1
+    assert tasks[0].url == typed
+    assert tasks[0].title is None
+    assert tasks[0].video_id is None

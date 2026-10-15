@@ -11,6 +11,7 @@ import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import httpx
 
@@ -35,6 +36,9 @@ from core.models import (
 from core.naming import build_output_directory, sanitize_filename
 from core.registry import PlatformRegistry
 from storage import metadata as metadata_store
+
+if TYPE_CHECKING:
+    from core.interfaces import PlatformAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -84,21 +88,20 @@ class DownloadService:
         base_dir = self.settings.resolve_path(base_dir)
 
         if self.settings.skip_existing and not force:
-            record = self.database.get(info.platform, info.video_id)
-            if record and record.status is DownloadStatus.COMPLETED and record.file_path:
-                if Path(record.file_path).exists():
-                    logger.info("数据库中已存在且文件仍在，跳过：%s", record.file_path)
-                    return DownloadResult(
-                        status=DownloadStatus.SKIPPED,
-                        platform=info.platform,
-                        video_id=info.video_id,
-                        title=info.title,
-                        video_path=Path(record.file_path),
-                        quality_label=record.quality_label or "unknown",
-                        resolution=record.resolution,
-                        skipped_reason="已下载（数据库记录命中）",
-                    )
-                logger.warning("数据库记录存在但文件缺失，将重新下载：%s", record.file_path)
+            record = self._completed_record(adapter, info)
+            if record is not None and record.file_path:
+                file_path = Path(record.file_path)
+                logger.info("数据库中已存在且文件仍在，跳过：%s", file_path)
+                return DownloadResult(
+                    status=DownloadStatus.SKIPPED,
+                    platform=info.platform,
+                    video_id=info.video_id,
+                    title=info.title,
+                    video_path=file_path,
+                    quality_label=record.quality_label or "unknown",
+                    resolution=record.resolution,
+                    skipped_reason="已下载（数据库记录命中）",
+                )
 
         plan = adapter.select_streams(info, quality)
         target_dir = build_output_directory(
@@ -175,6 +178,46 @@ class DownloadService:
             raise
 
     # -- internals ----------------------------------------------------------
+    def _completed_record(
+        self, adapter: PlatformAdapter, info: VideoInfo
+    ) -> DownloadRecord | None:
+        """The completed row for this download, if there is one.
+
+        The current key is tried first and behaves exactly as it always has.
+        Only when it has no row are the identities earlier versions used
+        consulted, and then only when the adapter confirms the stored URL is the
+        same download - so the compatibility path can spare a redundant
+        re-download but can never hide one that has not happened.
+        """
+
+        record = self.database.get(info.platform, info.video_id)
+        if record is None:
+            record = self._legacy_record(adapter, info)
+        if record is None or record.status is not DownloadStatus.COMPLETED:
+            return None
+        if not record.file_path:
+            return None
+        if not Path(record.file_path).exists():
+            logger.warning("数据库记录存在但文件缺失，将重新下载：%s", record.file_path)
+            return None
+        return record
+
+    def _legacy_record(
+        self, adapter: PlatformAdapter, info: VideoInfo
+    ) -> DownloadRecord | None:
+        """A row written under an identity an older version used for this download."""
+
+        for key in adapter.legacy_video_ids(info):
+            record = self.database.get(info.platform, key)
+            if record is None:
+                continue
+            if not adapter.is_same_download(info, record.url or ""):
+                logger.debug("忽略旧键 %s 的记录：URL 指向的不是同一次下载", key)
+                continue
+            logger.info("命中旧版本记录（键 %s），无需重复下载", key)
+            return record
+        return None
+
     async def _fetch_streams(
         self,
         info: VideoInfo,

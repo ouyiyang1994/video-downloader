@@ -16,7 +16,7 @@ from config.settings import Settings
 from core.exceptions import NotDownloadableError
 from core.http import load_cookie_header
 from core.login import LoginSource, LoginState, SessionOrigin, SessionStatus
-from core.models import DownloadPlan, Platform, VideoInfo
+from core.models import DownloadPlan, Platform, PlaylistEntry, VideoInfo
 from core.session_store import session_file
 
 
@@ -147,10 +147,45 @@ class PlatformAdapter(ABC):
     def select_streams(self, info: VideoInfo, quality: str) -> DownloadPlan:
         """Pick the streams matching the requested quality preset."""
 
-    # -- 5. Cover art / metadata sidecar ------------------------------------
+    # -- 5. Playlist --------------------------------------------------------
+    async def expand_playlist(self, url: str, *, limit: int = 200) -> list[PlaylistEntry]:
+        """The entries of a playlist URL, in order, or ``[]`` for a single video.
+
+        The default answer - "this platform has no playlist concept here" -
+        keeps every adapter that predates the queue working unchanged, and lets
+        the queue treat a single video and a playlist through one code path:
+        an empty list simply means "one item, the URL itself".
+        """
+
+        return []
+
+    # -- 5b. History compatibility -------------------------------------------
+    def legacy_video_ids(self, info: VideoInfo) -> tuple[str, ...]:
+        """Identity keys earlier versions recorded for this same download.
+
+        Only consulted when the current key has no row at all, and only accepted
+        when :meth:`is_same_download` agrees. That makes the compatibility path
+        strictly additive: it can spare a redundant re-download, but it can
+        never hide a download that has not actually happened.
+        """
+
+        return ()
+
+    def is_same_download(self, info: VideoInfo, stored_url: str) -> bool:
+        """Whether a row saved under an older key really is this download.
+
+        The default compares the download URL, which is what the row stored.
+        Platforms whose URL carries extra position information override this.
+        """
+
+        if not stored_url:
+            return False
+        return self.normalize_url(stored_url) == self.normalize_url(info.url)
+
+    # -- 6. Cover art / metadata sidecar ------------------------------------
     def cover_url(self, info: VideoInfo) -> str | None:
         return info.thumbnail_url
 
-    # -- 6. Error translation ----------------------------------------------
+    # -- 7. Error translation ----------------------------------------------
     def describe(self) -> str:
         return self.display_name or self.platform.value

@@ -16,11 +16,12 @@ from typing import Any
 import httpx
 
 from core import fallback_policy, selection
+from core.engine_ytdlp import YtDlpEngine
 from core.exceptions import MetadataError, NotDownloadableError, RateLimitedError
 from core.http import load_cookie_header
 from core.interfaces import PlatformAdapter
 from core.login import LoginSource, LoginState, SessionOrigin, SessionStatus, header_has_cookie
-from core.models import DownloadPlan, MediaStream, Platform, VideoInfo
+from core.models import DownloadPlan, MediaStream, Platform, PlaylistEntry, VideoInfo
 from platforms.bilibili import api, urls
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,48 @@ class BilibiliAdapter(PlatformAdapter):
         self._cookie_header: str | None = None
         self._cookie_origin = SessionOrigin()
         self._cookie_loaded = False
+        #: Built on first use. Bilibili's metadata and streams come from its own
+        #: API, so yt-dlp is only borrowed as a playlist enumerator (for 分P
+        #: listings) and costs nothing when it is never needed.
+        self._playlist_engine: YtDlpEngine | None = None
+
+    async def expand_playlist(self, url: str, *, limit: int = 200) -> list[PlaylistEntry]:
+        """List the parts of a multi-part video (分P), or ``[]`` for one video."""
+
+        if self._playlist_engine is None:
+            self._playlist_engine = YtDlpEngine(self.settings, platform=self.platform)
+        entries = await self._playlist_engine.extract_playlist(
+            url, limit=limit, referer=f"{WEB_ROOT}/"
+        )
+        return _label_parts(entries)
+
+    def legacy_video_ids(self, info: VideoInfo) -> tuple[str, ...]:
+        """The bare bvid: the key 1.25 之前 used for whichever part came first.
+
+        Offered for every part of a multi-part video - the row it finds may hold
+        any part, which is exactly why :meth:`is_same_download` checks the page
+        before the row is trusted. A single-part video already uses the bare
+        bvid as its own key, so it needs no compatibility path.
+        """
+
+        if int(info.extra.get("page_count") or 1) <= 1:
+            return ()
+        bvid = info.extra.get("bvid")
+        return (str(bvid),) if bvid else ()
+
+    def is_same_download(self, info: VideoInfo, stored_url: str) -> bool:
+        """Same投稿 **and** same 分P.
+
+        A URL without ``?p=`` means page 1, which is what an older version
+        stored for the first part of a multi-part video. Comparing the page is
+        what stops a投稿 whose P3 was once downloaded on its own from being
+        mistaken for P1 - the mistake that would hand back the wrong file.
+        """
+
+        if not stored_url:
+            return False
+        same_video = urls.extract_video_id(stored_url) == urls.extract_video_id(info.url)
+        return same_video and urls.extract_page(stored_url) == urls.extract_page(info.url)
 
     # -- URL -----------------------------------------------------------------
     def matches(self, url: str) -> bool:
@@ -305,10 +348,18 @@ class BilibiliAdapter(PlatformAdapter):
         if len(pages) > 1 and page.get("part"):
             title = f"{title} - P{page_index} {page['part']}"
 
+        # Each part is a separate download, so it needs a separate identity.
+        # The bvid is shared by every part while the history table is keyed on
+        # ``(platform, video_id)``: without the suffix, downloading P1 recorded
+        # the whole投稿 as done, and every later part came back "已下载"
+        # pointing at P1's file. Single-part videos keep the plain bvid, so
+        # existing history rows still match.
+        video_id = f"{bvid}_p{page_index}" if len(pages) > 1 else bvid
+
         owner = view.get("owner") or {}
         return VideoInfo(
             platform=self.platform,
-            video_id=bvid,
+            video_id=video_id,
             url=resolved,
             title=title,
             author=owner.get("name"),
@@ -321,6 +372,7 @@ class BilibiliAdapter(PlatformAdapter):
             webpage_url=urls.canonical_watch_url("bvid", bvid),
             extra={
                 "aid": aid,
+                "bvid": bvid,
                 "cid": cid,
                 "page": page_index,
                 "page_count": len(pages),
@@ -414,6 +466,35 @@ class BilibiliAdapter(PlatformAdapter):
         super().check_downloadable(info)
         if info.extra.get("is_upower_exclusive"):
             raise NotDownloadableError("该内容为充电专属，跳过", detail=info.video_id)
+
+
+def _label_parts(entries: list[PlaylistEntry]) -> list[PlaylistEntry]:
+    """Give every 分P entry the identity and title yt-dlp's flat data lacks.
+
+    A Bilibili playlist entry arrives as a bare URL with ``id`` and ``title``
+    both empty, so the queue would hold a nameless row with no stable identity.
+    The page number is the only thing the URL does carry, and it is also what
+    makes one part distinct from the next, so it is used for both - and the
+    identity matches what ``fetch_info`` will produce for the same part, so the
+    entry and the download agree on what they are.
+    """
+
+    if not entries:
+        return []
+
+    multi = len(entries) > 1
+    labelled: list[PlaylistEntry] = []
+    for entry in entries:
+        page = urls.extract_page(entry.url)
+        identity = urls.extract_video_id(entry.url)
+        updates: dict[str, Any] = {}
+        if not entry.video_id and identity:
+            value = identity[1]
+            updates["video_id"] = f"{value}_p{page}" if multi else value
+        if multi:
+            updates["title"] = f"{entry.title} - P{page}" if entry.title else f"P{page}"
+        labelled.append(entry.model_copy(update=updates) if updates else entry)
+    return labelled
 
 
 def _expired() -> SessionStatus:

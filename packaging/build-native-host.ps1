@@ -18,10 +18,16 @@
 .EXAMPLE
     .\packaging\build-native-host.ps1
     .\packaging\build-native-host.ps1 -OutputDir dist\VideoDownloader\native_host
+    .\packaging\build-native-host.ps1 -OutputDir $env:TEMP\vd-host -WorkDir $env:TEMP\vd-host-work
 #>
 [CmdletBinding()]
 param(
-    [string]$OutputDir
+    [string]$OutputDir,
+    #: PyInstaller workpath. Defaults to the project's build\native_host - but
+    #: as soon as -OutputDir is redirected, it moves to a temporary directory
+    #: instead, so a redirected build never touches the project's own
+    #: build\native_host.
+    [string]$WorkDir
 )
 
 $ErrorActionPreference = 'Stop'
@@ -33,7 +39,16 @@ $Python = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
 $Spec = Join-Path $PackagingDir 'native_host.spec'
 $AppName = 'VideoDownloaderNativeHost'
 if (-not $OutputDir) { $OutputDir = Join-Path $ProjectRoot 'native_host' }
-$WorkDir = Join-Path $ProjectRoot 'build\native_host'
+if (-not $WorkDir) {
+    if ($PSBoundParameters.ContainsKey('OutputDir')) {
+        # Redirected output means an isolated build: keep the workpath out of
+        # the project too, so nothing under build\ is written or deleted.
+        $WorkDir = Join-Path ([System.IO.Path]::GetTempPath()) 'vd-native-host-work'
+    }
+    else {
+        $WorkDir = Join-Path $ProjectRoot 'build\native_host'
+    }
+}
 $AppDir = Join-Path $OutputDir $AppName
 
 function Write-Step([string]$Text) {
@@ -41,16 +56,28 @@ function Write-Step([string]$Text) {
     Write-Host "==== $Text ====" -ForegroundColor Cyan
 }
 
-function Assert-InsideProject([string]$Path) {
-    $resolved = (Resolve-Path -LiteralPath $Path).Path
-    if (-not $resolved.StartsWith($ProjectRoot, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "拒绝清理项目外的目录: $resolved"
+# Refuses paths that are never safe to remove wholesale: a drive root, a
+# directory one level below a root, or a well-known user/system directory.
+# Deliberately not restricted to the project, so an isolated -OutputDir under
+# %TEMP% can be rebuilt; what it must never do is wipe a whole user folder.
+function Assert-SafeToRemove([string]$Path) {
+    $resolved = (Resolve-Path -LiteralPath $Path).Path.TrimEnd('\', '/')
+    $parent = Split-Path -Parent $resolved
+    if (-not $parent) { throw "拒绝删除根目录: $resolved" }
+    if (-not (Split-Path -Parent $parent)) { throw "拒绝删除过浅的路径: $resolved" }
+    foreach ($protected in @($ProjectRoot, $env:USERPROFILE, $env:TEMP, $env:LOCALAPPDATA, $env:APPDATA)) {
+        if (-not $protected) { continue }
+        if ($resolved -eq $protected.TrimEnd('\', '/')) {
+            throw "拒绝删除受保护目录: $resolved"
+        }
     }
 }
 
 if (-not (Test-Path $Python)) { throw "找不到 $Python，请先创建 .venv" }
 
 Write-Host "项目根目录: $ProjectRoot" -ForegroundColor Green
+Write-Host "输出目录:   $OutputDir"
+Write-Host "工作目录:   $WorkDir"
 
 Write-Step '1/5 检查 PyInstaller'
 & $Python -c "import PyInstaller; print('PyInstaller', PyInstaller.__version__)"
@@ -59,7 +86,7 @@ if ($LASTEXITCODE -ne 0) { throw '缺少 PyInstaller，请先 uv sync --dev' }
 Write-Step '2/5 清理旧的构建产物'
 foreach ($dir in @($WorkDir, $AppDir)) {
     if (Test-Path $dir) {
-        Assert-InsideProject $dir
+        Assert-SafeToRemove $dir
         Remove-Item -LiteralPath $dir -Recurse -Force
     }
 }

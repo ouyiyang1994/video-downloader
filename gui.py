@@ -24,6 +24,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import Any
 
 import httpx
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
@@ -46,6 +47,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -55,6 +57,7 @@ from PySide6.QtWidgets import (
 from config.constants import (
     DEFAULT_PROXY_HOST,
     DEFAULT_PROXY_PORT,
+    MAX_CONCURRENT_LIMIT,
     QUALITY_AUDIO_ONLY,
     QUALITY_PRESETS,
     SUPPORTED_PLATFORM_IDS,
@@ -130,9 +133,10 @@ from core.login import (
     parse_session_text,
 )
 from core.merger import locate_ffmpeg
-from core.models import DownloadResult, DownloadStatus, Platform
+from core.models import DownloadResult, DownloadStatus, Platform, PlaylistEntry
+from core.queue import DownloadQueue, QueueRequest, QueueState, eta_seconds
 from core.registry import PlatformRegistry, build_registry
-from core.service import DownloadService
+from core.runner import execute_download
 from core.session_store import (
     delete_session,
     has_session,
@@ -148,6 +152,28 @@ PLATFORM_IDLE_TEXT = "等待输入链接"
 UNSUPPORTED_PLATFORM_TEXT = "暂不支持该平台"
 RIGHTS_UNCHECKED_TEXT = "请先勾选「我确认拥有下载该内容的权利」"
 EMPTY_URL_TEXT = "请先粘贴视频链接"
+
+#: How often the window re-reads the queue. The queue is polled rather than
+#: pushed: progress ticks arrive ~2x/second per stream from worker threads, and
+#: one timer on the GUI thread is far simpler to reason about than signals
+#: crossing from every worker.
+QUEUE_REFRESH_MS = 400
+
+#: Queue table columns, in order.
+QUEUE_COLUMNS = ("位置", "标题 / 链接", "状态", "进度", "速度", "剩余", "画质")
+
+#: How each queue state is written in the table.
+QUEUE_STATE_LABELS: dict[QueueState, str] = {
+    QueueState.PENDING: "排队中",
+    QueueState.RUNNING: "下载中",
+    QueueState.PAUSED: "已暂停",
+    QueueState.COMPLETED: "已完成",
+    QueueState.SKIPPED: "已跳过",
+    QueueState.FAILED: "失败",
+    QueueState.CANCELLED: "已取消",
+}
+
+QUEUE_EMPTY_TEXT = "队列为空，粘贴链接后点「加入队列」"
 
 # --- sign-in button text ----------------------------------------------------
 #
@@ -498,32 +524,63 @@ class DownloadWorker(QThread):
         )
 
     async def _download(self) -> DownloadResult:
-        client = build_client(self.settings)
-        registry: PlatformRegistry | None = None
-        database = DownloadDatabase(self.settings)
-        database.connect()
-        try:
-            registry = build_registry(self.settings, client)
-            adapter = registry.resolve(self.url)
+        """Run the shared single-download path, remembering the platform.
+
+        The client/registry/database assembly lives in ``core.runner`` because
+        the queue needs exactly the same thing; keeping one copy means the two
+        can never drift apart in how they resolve a URL or close a socket.
+        """
+
+        def _remember(adapter: PlatformAdapter) -> None:
             self.platform = adapter.platform
             self.requires_rights = adapter.requires_rights_confirmation
-            service = DownloadService(self.settings, registry, client, database)
-            return await service.download(
-                self.url,
-                quality=self.quality,
-                output_dir=self.output_dir,
-                progress={"video": self._emit_progress, "audio": self._emit_progress},
-                cancel_event=self.cancel_event,
-            )
-        finally:
-            if registry is not None:
-                for extra in registry.owned_clients:
-                    await extra.aclose()
-            await client.aclose()
-            database.close()
+
+        return await execute_download(
+            self.settings,
+            self.url,
+            quality=self.quality,
+            output_dir=self.output_dir,
+            progress={"video": self._emit_progress, "audio": self._emit_progress},
+            cancel_event=self.cancel_event,
+            on_adapter=_remember,
+        )
 
     def _emit_progress(self, update: ProgressUpdate) -> None:
         self.progressed.emit(update)
+
+
+class PlaylistExpandWorker(QThread):
+    """Asks an adapter what a URL expands to, off the GUI thread.
+
+    yt-dlp's flat extraction is a single request, but it is still a network
+    call, so it never runs on the GUI thread. A failure is deliberately not an
+    error the user has to act on: it means "treat this as one video", which is
+    exactly what an empty entry list already means.
+    """
+
+    expanded = Signal(object)  # list[PlaylistEntry]
+
+    def __init__(
+        self,
+        adapter: PlatformAdapter,
+        url: str,
+        limit: int,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.adapter = adapter
+        self.url = url
+        self.limit = limit
+
+    def run(self) -> None:
+        """QThread entry point: never let a traceback escape to the GUI."""
+
+        entries: list[PlaylistEntry] = []
+        try:
+            entries = asyncio.run(self.adapter.expand_playlist(self.url, limit=self.limit))
+        except Exception as exc:  # noqa: BLE001 - a failed listing is not fatal
+            logger.warning("播放列表解析失败，将按单个视频处理：%s", exc)
+        self.expanded.emit(entries)
 
 
 class ProxyTestWorker(QThread):
@@ -1627,6 +1684,7 @@ class MainWindow(QMainWindow):
         settings: Settings,
         *,
         registry: PlatformRegistry | None = None,
+        queue: DownloadQueue | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -1635,6 +1693,22 @@ class MainWindow(QMainWindow):
         self.worker: DownloadWorker | None = None
         self.current_platform: Platform | None = None
         self.dark_mode = False
+
+        #: The download queue. Constructed here but *started* in ``showEvent``,
+        #: for the same reason the session check is: the tests build windows
+        #: without showing them, and starting the queue spawns worker threads
+        #: and restores persisted tasks. Injectable so a test can drive the
+        #: window without ever reaching the network.
+        self.queue = queue if queue is not None else DownloadQueue(settings)
+        self._queue_started = False
+        self._queue_rows: list[str] = []
+        #: Guards against re-entrancy: changing the row count makes Qt emit a
+        #: selection change, which would otherwise ask for another refresh.
+        self._refreshing_queue = False
+        self._expand_worker: PlaylistExpandWorker | None = None
+        self._queue_timer = QTimer(self)
+        self._queue_timer.setInterval(QUEUE_REFRESH_MS)
+        self._queue_timer.timeout.connect(self._refresh_queue)
 
         #: Sign-in state, one entry per platform that supports it.
         self.login_adapters: dict[Platform, PlatformAdapter] = {}
@@ -1766,10 +1840,10 @@ class MainWindow(QMainWindow):
         root.addWidget(self._build_login_box())
 
         actions = QHBoxLayout()
-        self.start_button = QPushButton("开始下载")
+        self.start_button = QPushButton("加入队列")
         self.start_button.setObjectName("primary")
         self.start_button.clicked.connect(self.start_download)
-        self.cancel_button = QPushButton("取消下载")
+        self.cancel_button = QPushButton("取消选中任务")
         self.cancel_button.clicked.connect(self.cancel_download)
         actions.addStretch(1)
         actions.addWidget(self.start_button)
@@ -1777,7 +1851,66 @@ class MainWindow(QMainWindow):
         actions.addStretch(1)
         root.addLayout(actions)
 
-        progress_box = QGroupBox("下载进度")
+        queue_box = QGroupBox("下载队列")
+        queue_layout = QVBoxLayout(queue_box)
+
+        queue_toolbar = QHBoxLayout()
+        queue_toolbar.addWidget(QLabel("最大并发"))
+        self.concurrency_spin = QSpinBox()
+        self.concurrency_spin.setRange(1, MAX_CONCURRENT_LIMIT)
+        self.concurrency_spin.setValue(self.queue.max_concurrent)
+        self.concurrency_spin.setToolTip("同时下载的任务数；调大可能触发平台限流")
+        self.concurrency_spin.valueChanged.connect(self._on_concurrency_changed)
+        queue_toolbar.addWidget(self.concurrency_spin)
+
+        self.expand_check = QCheckBox("展开播放列表")
+        self.expand_check.setChecked(self.settings.queue_expand_playlists)
+        self.expand_check.setToolTip("播放列表链接会按顺序拆成多个任务")
+        queue_toolbar.addWidget(self.expand_check)
+        queue_toolbar.addStretch(1)
+
+        self.queue_pause_button = QPushButton("暂停")
+        self.queue_pause_button.clicked.connect(self._on_queue_pause)
+        self.queue_resume_button = QPushButton("继续")
+        self.queue_resume_button.clicked.connect(self._on_queue_resume)
+        self.queue_retry_button = QPushButton("重试")
+        self.queue_retry_button.clicked.connect(self._on_queue_retry)
+        self.queue_remove_button = QPushButton("移除")
+        self.queue_remove_button.clicked.connect(self._on_queue_remove)
+        for button in (
+            self.queue_pause_button,
+            self.queue_resume_button,
+            self.queue_retry_button,
+            self.queue_remove_button,
+        ):
+            queue_toolbar.addWidget(button)
+        queue_layout.addLayout(queue_toolbar)
+
+        self.queue_table = QTableWidget(0, len(QUEUE_COLUMNS))
+        self.queue_table.setHorizontalHeaderLabels(list(QUEUE_COLUMNS))
+        self.queue_table.verticalHeader().setVisible(False)
+        self.queue_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.queue_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.queue_table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.queue_table.setMinimumHeight(150)
+        queue_header = self.queue_table.horizontalHeader()
+        queue_header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        queue_header.setStretchLastSection(True)
+        self.queue_table.itemSelectionChanged.connect(self._on_queue_selection_changed)
+        queue_layout.addWidget(self.queue_table)
+
+        queue_footer = QHBoxLayout()
+        self.queue_summary_label = QLabel(QUEUE_EMPTY_TEXT)
+        self.queue_summary_label.setStyleSheet("color: #57606a;")
+        self.queue_summary_label.setWordWrap(True)
+        queue_footer.addWidget(self.queue_summary_label, 1)
+        self.queue_clear_button = QPushButton("清空已结束")
+        self.queue_clear_button.clicked.connect(self._on_queue_clear_finished)
+        queue_footer.addWidget(self.queue_clear_button)
+        queue_layout.addLayout(queue_footer)
+        root.addWidget(queue_box)
+
+        progress_box = QGroupBox("当前任务")
         progress_layout = QVBoxLayout(progress_box)
         self.file_label = QLabel("当前文件：-")
         self.file_label.setWordWrap(True)
@@ -1922,6 +2055,15 @@ class MainWindow(QMainWindow):
         if not self._login_checked:
             self._login_checked = True
             QTimer.singleShot(0, self.refresh_login_status)
+        if not self._queue_started:
+            # Starting the queue restores unfinished tasks from SQLite and
+            # spawns its worker threads, so it happens when the window really
+            # appears - never while a test is merely constructing it.
+            self._queue_started = True
+            self.queue.start()
+            self.concurrency_spin.setValue(self.queue.max_concurrent)
+            self._refresh_queue()
+            self._queue_timer.start()
 
     def refresh_login_status(self) -> None:
         """Re-check every platform's session in the background."""
@@ -2414,7 +2556,11 @@ class MainWindow(QMainWindow):
 
     # -- download control ----------------------------------------------------
     def start_download(self) -> None:
-        """Validate the form and hand the job to a worker thread."""
+        """Validate the form and put the link into the queue.
+
+        Nothing is downloaded on this thread: the queue owns execution, so the
+        window stays responsive and several tasks can be in flight at once.
+        """
 
         self._clear_messages()
         url = self.url_edit.text().strip()
@@ -2440,34 +2586,290 @@ class MainWindow(QMainWindow):
             return
 
         quality = self.quality_combo.currentData() or "best"
-        raw_dir = self.output_edit.text().strip()
-        output_dir = Path(raw_dir) if raw_dir else None
+        if adapter is not None and self.expand_check.isChecked():
+            self._begin_expansion(adapter, url, quality)
+            return
+        self._enqueue([url], quality)
 
-        worker = DownloadWorker(self.settings, url, quality, output_dir, self)
-        worker.progressed.connect(self._on_progress)
-        worker.succeeded.connect(self._on_success)
-        worker.failed.connect(self._on_failure)
-        worker.cancelled.connect(self._on_cancelled)
-        worker.finished.connect(self._on_worker_finished)
-        self.worker = worker
+    def _begin_expansion(self, adapter: PlatformAdapter, url: str, quality: str) -> None:
+        """Ask the adapter what the link expands to, then queue the result.
 
-        self.progress_bar.setRange(0, 1000)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("0%")
-        self.file_label.setText("当前文件：正在获取视频信息…")
-        self.status_label.setText("状态：正在准备")
-        self.speed_label.setText("速度：-")
-        self.size_label.setText("已下载：0 B")
-        self.eta_label.setText("剩余：-")
-        self._set_running_state()
+        Done in the background because it is a network call, and done for every
+        link because only the platform can say whether a URL is a playlist -
+        guessing from the URL misses short links and multi-part videos.
+        """
+
+        if self._expand_worker is not None and self._expand_worker.isRunning():
+            self._show_error("上一个链接仍在解析中，请稍候")
+            return
+
+        self.start_button.setEnabled(False)
+        self.status_label.setText("状态：正在解析链接…")
+        self.queue_summary_label.setText("正在解析链接，判断是否为播放列表…")
+
+        worker = PlaylistExpandWorker(adapter, url, self.settings.playlist_max_entries, self)
+        worker.expanded.connect(lambda entries: self._on_expanded(entries, url, quality))
+        worker.finished.connect(self._on_expansion_finished)
+        self._expand_worker = worker
         worker.start()
 
+    def _on_expanded(self, entries: list[PlaylistEntry], url: str, quality: str) -> None:
+        """Queue the playlist's entries in order, or the single link as-is."""
+
+        if len(entries) > 1:
+            # The listing already knows each entry's title and identity, so the
+            # rows are labelled from the start instead of showing a raw URL -
+            # and two parts of one Bilibili video stay distinguishable.
+            requests: list[str | QueueRequest] = [
+                QueueRequest(url=entry.url, title=entry.title, video_id=entry.video_id)
+                for entry in entries
+            ]
+        else:
+            # One result is not a playlist worth expanding: the link the user
+            # typed is what they expect to see queued, and its title arrives
+            # with the download.
+            requests = [url]
+        self._enqueue(requests, quality)
+
+    def _on_expansion_finished(self) -> None:
+        self.start_button.setEnabled(True)
+        self._expand_worker = None
+
+    def _enqueue(self, requests: list[str | QueueRequest], quality: str) -> None:
+        before = len(self.queue.tasks())
+        # The 保存位置 field keeps working: an empty box means the configured
+        # default, exactly as it did before the queue existed.
+        raw_dir = self.output_edit.text().strip()
+        self.queue.submit_many(requests, quality, output_dir=raw_dir or None)
+        added = len(self.queue.tasks()) - before
+        duplicates = len(requests) - added
+
+        self.status_label.setText("状态：已加入队列")
+        # Empty the box *before* writing the confirmation: changing the URL
+        # clears the message labels, so a message written first would vanish.
+        self.url_edit.clear()
+        if added:
+            note = f"（另有 {duplicates} 个已在队列中）" if duplicates else ""
+            self._show_done(f"已加入队列：{added} 个任务{note}")
+        elif duplicates:
+            self._show_done("该链接已在队列中，未重复添加")
+        self._refresh_queue()
+
     def cancel_download(self) -> None:
+        """Cancel the selected queue task, or a legacy in-flight worker."""
+
+        task_id = self._selected_task_id()
+        if task_id is not None and self.queue.cancel(task_id):
+            self.cancel_button.setEnabled(False)
+            self.status_label.setText("状态：已取消选中任务")
+            self._refresh_queue()
+            return
         if self.worker is None:
             return
         self.cancel_button.setEnabled(False)
         self.status_label.setText("状态：正在取消…")
         self.worker.cancel()
+
+    # -- queue rendering -----------------------------------------------------
+    def _refresh_queue(self) -> None:
+        """Redraw the queue from the scheduler's current state.
+
+        The queue is polled rather than pushed: progress ticks arrive from every
+        worker thread, and one timer reading a thread-safe snapshot is far
+        easier to reason about than signals crossing from each of them.
+        """
+
+        if self._refreshing_queue:
+            return
+        self._refreshing_queue = True
+        try:
+            snapshots = [task.snapshot() for task in self.queue.tasks()]
+            ids = [snapshot["task_id"] for snapshot in snapshots]
+
+            if ids != self._queue_rows:
+                self._queue_rows = ids
+                self.queue_table.setRowCount(len(snapshots))
+                for row in range(len(snapshots)):
+                    for column in range(len(QUEUE_COLUMNS)):
+                        if self.queue_table.item(row, column) is None:
+                            self.queue_table.setItem(row, column, QTableWidgetItem(""))
+
+            for row, snapshot in enumerate(snapshots):
+                self._fill_queue_row(row, snapshot)
+
+            self._update_queue_summary()
+            self._update_queue_detail(snapshots)
+        finally:
+            self._refreshing_queue = False
+
+    def _fill_queue_row(self, row: int, snapshot: dict[str, Any]) -> None:
+        state = snapshot["state"]
+        position = self.queue.queue_position(snapshot["task_id"])
+        running = state is QueueState.RUNNING
+        cells = (
+            str(position) if position is not None else "-",
+            snapshot["title"] or snapshot["url"],
+            self._queue_state_text(snapshot),
+            self._queue_progress_text(snapshot),
+            format_speed(snapshot["speed_bps"]) if running else "-",
+            format_eta(eta_seconds(snapshot)) if running else "-",
+            describe_quality(snapshot["resolution"], snapshot["quality_label"]),
+        )
+        for column, text in enumerate(cells):
+            item = self.queue_table.item(row, column)
+            if item is not None and item.text() != text:
+                item.setText(text)
+
+    @staticmethod
+    def _queue_state_text(snapshot: dict[str, Any]) -> str:
+        state = snapshot["state"]
+        label = QUEUE_STATE_LABELS[state]
+        if state is QueueState.RUNNING and snapshot["max_attempts"] > 1:
+            label = f"{label} {snapshot['attempts']}/{snapshot['max_attempts']}"
+        error = snapshot["error"]
+        if state is QueueState.FAILED and error:
+            label = f"{label}：{error[:40]}"
+        return label
+
+    @staticmethod
+    def _queue_progress_text(snapshot: dict[str, Any]) -> str:
+        state = snapshot["state"]
+        if state is QueueState.COMPLETED:
+            return "100%"
+        if state is QueueState.SKIPPED:
+            return "已存在"
+        fraction = snapshot["fraction"]
+        if fraction is not None:
+            return f"{fraction * 100:.0f}%"
+        downloaded = snapshot["downloaded"]
+        return format_size(downloaded) if downloaded else "-"
+
+    def _update_queue_summary(self) -> None:
+        counts = self.queue.counts()
+        total = sum(counts.values())
+        if total == 0:
+            self.queue_summary_label.setText(QUEUE_EMPTY_TEXT)
+            return
+        done = counts[QueueState.COMPLETED.value] + counts[QueueState.SKIPPED.value]
+        self.queue_summary_label.setText(
+            " · ".join(
+                (
+                    f"排队 {counts[QueueState.PENDING.value]}",
+                    f"下载中 {counts[QueueState.RUNNING.value]}",
+                    f"已暂停 {counts[QueueState.PAUSED.value]}",
+                    f"完成 {done}",
+                    f"失败 {counts[QueueState.FAILED.value]}",
+                )
+            )
+            + f"（共 {total}）"
+        )
+
+    def _update_queue_detail(self, snapshots: list[dict[str, Any]]) -> None:
+        """Mirror the selected task - or the most interesting one - below.
+
+        The fallback order is deliberate: what the user selected, then whatever
+        is actually downloading, then the next task waiting. Showing the empty
+        state when the queue is busy would be less useful than showing progress.
+        """
+
+        selected = self._selected_task_id()
+        snapshot = next((item for item in snapshots if item["task_id"] == selected), None)
+        if snapshot is None:
+            snapshot = next(
+                (item for item in snapshots if item["state"] is QueueState.RUNNING), None
+            )
+        if snapshot is None:
+            snapshot = next(
+                (item for item in snapshots if item["state"].unfinished), None
+            )
+        if snapshot is None:
+            return
+        self._render_detail(snapshot)
+
+    def _render_detail(self, snapshot: dict[str, Any]) -> None:
+        self.file_label.setText(f"当前文件：{snapshot['title'] or snapshot['url']}")
+        fraction = snapshot["fraction"]
+        if fraction is None:
+            # Size unknown: show activity rather than inventing a percentage.
+            self.progress_bar.setRange(0, 0)
+            self.progress_bar.setFormat("进行中…")
+        else:
+            self.progress_bar.setRange(0, 1000)
+            self.progress_bar.setValue(int(fraction * 1000))
+            self.progress_bar.setFormat(f"{fraction * 100:.0f}%")
+
+        self.speed_label.setText(f"速度：{format_speed(snapshot['speed_bps'])}")
+        total = snapshot["total"]
+        if total:
+            self.size_label.setText(
+                f"已下载：{format_size(snapshot['downloaded'])} / {format_size(total)}"
+            )
+        else:
+            self.size_label.setText(f"已下载：{format_size(snapshot['downloaded'])}")
+        self.eta_label.setText(f"剩余：{format_eta(eta_seconds(snapshot))}")
+        self.status_label.setText(f"状态：{QUEUE_STATE_LABELS[snapshot['state']]}")
+
+    # -- queue actions -------------------------------------------------------
+    def _selected_task_id(self) -> str | None:
+        row = self.queue_table.currentRow()
+        if row < 0 or row >= len(self._queue_rows):
+            return None
+        return self._queue_rows[row]
+
+    def _with_selected_task(self, action: str) -> str | None:
+        task_id = self._selected_task_id()
+        if task_id is None:
+            self._show_error(f"请先在队列中选择一个任务，再点「{action}」")
+        return task_id
+
+    def _on_queue_pause(self) -> None:
+        task_id = self._with_selected_task("暂停")
+        if task_id is not None and self.queue.pause(task_id):
+            self._refresh_queue()
+
+    def _on_queue_resume(self) -> None:
+        task_id = self._with_selected_task("继续")
+        if task_id is not None and self.queue.resume(task_id):
+            self._refresh_queue()
+
+    def _on_queue_retry(self) -> None:
+        task_id = self._with_selected_task("重试")
+        if task_id is None:
+            return
+        if self.queue.retry(task_id):
+            self._refresh_queue()
+        else:
+            self._show_error("只有失败或已取消的任务可以重试")
+
+    def _on_queue_remove(self) -> None:
+        task_id = self._with_selected_task("移除")
+        if task_id is None:
+            return
+        if self.queue.remove(task_id):
+            self._refresh_queue()
+        else:
+            self._show_error("正在下载的任务无法直接移除，请先暂停或取消")
+
+    def _on_queue_clear_finished(self) -> None:
+        removed = self.queue.clear_finished()
+        if removed:
+            self._show_done(f"已清空 {removed} 个已结束任务")
+        else:
+            self._show_done("没有已结束的任务")
+        self._refresh_queue()
+
+    def _on_concurrency_changed(self, value: int) -> None:
+        applied = self.queue.set_max_concurrent(value)
+        if applied != value:
+            self.concurrency_spin.blockSignals(True)
+            self.concurrency_spin.setValue(applied)
+            self.concurrency_spin.blockSignals(False)
+        self._show_done(f"最大并发下载数已设为 {applied}")
+
+    def _on_queue_selection_changed(self) -> None:
+        # The cancel button only makes sense with a row selected.
+        self.cancel_button.setEnabled(self._selected_task_id() is not None)
+        self._refresh_queue()
 
     # -- worker callbacks (always run on the GUI thread) ---------------------
     def _on_progress(self, update: ProgressUpdate) -> None:
@@ -2566,6 +2968,10 @@ class MainWindow(QMainWindow):
 
     # -- lifecycle -----------------------------------------------------------
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt API
+        # Stop reading the queue before anything else, so no timer tick can
+        # touch widgets that are being torn down.
+        self._queue_timer.stop()
+        wait_for_thread(self._expand_worker)
         if self.worker is not None:
             self.worker.cancel()
             wait_for_thread(self.worker)
@@ -2575,6 +2981,9 @@ class MainWindow(QMainWindow):
         # The dialog is a child widget: destroying it would destroy its worker.
         if self._login_dialog is not None:
             wait_for_thread(self._login_dialog.worker, 5000)
+        # Running transfers are interrupted as *paused*, so their partial files
+        # stay and the next start resumes them rather than starting over.
+        self.queue.stop()
         event.accept()
 
 

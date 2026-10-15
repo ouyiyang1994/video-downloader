@@ -851,12 +851,20 @@ def host_probe_arguments() -> list[str]:
     return [origin, "--parent-window=0", "--selftest"]
 
 
-def verify_host(settings: Settings, *, timeout: float = 25.0) -> tuple[bool, str]:
+def verify_host(settings: Settings, *, timeout: float = 60.0) -> tuple[bool, str]:
     """Run the host's ``--selftest`` the way Chrome would start it.
 
     A silent failure inside Chrome is nearly impossible to diagnose, so the
     application proves the launcher works before telling the user to try it -
     with the same arguments Chrome passes, not a bare command line.
+
+    The timeout is deliberately generous. In a development checkout the launcher
+    is a ``.bat`` that starts a *fresh* interpreter, and on a machine whose
+    anti-virus scans every DLL the interpreter loads that is far slower than on
+    a clean one: measured here at 9-25 s idle and 25-31 s under load, against
+    the former 25 s budget - so a healthy host was being reported as broken.
+    The shipped build runs a compiled ``.exe`` and starts much faster, but the
+    pre-flight has to work in both.
     """
 
     launcher = launcher_path(settings)
@@ -877,7 +885,15 @@ def verify_host(settings: Settings, *, timeout: float = 25.0) -> tuple[bool, str
             check=False,
             env={**os.environ, _SESSION_DIR_ENV: str(session_dir(settings))},
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired:
+        # Reported apart from a launch failure on purpose: the host did start,
+        # it simply did not finish, and that needs a different answer.
+        return (
+            False,
+            f"宿主程序自检超时（超过 {timeout:.0f} 秒），请重试；"
+            "若反复超时，请把程序目录加入杀毒软件的排除项。",
+        )
+    except OSError as exc:
         return False, f"无法启动宿主程序：{type(exc).__name__}"
 
     stdout = completed.stdout.decode("utf-8", "replace").strip()

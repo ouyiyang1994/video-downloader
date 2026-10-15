@@ -856,6 +856,217 @@ def test_the_keyword_exemption_still_checks_for_credentials(tmp_path: Path) -> N
     assert any("真实凭据值" in failure for failure in failures)
 
 
+def test_the_build_script_requires_both_ffmpeg_tools() -> None:
+    """The release staging step must fail instead of shipping a partial FFmpeg."""
+
+    script = (Path(__file__).resolve().parent.parent / "packaging" / "build.ps1").read_text(
+        encoding="utf-8-sig"
+    )
+    assert "$FfmpegTools = @('ffmpeg.exe', 'ffprobe.exe')" in script
+    assert "throw \"发布必需文件缺失：$source\"" in script
+    assert "throw \"发布必需文件不可用：$source" in script
+    assert "Copy-Item -LiteralPath $source -Destination $FfmpegDst -Force" in script
+
+
+def test_the_installer_requires_both_ffmpeg_tools() -> None:
+    """The final staging check must reject either missing or empty FFmpeg file."""
+
+    script = _build_script()
+    assert "'tools\\ffmpeg\\bin\\ffmpeg.exe'" in script
+    assert "'tools\\ffmpeg\\bin\\ffprobe.exe'" in script
+    assert "-PathType Leaf" in script
+    assert "FFmpeg 文件为空" in script
+
+
+def _extract_powershell_block(text: str, start_marker: str) -> str:
+    """Slice a PowerShell block out of a script, matching its braces.
+
+    Used so the tests run the guard code that actually ships instead of a copy
+    that can drift away from it. Braces inside strings are fine as long as they
+    are balanced, which the scripts here keep them.
+    """
+
+    start = text.index(start_marker)
+    depth = 0
+    for index in range(text.index("{", start), len(text)):
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    raise AssertionError(f"花括号不配对：{start_marker!r}")
+
+
+def _run_powershell(probe: str) -> subprocess.CompletedProcess[str]:
+    interpreter = shutil.which("powershell") or shutil.which("pwsh")
+    assert interpreter, "构建脚本是 PowerShell，这个测试需要它的解释器"
+    return subprocess.run(
+        [interpreter, "-NoProfile", "-NonInteractive", "-Command", probe],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=180,
+    )
+
+
+def _build_script_text() -> str:
+    return (Path(__file__).resolve().parent.parent / "packaging" / "build.ps1").read_text(
+        encoding="utf-8-sig"
+    )
+
+
+def _native_host_script_text() -> str:
+    return (
+        Path(__file__).resolve().parent.parent / "packaging" / "build-native-host.ps1"
+    ).read_text(encoding="utf-8-sig")
+
+
+# --- build directory isolation and existing-artifact protection -------------
+
+
+def test_the_native_host_script_can_isolate_its_work_directory() -> None:
+    """Redirecting -OutputDir must not clean the project's build\\native_host.
+
+    The host build used to hard-code its PyInstaller workpath to
+    ``<project>\\build\\native_host`` and delete it unconditionally, so a build
+    aimed at a temporary directory still wiped the project's own intermediates.
+    """
+
+    script = _native_host_script_text()
+
+    assert "[string]$WorkDir" in script
+    assert "$PSBoundParameters.ContainsKey('OutputDir')" in script
+    assert "'vd-native-host-work'" in script, "重定向输出时必须把工作目录移出项目"
+    assert "$WorkDir = Join-Path $ProjectRoot 'build\\native_host'" in script, "默认值应保持不变"
+    assert "Assert-InsideProject" not in script, "旧守卫会拒绝 %TEMP% 下的隔离目录"
+    assert "Assert-SafeToRemove $dir" in script
+
+
+def test_the_build_script_passes_an_explicit_work_dir_to_the_host_build() -> None:
+    """The host's workpath must stay out of the directory that gets packaged."""
+
+    script = _build_script_text()
+
+    assert "$NativeHostWork = Join-Path $BuildDir 'native_host'" in script
+    assert "& $NativeHostScript -OutputDir $NativeHostOut -WorkDir $NativeHostWork" in script
+
+
+def test_the_build_script_can_build_into_a_temporary_output_root() -> None:
+    """-OutputRoot is the isolation escape hatch the cleanup guard points at."""
+
+    script = _build_script_text()
+
+    assert "[string]$OutputRoot" in script
+    # The default layout must stay exactly what build-installer.ps1 expects.
+    assert "$DistDir = Join-Path $ProjectRoot 'dist'" in script
+    assert "$BuildDir = Join-Path $ProjectRoot 'build'" in script
+    assert "$DistDir = Join-Path $resolvedRoot 'dist'" in script
+    assert "$BuildDir = Join-Path $resolvedRoot 'build'" in script
+
+
+def test_the_build_script_refuses_to_clean_existing_artifacts() -> None:
+    """A non-empty dist\\ or build\\ stops the build unless it is confirmed."""
+
+    script = _build_script_text()
+
+    assert "[switch]$OverwriteExisting" in script
+    assert "目标目录已有内容，未获确认，拒绝删除" in script
+    assert "Get-ChildItem -LiteralPath $dir -Force" in script
+    assert "Remove-BuildDirectory $dir" in script
+    assert "Remove-ProjectDirectory" not in script
+
+
+def test_the_installer_refuses_to_clean_an_existing_output_directory() -> None:
+    """The previous release's Setup.exe must survive an unconfirmed rebuild."""
+
+    script = _build_script()
+    assert "[switch]$OverwriteExisting" in script
+    assert "安装包输出目录已有内容，未获确认，拒绝删除" in script
+    assert "Get-ChildItem -LiteralPath $OutDir -Force" in script
+
+
+def test_the_removal_guard_rejects_directories_that_are_never_safe(tmp_path: Path) -> None:
+    """Run the shipped guard: deep paths pass, roots and well-known dirs do not."""
+
+    guard = _extract_powershell_block(_build_script_text(), "function Assert-SafeToRemove")
+    safe = tmp_path / "vd-guard" / "dist"
+    safe.mkdir(parents=True)
+    temp_root = os.environ.get("TEMP", str(tmp_path))
+
+    probe = (
+        "$ErrorActionPreference = 'Stop'\n"
+        "$ProjectRoot = 'C:\\definitely-not-the-real-project-root'\n"
+        + guard
+        + "\n"
+        + f"foreach ($candidate in @('{safe}', 'C:\\', '{temp_root}')) {{\n"
+        + "    try {\n"
+        + "        Assert-SafeToRemove $candidate\n"
+        + "        Write-Output \"ACCEPT $candidate\"\n"
+        + "    }\n"
+        + "    catch {\n"
+        + "        Write-Output \"REJECT $candidate\"\n"
+        + "    }\n"
+        + "}\n"
+    )
+    result = _run_powershell(probe)
+    assert result.returncode == 0, result.stderr
+    verdicts = {
+        line.split()[1]: line.split()[0] for line in result.stdout.splitlines() if line.strip()
+    }
+    assert verdicts.get(str(safe)) == "ACCEPT", f"深层临时目录应可删除：{verdicts}"
+    assert verdicts.get("C:\\") == "REJECT", f"盘根必须拒绝：{verdicts}"
+    assert verdicts.get(temp_root) == "REJECT", f"%TEMP% 本身必须拒绝：{verdicts}"
+
+
+def test_the_cleanup_guard_stops_on_a_non_empty_directory(tmp_path: Path) -> None:
+    """Behaviour of the real step-3 cleanup: empty passes, non-empty needs consent."""
+
+    text = _build_script_text()
+    guard = _extract_powershell_block(text, "function Assert-SafeToRemove")
+    remover = _extract_powershell_block(text, "function Remove-BuildDirectory")
+    cleanup = _extract_powershell_block(text, "foreach ($dir in @($BuildDir, $DistDir))")
+    missing = tmp_path / "no-such-dist"
+
+    def run(build_dir: Path, overwrite: bool) -> str:
+        probe = (
+            "$ErrorActionPreference = 'Stop'\n"
+            "$ProjectRoot = 'C:\\definitely-not-the-real-project-root'\n"
+            + guard
+            + "\n"
+            + remover
+            + "\n"
+            + f"$BuildDir = '{build_dir}'\n$DistDir = '{missing}'\n"
+            + f"$OverwriteExisting = ${str(overwrite).lower()}\n"
+            + "try {\n"
+            + "\n".join("    " + line if line.strip() else line for line in cleanup.splitlines())
+            + "\n    Write-Output 'CLEANUP=PASS'\n"
+            + "}\n"
+            + "catch {\n"
+            + "    Write-Output 'CLEANUP=REFUSED'\n"
+            + "}\n"
+        )
+        result = _run_powershell(probe)
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip()
+
+    empty = tmp_path / "empty-build"
+    empty.mkdir()
+    assert "CLEANUP=PASS" in run(empty, overwrite=False), "空目录不应阻止构建"
+    assert empty.is_dir(), "空目录本来就该留着"
+
+    occupied = tmp_path / "occupied-build"
+    occupied.mkdir()
+    (occupied / "previous-artifact.bin").write_bytes(b"old release")
+    assert "CLEANUP=REFUSED" in run(occupied, overwrite=False), "非空目录必须停下来提示"
+    assert (occupied / "previous-artifact.bin").is_file(), "未确认时不得删除已有产物"
+
+    assert "CLEANUP=PASS" in run(occupied, overwrite=True), "确认后应可清理"
+    assert not occupied.exists(), "确认后目录应被移除"
+
+
 def test_the_build_script_ships_the_login_helper() -> None:
     """The host must land in the folder ``core.chrome_bridge`` looks in.
 

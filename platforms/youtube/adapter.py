@@ -16,7 +16,7 @@ from core import selection
 from core.engine_ytdlp import YtDlpEngine
 from core.exceptions import NotDownloadableError, VideoDownloaderError
 from core.interfaces import PlatformAdapter
-from core.models import DownloadPlan, Platform, VideoInfo
+from core.models import DownloadPlan, Platform, PlaylistEntry, VideoInfo
 from platforms.youtube import api, urls
 
 logger = logging.getLogger(__name__)
@@ -42,6 +42,16 @@ class YouTubeAdapter(PlatformAdapter):
             cleaned = f"https://{cleaned}"
         video_id = urls.extract_video_id(cleaned)
         return urls.canonical_watch_url(video_id) if video_id else cleaned
+
+    async def expand_playlist(self, url: str, *, limit: int = 200) -> list[PlaylistEntry]:
+        """A playlist URL lists its videos; a plain watch link returns ``[]``.
+
+        Note that ``normalize_url`` collapses ``watch?v=X&list=Y`` to the single
+        video ``X``, so a caller must expand the URL the user typed, not the
+        normalised one.
+        """
+
+        return await self.engine.extract_playlist(url, limit=limit)
 
     async def fetch_info(self, url: str) -> VideoInfo:
         video_id = urls.extract_video_id(url)

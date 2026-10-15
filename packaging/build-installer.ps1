@@ -5,10 +5,18 @@
 .EXAMPLE
     .\packaging\build-installer.ps1
     .\packaging\build-installer.ps1 -SkipScan
+    .\packaging\build-installer.ps1 -OverwriteExisting   # 确认可覆盖旧安装包
+
+.NOTES
+    dist\installer\ 里通常放着上一个已发布的安装包。脚本默认不会清空已有内容
+    的输出目录：检测到非空就停止并提示，必须显式加 -OverwriteExisting 才会删除。
 #>
 [CmdletBinding()]
 param(
-    [switch]$SkipScan
+    [switch]$SkipScan,
+    #: Allow deleting an installer output directory that already contains
+    #: files (typically the previous release's Setup.exe).
+    [switch]$OverwriteExisting
 )
 
 $ErrorActionPreference = 'Stop'
@@ -69,16 +77,22 @@ if (-not (Test-Path $AppDir)) { throw "缺少 $AppDir，请先运行 build.ps1" 
 $required = @(
     'VideoDownloader.exe',
     '.env.example',
+    'tools\ffmpeg\bin\ffmpeg.exe',
+    'tools\ffmpeg\bin\ffprobe.exe',
     'chrome-extension\manifest.json',
     'chrome-extension\logic.js',
     'native_host\VideoDownloaderNativeHost\VideoDownloaderNativeHost.exe'
 )
 foreach ($item in $required) {
-    if (-not (Test-Path -LiteralPath (Join-Path $AppDir $item))) {
-        throw "待打包目录缺少 $item —— 请重新运行 build.ps1（它会构建 Chrome 登录助手）"
+    $requiredPath = Join-Path $AppDir $item
+    if (-not (Test-Path -LiteralPath $requiredPath -PathType Leaf)) {
+        throw "待打包目录缺少 $item —— 请重新运行 build.ps1（它会构建 FFmpeg 与 Chrome 登录助手）"
+    }
+    if ($item -like 'tools\ffmpeg\bin\*' -and (Get-Item -LiteralPath $requiredPath).Length -le 0) {
+        throw "待打包目录中的 FFmpeg 文件为空：$item"
     }
 }
-Write-Host "  必需文件齐备（含 Chrome 登录助手扩展与宿主）"
+Write-Host "  必需文件齐备（含 FFmpeg、Chrome 登录助手扩展与宿主）"
 
 $files = Get-ChildItem -LiteralPath $AppDir -Recurse -File
 $sizeMb = [math]::Round((($files | Measure-Object -Property Length -Sum).Sum) / 1MB, 1)
@@ -110,10 +124,17 @@ else {
 }
 
 Write-Step '4/6 编译安装包'
-if (Test-Path $OutDir) {
+if (Test-Path -LiteralPath $OutDir) {
+    $existingOutput = @(Get-ChildItem -LiteralPath $OutDir -Force -ErrorAction SilentlyContinue)
+    if ($existingOutput.Count -gt 0 -and -not $OverwriteExisting) {
+        throw ("安装包输出目录已有内容，未获确认，拒绝删除：{0}（{1} 项）。确认可以覆盖旧安装包后加 -OverwriteExisting 重跑。" -f $OutDir, $existingOutput.Count)
+    }
     $resolved = (Resolve-Path -LiteralPath $OutDir).Path
     if (-not $resolved.StartsWith($ProjectRoot, [StringComparison]::OrdinalIgnoreCase)) {
         throw "拒绝清理项目外的目录: $resolved"
+    }
+    if ($existingOutput.Count -gt 0) {
+        Write-Host "  删除 $OutDir（已用 -OverwriteExisting 确认）"
     }
     Remove-Item -LiteralPath $resolved -Recurse -Force
 }

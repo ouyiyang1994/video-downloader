@@ -42,3 +42,8 @@ DEFAULT_PROXY_PORT: Final[int] = 8090
 DEFAULT_CHUNK_SIZE: Final[int] = 1024 * 1024
 PARTIAL_SUFFIX: Final[str] = ".part"
 FILE_EXTENSIONS_VIDEO: Final[tuple[str, ...]] = (".mp4", ".mkv", ".flv", ".webm", ".mov")
+
+#: Upper bound on simultaneous downloads in the queue. Beyond a handful the
+#: platforms start rate-limiting and the disk thrashes, so the setting is
+#: clamped rather than trusted.
+MAX_CONCURRENT_LIMIT: Final[int] = 5

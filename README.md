@@ -7,9 +7,9 @@
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-![GUI 明亮主题](docs/gui-light.png)
+![GUI 明亮主题](docs/screenshots/ui-light.png)
 
-<sub>暗色主题见 [`docs/gui-dark.png`](docs/gui-dark.png)。</sub>
+<sub>暗色主题见 [`docs/screenshots/ui-dark.png`](docs/screenshots/ui-dark.png)。</sub>
 
 ---
 
@@ -59,8 +59,10 @@
 - **画质选择**：`best` / `2160p` / `1440p` / `1080p` / `720p` / `480p` / `360p` / `audio`（仅音频 m4a）。
 - **高清优先**：DASH 音视频分离时自动分别下载，再用 ffmpeg `-c copy` 无损合并（不重编码）。
 - **实时进度**：视频 / 音频双进度条、速度、已下载大小、剩余时间；GUI 后台线程下载，窗口不卡。
-- **断点续传**：`.part` 文件 + `Range` 请求；服务器不支持 Range 时自动重新下载。
-- **失败重试**：指数退避，默认 3 次；网络超时与连接超时独立控制。
+- **智能下载队列**：多个链接排队执行，可调最大并发数（1–5）；每个任务可**暂停 / 继续 / 取消 / 重试**，失败自动退避重试；队列位置、进度、速度、剩余时间实时显示。队列写入 SQLite，**关闭软件后重新打开会继续未完成的任务**（已下载的分片通过 Range 续传，不会从头再来）。
+- **播放列表**：粘贴播放列表 / 多分P链接会按顺序展开成多个任务，逐个下载；也可关闭该行为按单个视频处理。
+- **断点续传**：`.part` 文件 + `Range` 请求；服务器不支持 Range 时自动重新下载。**暂停**同样保留分片，继续时从断点接着下。
+- **失败重试**：指数退避，默认 3 次；网络超时与连接超时独立控制。队列层另有整任务重试（默认 2 次）。
 - **完整性检查**：Content-Length 比对 + 媒体头嗅探 + ffprobe 时长偏差告警（> 5%）。
 - **避免重复**：SQLite 记录命中且文件仍存在时直接跳过（`--force` 可强制重下）。
 - **下载历史**：GUI 表格展示，CLI 用 `--history` 查看。
@@ -202,12 +204,38 @@ Windows 上也可直接使用便捷脚本：
 
 GUI 只是现有下载核心的界面层，**不复制任何下载逻辑**：它调用同一个 `DownloadService`、同一份 `.env`（代理、`secrets/cookies.txt`）、同一个 SQLite 数据库和同一套日志。
 
-功能：粘贴链接自动识别平台、画质选择、保存目录选择、后台下载（窗口不卡）、真实进度 / 速度 / 已下载大小 / 剩余时间、取消下载、下载历史、明亮与暗色主题。
+功能：粘贴链接自动识别平台、画质选择、保存目录选择、下载队列、真实进度 / 速度 / 已下载大小 / 剩余时间、下载历史、明亮与暗色主题。
 
 - 未支持的平台（例如抖音）显示「暂不支持该平台」。
 - YouTube / Instagram 需要勾选「我确认拥有下载内容的权利」，等同 CLI 的 `--confirm-rights`。
 - 代理与 Cookie 完全沿用 `.env`。
-- 取消下载会保留已下载的分片，下次可断点续传。
+- 取消或暂停下载会保留已下载的分片，下次可断点续传。
+
+---
+
+## 下载队列
+
+点「加入队列」把链接放进队列，由队列决定什么时候下载。队列与单次下载用的是**同一个下载核心**：代理、Cookie、ffmpeg 合并、断点续传、完整性校验、历史记录全部沿用，队列只负责调度。
+
+| 能力 | 说明 |
+| --- | --- |
+| 并发 | 「最大并发」1–5，默认 2；超过上限的任务排队等待 |
+| 暂停 / 继续 | 暂停会中断传输但**保留 `.part` 分片**，继续时用 `Range` 从断点接着下 |
+| 取消 | 丢弃任务，已下载的分片仍留在磁盘上 |
+| 重试 | 失败任务按退避自动重试（`QUEUE_MAX_ATTEMPTS`，默认 2 次）；也可手动「重试」 |
+| 播放列表 | 勾选「展开播放列表」时，列表链接按顺序拆成多个任务 |
+| 去重 | 同一链接已在队列中时不会重复添加 |
+| 持久化 | 队列写入 SQLite；**重启软件后未完成的任务自动继续** |
+| 显示 | 位置 / 标题 / 状态 / 进度 / 速度 / 剩余时间，每 0.4 秒刷新 |
+
+行为细节：
+
+- **暂停是"停住"而不是"放弃"**：因为分片文件保留着，继续下载时会发 `Range` 请求，已经下好的部分不会重来。
+- **关闭软件是"中断"，不是"暂停"**：正在下载的任务会**重新排入队列**并保留分片，下次打开自动继续 —— 关闭程序不代表你不想下了。
+- **重启后**：`running` 行（上次被强制结束）与中断的任务都回到 `排队中`，用 `Range` 从分片处接着下；**你自己点过「暂停」的任务仍然保持暂停**，尊重你的选择。
+- **已取消的任务不会被自动重试**：取消是明确的意图。
+- **队列位置**只统计"还在等或正在下"的任务，已完成的不占号。
+- 队列存在 `downloads/downloads.db` 的 `queue_items` 表里，与下载历史（`downloads` 表）互不影响。
 
 ---
 
@@ -426,6 +454,10 @@ docker compose run --rm video-downloader "https://www.bilibili.com/video/BV1GJ41
 | `DIR_TEMPLATE` | `{platform}/{author}/{date}` | 输出目录模板，支持 `{platform}` `{author}` `{date}` `{year}` `{month}` `{day}` |
 | `MAX_FILENAME_LENGTH` | `120` | 文件名主干最大长度 |
 | `SKIP_EXISTING` | `true` | 命中记录且文件存在时跳过 |
+| `MAX_CONCURRENT_DOWNLOADS` | `2` | 队列同时下载的任务数（1–5，超出会被夹紧） |
+| `QUEUE_MAX_ATTEMPTS` | `2` | 队列任务的整任务尝试次数（含首次） |
+| `QUEUE_EXPAND_PLAYLISTS` | `true` | 是否把播放列表链接展开成多个任务 |
+| `PLAYLIST_MAX_ENTRIES` | `200` | 单个播放列表最多展开多少条 |
 | `FFMPEG_PATH` | 空 | 指定 ffmpeg，留空自动查找 |
 | `HTTP_PROXY` / `HTTPS_PROXY` | 空 | HTTP 代理，例如 `http://127.0.0.1:8090` |
 | `PROXY_BYPASS_PLATFORMS` | `bilibili` | 不走代理的平台（逗号分隔） |
@@ -495,6 +527,7 @@ video-downloader/
 ├── LICENSE                     # MIT
 ├── README.md
 ├── docs/                       # README 截图等文档资源
+│   └── screenshots/            # GUI 主题截图（ui-light.png / ui-dark.png）
 ├── scripts/                    # 部署 / 启动 / 停止 / 更新脚本（sh + ps1）
 ├── config/                     # settings（环境变量）+ constants
 ├── core/                       # 与平台无关的引擎
@@ -512,6 +545,9 @@ video-downloader/
 │   ├── session_store.py        # 账号登录保存的按平台隔离的 cookies.txt
 │   ├── browser_cookies.py      # 默认浏览器检测 + 用 yt-dlp 读取会话（含失败分类）
 │   ├── service.py              # 编排：元数据 → 校验 → 下载 → 合并 → 入库
+│   ├── runner.py               # 单次下载的装配（client/registry/DB → service），GUI 与队列共用
+│   ├── queue.py                # 下载队列：并发上限、暂停/继续/取消/重试、进度快照
+│   ├── queue_store.py          # 队列的 SQLite 持久化（queue_items 表）
 │   └── logging_setup.py
 ├── platforms/
 │   ├── bilibili/{urls,wbi,api,adapter}.py
@@ -527,7 +563,7 @@ video-downloader/
 └── secrets/                    # Cookie 登录态（不入库）
 ```
 
-新增平台只需实现 `PlatformAdapter` 的 `matches / normalize_url / fetch_info / select_streams`，并在 `core/registry.py::build_registry` 注册。上层代码无需改动。
+新增平台只需实现 `PlatformAdapter` 的 `matches / normalize_url / fetch_info / select_streams`，并在 `core/registry.py::build_registry` 注册。上层代码无需改动。播放列表支持是可选的：实现 `expand_playlist` 即可（默认返回空列表，表示该链接不是播放列表）。
 
 ---
 

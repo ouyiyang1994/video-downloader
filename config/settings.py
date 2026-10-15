@@ -18,6 +18,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from config.constants import (
     DEFAULT_PROXY_HOST,
     DEFAULT_PROXY_PORT,
+    MAX_CONCURRENT_LIMIT,
     SUPPORTED_PLATFORM_IDS,
 )
 
@@ -241,6 +242,34 @@ class Settings(BaseSettings):
     confirm_rights: bool = False
     max_filename_length: int = 120
     skip_existing: bool = True
+
+    # --- Download queue ----------------------------------------------------
+    #: How many queued downloads run at the same time. ``1`` reproduces the
+    #: original one-at-a-time behaviour; the value is capped at
+    #: :data:`MAX_CONCURRENT_LIMIT` because every extra worker means another
+    #: connection pool and more simultaneous pressure on the platforms.
+    max_concurrent_downloads: int = 2
+    #: Whole-task attempts for a queued item, including the first one. Distinct
+    #: from ``max_retries``, which retries a single HTTP stream inside one task.
+    queue_max_attempts: int = 2
+    #: A playlist URL is expanded into one queue item per entry, in order.
+    #: Turning this off makes a playlist URL behave as a single video.
+    queue_expand_playlists: bool = True
+    #: Safety valve on playlist expansion: a channel URL can list thousands of
+    #: entries, and enqueuing all of them is never what the user meant.
+    playlist_max_entries: int = 200
+
+    @property
+    def concurrent_downloads(self) -> int:
+        """``max_concurrent_downloads`` clamped to a sane range."""
+
+        return max(1, min(self.max_concurrent_downloads, MAX_CONCURRENT_LIMIT))
+
+    @property
+    def queue_attempts(self) -> int:
+        """``queue_max_attempts`` clamped to at least one attempt."""
+
+        return max(1, min(self.queue_max_attempts, 10))
 
     @property
     def proxy(self) -> str | None:

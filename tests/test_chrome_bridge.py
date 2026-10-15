@@ -7,8 +7,10 @@ developer's real ``HKCU``, and the generated files all land in ``tmp_path``.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import struct
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -818,6 +820,85 @@ def test_verify_host_reports_a_missing_launcher(settings: Settings) -> None:
     ok, detail = chrome_bridge.verify_host(settings)
     assert ok is False
     assert "不存在" in detail
+
+
+# --- the pre-flight's time budget -------------------------------------------
+
+
+def test_the_preflight_allows_for_a_slow_cold_start() -> None:
+    """A cold interpreter start can cost tens of seconds on a scanned machine.
+
+    The budget was 25 s, which a perfectly healthy host exceeded under load and
+    was then reported to the user as broken. Measured on this project's own
+    development checkout: 9-25 s idle, 25-31 s under load.
+    """
+
+    budget = inspect.signature(chrome_bridge.verify_host).parameters["timeout"].default
+    assert budget >= 60.0
+
+
+def test_the_preflight_passes_its_timeout_to_subprocess(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The parameter has to actually reach ``subprocess.run``."""
+
+    chrome_bridge.write_launcher(settings)
+    seen: dict[str, Any] = {}
+
+    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        seen.clear()
+        seen.update(kwargs)
+        return subprocess.CompletedProcess(command, 0, b'{"ok": true, "sessionDir": "x"}', b"")
+
+    monkeypatch.setattr(chrome_bridge.subprocess, "run", fake_run)
+
+    ok, _ = chrome_bridge.verify_host(settings)
+    assert ok is True
+    assert seen["timeout"] == 60.0, "默认超时必须是 60 秒"
+
+    chrome_bridge.verify_host(settings, timeout=7.5)
+    assert seen["timeout"] == 7.5, "显式传入的超时必须原样透传"
+
+
+def test_a_timed_out_preflight_is_reported_as_a_timeout(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timeout is not the same failure as a launcher that cannot start.
+
+    Saying "无法启动宿主程序" for a host that started fine but ran long sends
+    the user looking in the wrong place.
+    """
+
+    chrome_bridge.write_launcher(settings)
+
+    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        raise subprocess.TimeoutExpired(command, kwargs.get("timeout", 0))
+
+    monkeypatch.setattr(chrome_bridge.subprocess, "run", fake_run)
+
+    ok, detail = chrome_bridge.verify_host(settings, timeout=30)
+
+    assert ok is False
+    assert "超时" in detail
+    assert "30" in detail, "报错里要说明实际的时间预算"
+    assert "无法启动" not in detail
+
+
+def test_a_launcher_that_cannot_start_is_reported_separately(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chrome_bridge.write_launcher(settings)
+
+    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        raise OSError("cannot spawn")
+
+    monkeypatch.setattr(chrome_bridge.subprocess, "run", fake_run)
+
+    ok, detail = chrome_bridge.verify_host(settings)
+
+    assert ok is False
+    assert "无法启动" in detail
+    assert "超时" not in detail
 
 
 def test_the_host_accepts_the_command_line_chrome_builds() -> None:
