@@ -710,7 +710,13 @@ class _FleetHandler(http.server.BaseHTTPRequestHandler):
 
     ``inflight`` is bumped for the whole request - the failure responses too,
     because a rejected request still occupied a queue slot - so ``max_inflight``
-    is an upper bound on how many transfers the server ever saw at once.
+    is an upper bound on how many transfers the server ever saw at once.  It is
+    deliberately *not* a lower bound on the client's concurrency: ``do_GET``
+    sleeps one more ``delay`` after the final chunk before releasing, and a
+    client that has already read its Content-Length is finished during that
+    sleep, so the reading can exceed the real cap by one.  Assert on the
+    executor spans (``_max_concurrent_spans``) when the cap itself is the
+    question, and use the per-path counters for "was this file fetched twice".
     The per-path counters answer a different question, and it is the one the
     cancel / pause / retry races live or die by: ``path_max_inflight`` is how
     many transfers of *this one file* were ever running at the same time. Two
@@ -977,15 +983,22 @@ def test_five_real_transfers_stay_within_the_cap_and_keep_their_files_apart(
 ) -> None:
     """The hard cap of five, with five genuinely overlapping engines.
 
-    Six tasks and five slots: the server counts how many requests were in
-    flight at once, so "at most five" is measured rather than assumed, and the
-    sixth wave proves the queue keeps working after a full slot cycle. Every
-    task writes its own path-derived bytes to its own file, so a task that ran
-    twice, or that wrote another task's payload, shows up as a mismatched
-    file instead of passing.
+    Six tasks and five slots, so "at most five" is measured rather than
+    assumed, and the sixth wave proves the queue keeps working after a full
+    slot cycle. The measurement is the executor's own spans; the server-side
+    ``max_inflight`` is deliberately not used for the cap, because ``do_GET``
+    holds its slot through one more ``delay`` after the final chunk, so a client
+    that has already finished still counts as in flight and the reading can
+    exceed the real cap by one (``logs/_probe-inflight-tail-sleep.py.txt``
+    reproduces that by enlarging the trailing sleep).
+
+    Every task writes its own path-derived bytes to its own file, so a task
+    that ran twice, or that wrote another task's payload, shows up as a
+    mismatched file instead of passing.
     """
 
     calls: list[str] = []
+    spans: list[tuple[str, float, float]] = []
     lock = threading.Lock()
 
     def url_for(task: QueueTask) -> str:
@@ -997,9 +1010,14 @@ def test_five_real_transfers_stay_within_the_cap_and_keep_their_files_apart(
     inner = _transfer_executor(settings, url_for=url_for, destination_for=destination_for)
 
     def executor(task: QueueTask, progress: dict, cancel_event: threading.Event) -> DownloadResult:
+        started = time.monotonic()
         with lock:
             calls.append(task.task_id)
-        return inner(task, progress, cancel_event)
+        try:
+            return inner(task, progress, cancel_event)
+        finally:
+            with lock:
+                spans.append((task.task_id, started, time.monotonic()))
 
     queue = DownloadQueue(settings, executor=executor)
     try:
@@ -1014,12 +1032,21 @@ def test_five_real_transfers_stay_within_the_cap_and_keep_their_files_apart(
         )
 
         assert all(task.state is QueueState.COMPLETED for task in tasks)
-        # Measured, not assumed: five slots, and never a sixth request.
-        observed = _FleetHandler.stats()["max_inflight"]
-        assert observed == 5, f"实测最大在途请求 {observed}，应为 5"
+        # Measured, not assumed: never a sixth transfer at once, and the cap was
+        # really saturated - otherwise the first assertion would hold vacuously.
+        overlap = _max_concurrent_spans(spans)
+        assert overlap <= 5, f"实测最多 {overlap} 个传输同时进行，超过上限 5"
+        assert overlap == 5, f"只观测到 {overlap} 个传输同时进行，上限没有被压满"
         # One executor call per task: no task ran twice behind another's back.
         assert sorted(calls) == sorted(task.task_id for task in tasks), "有任务被重复执行"
         assert len(calls) == len(set(calls)) == len(tasks)
+        # Server-side cross-check: every file was fetched exactly once, and no
+        # file ever had two requests running against it at the same time.
+        stats = _FleetHandler.stats()
+        assert set(stats["requests"].values()) == {1}, f"请求数异常：{stats['requests']}"
+        assert set(stats["path_max_inflight"].values()) == {1}, (
+            f"有文件被同时下载了两次：{stats['path_max_inflight']}"
+        )
         # Each file holds exactly the bytes that were meant for it.
         for task in tasks:
             path = destination_for(task)
@@ -1184,6 +1211,29 @@ def _assert_one_transfer_at_a_time(
     mine = sorted((started, ended) for (other, started, ended) in spans if other == task_id)
     for (_, first_ended), (second_started, _) in zip(mine, mine[1:], strict=False):
         assert first_ended <= second_started, "同一任务的两个传输在时间上重叠了"
+
+
+def _max_concurrent_spans(spans: list[tuple[str, float, float]]) -> int:
+    """The most executor calls that were ever open at the same time.
+
+    This is the honest measure of the concurrency cap: a span brackets one
+    executor call exactly, so the count cannot drift the way the server-side
+    ``max_inflight`` counter does when a client finishes before its handler
+    returns.
+    """
+
+    events: list[tuple[float, int]] = []
+    for _, started, ended in spans:
+        events.append((started, 1))
+        events.append((ended, -1))
+    # At equal timestamps -1 sorts before 1, so a call that ends exactly when
+    # the next one starts is not counted as overlapping.
+    events.sort()
+    peak = current = 0
+    for _, delta in events:
+        current += delta
+        peak = max(peak, current)
+    return peak
 
 
 def _assert_files_match_the_paths(
