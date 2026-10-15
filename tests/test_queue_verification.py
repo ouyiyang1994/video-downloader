@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import http.server
+import socket
 import threading
 import time
 import tracemalloc
@@ -58,6 +59,16 @@ HOLD_TIMEOUT_SECONDS = 60.0
 #: still behind it, which is what makes the interruption land mid-transfer.
 HOLD_AFTER_FRACTION = 0.75
 
+#: The stub's send buffer.  A held response is released and then raced by the
+#: client's cancel: with a default buffer the kernel absorbs the whole
+#: remainder, so the handler finishes writing a response the client has already
+#: abandoned, and "the interrupted transfer delivered less than the payload"
+#: becomes a race against socket buffering rather than a property of the
+#: download (it failed exactly that way under load, with the client's ``.part``
+#: still partial).  Bounded, ``send()`` blocks until the client reads or the
+#: connection breaks, so the byte counters measure the download again.
+STUB_SEND_BUFFER_BYTES = 8 * 1024
+
 #: Range headers the test server has seen, cleared by the fixture.
 _RANGES: list[str] = []
 
@@ -69,6 +80,19 @@ def _wait_until(predicate: Callable[[], bool], timeout: float = 25.0, message: s
             return
         time.sleep(0.02)
     raise AssertionError(message or "等待条件超时")
+
+
+def _bound_send_buffer(connection: socket.socket) -> None:
+    """Keep the kernel from absorbing a response the client stopped reading.
+
+    See :data:`STUB_SEND_BUFFER_BYTES` for why. A stub that cannot shrink its
+    buffer is still usable, so a refusal is not fatal.
+    """
+
+    try:
+        connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, STUB_SEND_BUFFER_BYTES)
+    except OSError:  # pragma: no cover - platform refusal
+        return
 
 
 class BlockingDownload:
@@ -193,6 +217,10 @@ class _RangeHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     chunk_size = 16 * 1024
     delay = 0.04
+
+    def setup(self) -> None:
+        super().setup()
+        _bound_send_buffer(self.connection)
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002 - stdlib name
         return None
@@ -738,6 +766,10 @@ class _FleetHandler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     chunk_size = 16 * 1024
     delay = 0.05
+
+    def setup(self) -> None:
+        super().setup()
+        _bound_send_buffer(self.connection)
 
     _lock = threading.Lock()
     _inflight = 0
@@ -2221,7 +2253,18 @@ def test_bounded_http_queue_soak_keeps_tasks_threads_and_memory_stable(
 
                 if role == "cancel":
                     assert task.state is QueueState.CANCELLED
-                    assert stats["delivered"][request_path][0] < SOAK_PAYLOAD_SIZE
+                    # "The cancel landed mid-transfer" needs both halves, each
+                    # measured where it is deterministic: the stub had already
+                    # written the parked fraction when the interruption was
+                    # issued, and the client's own ``.part`` then stopped short
+                    # of the payload. The stub's *final* byte count is
+                    # deliberately not used: the kernel can absorb the rest of a
+                    # response the client abandoned (its send buffer is bounded
+                    # above, the peer's receive window is not ours to set).
+                    assert stats["delivered"][request_path][0] >= int(
+                        SOAK_PAYLOAD_SIZE * HOLD_AFTER_FRACTION
+                    ), "响应没有走到停靠点，取消就没有中断任何东西"
+                    assert 0 < cancel_part.stat().st_size < SOAK_PAYLOAD_SIZE
                     assert _part_of(destination).exists()
                     continue
 
@@ -2240,7 +2283,13 @@ def test_bounded_http_queue_soak_keeps_tasks_threads_and_memory_stable(
                     assert ranges[1].startswith("bytes=")
                     retry_offset = int(ranges[1][len("bytes=") :].split("-")[0])
                     assert retry_offset > 0
-                    assert stats["delivered"][request_path][0] < SOAK_PAYLOAD_SIZE
+                    # Same two-sided evidence as the cancel branch: the first
+                    # attempt reached the parked fraction, and the second had to
+                    # resume from part-way through the payload.
+                    assert stats["delivered"][request_path][0] >= int(
+                        SOAK_PAYLOAD_SIZE * HOLD_AFTER_FRACTION
+                    ), "第一次请求没有走到停靠点"
+                    assert retry_initial_size < SOAK_PAYLOAD_SIZE
                 elif role == "network-retry":
                     assert stats["delivered"][request_path] == [0, SOAK_PAYLOAD_SIZE]
                     assert ranges == [""]

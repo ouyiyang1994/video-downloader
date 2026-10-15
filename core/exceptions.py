@@ -62,6 +62,19 @@ class DownloadError(VideoDownloaderError):
     exit_code = 7
 
 
+class TargetFileError(DownloadError):
+    """The finished file could not be moved onto the target path.
+
+    Raised when another process holds the destination open, or the folder
+    refuses the write. The payload is already complete next to it, so the
+    download loop deliberately does **not** retry this one - running the
+    transfer again would only fetch bytes that are already on disk. Callers
+    that want to wait the lock out retry the rename alone.
+    """
+
+    exit_code = 15
+
+
 class IntegrityError(VideoDownloaderError):
     """The downloaded file failed verification."""
 

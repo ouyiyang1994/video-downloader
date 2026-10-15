@@ -17,12 +17,12 @@ from typing import Any
 import httpx
 
 from config.settings import Settings
-from core import selection
+from core import browser_cookies, selection
 from core.engine_ytdlp import YtDlpEngine
 from core.exceptions import NotDownloadableError, UnsupportedUrlError, VideoDownloaderError
 from core.http import load_cookie_header
 from core.interfaces import PlatformAdapter
-from core.login import LoginState, SessionOrigin, SessionStatus, header_has_cookie
+from core.login import LoginSource, LoginState, SessionOrigin, SessionStatus, header_has_cookie
 from core.models import DownloadPlan, MediaStream, Platform, PlaylistEntry, VideoInfo
 from core.session_store import session_file
 from platforms.instagram import graph, urls
@@ -38,6 +38,10 @@ SESSION_DOMAIN = "instagram.com"
 #: ``sessionid`` is the cookie yt-dlp's own Instagram extractor treats as the
 #: authentication token (``InstagramBaseIE._AUTH_COOKIE_NAME``).
 SESSION_COOKIE_NAMES = ("sessionid",)
+
+#: The ``.env`` key behind the browser-cookie fallback. Named here so the row,
+#: the logout dialog and the switch all talk about the same thing.
+BROWSER_COOKIE_KEY = "YTDLP_COOKIES_FROM_BROWSER"
 
 #: "Who am I" endpoint: the account-settings form the signed-in web app loads
 #: for itself. A valid session gets a plain ``200`` JSON here, while an
@@ -107,7 +111,15 @@ class InstagramAdapter(PlatformAdapter):
     def fallback_config_keys(self) -> tuple[str, ...]:
         """``.env`` keys that survive 「退出登录」 for this platform."""
 
-        return ("YTDLP_COOKIEFILE",) if (self.settings.ytdlp_cookiefile or "").strip() else ()
+        keys: list[str] = []
+        if (self.settings.ytdlp_cookiefile or "").strip():
+            keys.append("YTDLP_COOKIEFILE")
+        if (self.settings.ytdlp_cookies_from_browser or "").strip():
+            # Read from the settings, not from ``engine.browser_cookie_source``:
+            # that one answers ``None`` while the switch is off, and the
+            # 「重新启用配置会话」 dialog still has to name what it restores.
+            keys.append(BROWSER_COOKIE_KEY)
+        return tuple(keys)
 
     def _resolve_session(self) -> tuple[str | None, SessionOrigin]:
         """One resolution of the session: the header *and* where it came from.
@@ -120,8 +132,34 @@ class InstagramAdapter(PlatformAdapter):
         path, origin = self.engine.cookie_file_source()
         header = load_cookie_header(path, domain_suffix=SESSION_DOMAIN)
         if not header:
-            return None, SessionOrigin()
+            # No file session - the remaining source is the browser's own
+            # cookie store. Its *content* is read lazily by the caller (that
+            # touches a locked database and can fail), so only the origin is
+            # resolved here.
+            return None, self._browser_fallback_origin()
         return header, origin
+
+    def _browser_fallback_origin(self) -> SessionOrigin:
+        """Where ``YTDLP_COOKIES_FROM_BROWSER`` would be read from, if enabled."""
+
+        if self.engine.browser_cookie_source is None:
+            return SessionOrigin()
+        return SessionOrigin(LoginSource.BROWSER, BROWSER_COOKIE_KEY)
+
+    def browser_fallback_session(self) -> browser_cookies.BrowserSession | None:
+        """Read the configured browser's cookies for Instagram.
+
+        Slow and fallible - the profile may be locked, or Chromium 127+ may have
+        encrypted the store (App-Bound Encryption). Callers run this on a worker
+        thread and turn :class:`~core.exceptions.BrowserCookieError` into an
+        explanation, never into "未登录".
+        """
+
+        browser = self.engine.browser_cookie_source
+        if browser is None:
+            return None
+        cookies = browser_cookies.extract_cookies(browser, domain_suffix=SESSION_DOMAIN)
+        return browser_cookies.BrowserSession(browser=browser, cookies=cookies)
 
     async def check_session(self, cookie_header: str | None) -> SessionStatus:
         """Ask Instagram who this session belongs to.

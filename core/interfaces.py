@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import httpx
 
@@ -18,6 +18,9 @@ from core.http import load_cookie_header
 from core.login import LoginSource, LoginState, SessionOrigin, SessionStatus
 from core.models import DownloadPlan, Platform, PlaylistEntry, VideoInfo
 from core.session_store import session_file
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an import cycle
+    from core.browser_cookies import BrowserSession
 
 
 class PlatformAdapter(ABC):
@@ -103,6 +106,17 @@ class PlatformAdapter(ABC):
         """
 
         return ()
+
+    def browser_fallback_session(self) -> BrowserSession | None:  # noqa: B027 - opt-in
+        """Cookies from the ``.env`` browser fallback, or ``None`` when unused.
+
+        Reading a browser's cookie database touches a locked file and can fail
+        outright (Chromium 127+ App-Bound Encryption), so callers run this on a
+        worker thread and let :class:`~core.exceptions.BrowserCookieError` carry
+        the advice. Platforms that do not read browser cookies keep the default.
+        """
+
+        return None
 
     async def check_session(self, cookie_header: str | None) -> SessionStatus:
         """Ask the platform whether ``cookie_header`` is a live session.

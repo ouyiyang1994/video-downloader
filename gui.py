@@ -186,6 +186,10 @@ PASTE_BUTTON_TEXT = "保存并验证"
 PASTE_BUSY_TEXT = "验证中…"
 LOGIN_BUSY_TEXT = "检测中…"
 
+#: The sign-out label. Used instead of the plain state label while a session
+#: could not be *read* but a configured fallback can still be switched off.
+LOGOUT_BUTTON_TEXT = "退出登录"
+
 #: Shown only while a platform's ``.env`` fallback is switched off by
 #: 「退出登录」, so the way back is always visible.
 REENABLE_FALLBACK_TEXT = "重新启用配置会话"
@@ -698,9 +702,14 @@ class LoginWorker(QThread):
         # adapter cached before the user signed in or out is stale by now.
         self.adapter.reload_session()
         if self.action is LoginAction.STATUS:
-            return await self._check(
-                self.adapter.session_cookie_header(), origin=self.adapter.session_origin()
-            )
+            header = self.adapter.session_cookie_header()
+            origin = self.adapter.session_origin()
+            if header is None and origin.source is LoginSource.BROWSER:
+                # ``.env`` points at a browser instead of a file: the store has
+                # to be read here, on the worker thread, because it can be slow
+                # and can fail.
+                return await self._check_browser_fallback(origin)
+            return await self._check(header, origin=origin)
         if self.action is LoginAction.ACQUIRE:
             return await self._acquire()
         if self.action is LoginAction.PASTE:
@@ -735,6 +744,35 @@ class LoginWorker(QThread):
         if origin is None:
             return status
         return replace(status, origin=origin)
+
+    async def _check_browser_fallback(self, origin: SessionOrigin) -> SessionStatus:
+        """Validate the session the ``.env`` browser fallback holds.
+
+        "Could not read the store" is not "not logged in": a locked profile or
+        App-Bound Encryption is reported as ``UNKNOWN`` with the reason, so the
+        row tells the truth and the advice (extension / manual session) stays
+        one step away. Nothing is written and nothing is deleted either way.
+        """
+
+        try:
+            session = self.adapter.browser_fallback_session()
+        except BrowserCookieError as exc:
+            logger.info("无法读取浏览器 Cookie（%s）：%s", exc.reason, exc.detail or exc.message)
+            return SessionStatus(
+                platform=self.adapter.platform,
+                state=LoginState.UNKNOWN,
+                detail=exc.message,
+                origin=origin,
+            )
+        if session is None:
+            return await self._check(None, origin=origin)
+        logger.info(
+            "已从 %s 读取 %s 的登录 Cookie（%d 个）",
+            session.browser,
+            self.adapter.platform.value,
+            len(session.cookies),
+        )
+        return await self._check(header_from_cookies(session.cookies), origin=origin)
 
     def _stored_origin(self) -> SessionOrigin:
         """Where the session on disk comes from *now*.
@@ -2117,7 +2155,14 @@ class MainWindow(QMainWindow):
     def _on_login_button(self, adapter: PlatformAdapter) -> None:
         """The single button beside a platform: sign in, or sign out."""
         status = self.login_status.get(adapter.platform)
-        if status is not None and status.logged_in:
+        if status is not None and (
+            status.logged_in
+            or (status.state is LoginState.UNKNOWN and self._fallback_can_be_disabled(adapter))
+        ):
+            # UNKNOWN with a configured fallback means "we could not read the
+            # session" (a locked or App-Bound-encrypted store). Switching that
+            # fallback off is then the one useful action left, so the button
+            # must not only offer "登录".
             self._logout(adapter)
             return
         dialog = LoginDialog(self.settings, adapter, self)
@@ -2297,7 +2342,7 @@ class MainWindow(QMainWindow):
                 + self._login_source_hint(platform)
                 + self._fallback_disabled_hint(platform)
             )
-            button.setText(status.action_label)
+            button.setText(self._login_action_text(platform, status))
         button.setEnabled(not running)
 
         reenable = self.login_reenable.get(platform)
@@ -2311,6 +2356,32 @@ class MainWindow(QMainWindow):
         if not fallback_policy.is_disabled(self.settings, platform):
             return ""
         return FALLBACK_DISABLED_HINT
+
+    def _fallback_can_be_disabled(self, adapter: PlatformAdapter) -> bool:
+        """True when 「退出登录」 has a fallback to switch off right now."""
+
+        if fallback_policy.is_disabled(self.settings, adapter.platform):
+            return False
+        return bool(adapter.fallback_config_keys())
+
+    def _login_action_text(self, platform: Platform, status: SessionStatus) -> str:
+        """The row's button label.
+
+        :attr:`SessionStatus.action_label` says "登录" for ``UNKNOWN``, but when
+        the session could not be *read* and a configured fallback is behind it,
+        the useful action is switching that fallback off - offering only "登录"
+        would hide it, which is exactly what made an encrypted Chrome store look
+        like a dead end.
+        """
+
+        adapter = self.login_adapters.get(platform)
+        if (
+            adapter is not None
+            and status.state is LoginState.UNKNOWN
+            and self._fallback_can_be_disabled(adapter)
+        ):
+            return LOGOUT_BUTTON_TEXT
+        return status.action_label
 
     def _refresh_login_controls(self) -> None:
         """Keep the refresh button in step with the running checks."""
@@ -2360,7 +2431,8 @@ class MainWindow(QMainWindow):
         if origin.source is LoginSource.ENV_VALUE:
             return f"来自 .env 的 {origin.key or '会话配置'}"
         if origin.source is LoginSource.BROWSER:
-            return "来自浏览器"
+            key = origin.key or "YTDLP_COOKIES_FROM_BROWSER"
+            return f"来自 .env 的 {key}（浏览器 Cookie）"
         if origin.source is LoginSource.MANAGED:
             return ""
         # An origin this build cannot name (an older status, a platform with no

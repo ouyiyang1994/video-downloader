@@ -940,6 +940,25 @@ def test_login_row_stays_quiet_for_a_managed_session(window: gui.MainWindow) -> 
     assert ".env" not in state_label.text(), "本程序保存的会话不需要来源提示"
 
 
+def test_login_row_names_the_browser_cookie_source(window: gui.MainWindow) -> None:
+    """A browser-backed login must say so, and name the key that feeds it."""
+
+    platform = Platform.INSTAGRAM
+    window.login_status[platform] = SessionStatus(
+        platform=platform,
+        state=LoginState.LOGGED_IN,
+        account="bosco.slash",
+        origin=SessionOrigin(LoginSource.BROWSER, "YTDLP_COOKIES_FROM_BROWSER"),
+    )
+    window._refresh_login_row(platform)
+
+    state_label, _action = window.login_rows[platform]
+    text = state_label.text()
+    assert "YTDLP_COOKIES_FROM_BROWSER" in text
+    assert "浏览器 Cookie" in text
+    assert "本程序未保存会话" in text
+
+
 def test_login_summary_names_the_env_source(window: gui.MainWindow) -> None:
     window.login_status[Platform.INSTAGRAM] = SessionStatus(
         platform=Platform.INSTAGRAM,
@@ -1204,6 +1223,249 @@ def test_status_refresh_labels_the_instagram_fallback_origin(
     assert status.logged_in is True
     assert status.origin.source is LoginSource.ENV_COOKIEFILE
     assert status.origin.key == "YTDLP_COOKIEFILE"
+
+
+def _browser_instagram_cookie(value: str = "FROMBROWSER"):  # noqa: ANN201 - test helper
+    """A simulated ``sessionid`` as it would come out of a browser store."""
+
+    return session_store.make_cookie("sessionid", value, domain=".instagram.com")
+
+
+def test_status_refresh_reads_the_configured_browser_cookies(
+    settings: Settings, registry: PlatformRegistry, monkeypatch
+) -> None:
+    """Only ``YTDLP_COOKIES_FROM_BROWSER`` configured: the browser holds the session."""
+
+    settings.ytdlp_cookiefile = None
+    settings.ytdlp_cookies_from_browser = "chrome"
+    seen: list[str | None] = []
+
+    def _fake_extract(browser: str, *, domain_suffix: str):
+        assert browser == "chrome"
+        assert domain_suffix == "instagram.com"
+        return [_browser_instagram_cookie()]
+
+    monkeypatch.setattr(browser_cookies, "extract_cookies", _fake_extract)
+
+    async def _logged_in(self, header, *, origin=None):  # noqa: ANN001
+        seen.append(header)
+        return SessionStatus(
+            platform=self.adapter.platform,
+            state=LoginState.LOGGED_IN,
+            account="bosco.slash",
+            origin=origin or SessionOrigin(),
+        )
+
+    monkeypatch.setattr(gui.LoginWorker, "_check", _logged_in)
+
+    worker = gui.LoginWorker(settings, registry.get(Platform.INSTAGRAM), gui.LoginAction.STATUS)
+    status = asyncio.run(worker._run())
+
+    assert status.logged_in is True
+    assert status.origin.source is LoginSource.BROWSER
+    assert status.origin.key == "YTDLP_COOKIES_FROM_BROWSER"
+    assert seen and "sessionid=" in (seen[0] or "")
+
+
+def test_status_refresh_reports_an_unreadable_browser_fallback(
+    settings: Settings, registry: PlatformRegistry, monkeypatch
+) -> None:
+    """A locked or undecryptable store is "unknown", never a silent 未登录."""
+
+    settings.ytdlp_cookiefile = None
+    settings.ytdlp_cookies_from_browser = "chrome"
+
+    def _boom(browser: str, *, domain_suffix: str) -> list[object]:
+        raise BrowserCookieError(
+            "无法解密 Chrome 的 Cookie（App-Bound Encryption）",
+            reason=browser_cookies.BrowserFailure.ENCRYPTED.value,
+            browser="chrome",
+            detail="首选方案：安装「Chrome 登录助手」扩展",
+        )
+
+    async def _never(self, header, *, origin=None):  # noqa: ANN001
+        pytest.fail("读不到浏览器 Cookie 时不应向平台发问")
+
+    monkeypatch.setattr(browser_cookies, "extract_cookies", _boom)
+    monkeypatch.setattr(gui.LoginWorker, "_check", _never)
+
+    worker = gui.LoginWorker(settings, registry.get(Platform.INSTAGRAM), gui.LoginAction.STATUS)
+    status = asyncio.run(worker._run())
+
+    assert status.state is LoginState.UNKNOWN
+    assert "App-Bound Encryption" in status.detail
+    assert status.origin.source is LoginSource.BROWSER
+    assert status.origin.key == "YTDLP_COOKIES_FROM_BROWSER"
+
+
+def test_the_sign_out_button_stays_reachable_when_the_store_cannot_be_read(
+    window: gui.MainWindow, settings: Settings
+) -> None:
+    """UNKNOWN must not hide the only action that helps: switching the fallback off."""
+
+    platform = Platform.INSTAGRAM
+    settings.ytdlp_cookies_from_browser = "chrome"
+    window.login_status[platform] = SessionStatus(
+        platform=platform,
+        state=LoginState.UNKNOWN,
+        detail="无法解密 Chrome 的 Cookie（App-Bound Encryption）",
+        origin=SessionOrigin(LoginSource.BROWSER, "YTDLP_COOKIES_FROM_BROWSER"),
+    )
+
+    window._refresh_login_row(platform)
+    _state, button = window.login_rows[platform]
+    assert button.text() == "退出登录", "读不到会话时仍必须能禁用配置回退"
+
+    # Without a configured fallback there is nothing to switch off, so the plain
+    # "登录" wording (and the sign-in dialog) stays.
+    settings.ytdlp_cookies_from_browser = None
+    window._refresh_login_row(platform)
+    assert button.text() == "登录"
+
+
+def test_a_platform_can_be_switched_off_even_when_its_cookies_cannot_be_read(
+    window: gui.MainWindow, settings: Settings, monkeypatch, tmp_path: Path
+) -> None:
+    """The user must be able to disable an unreadable browser fallback."""
+
+    platform = Platform.INSTAGRAM
+    settings.ytdlp_cookiefile = None
+    settings.ytdlp_cookies_from_browser = "chrome"
+    window.login_status[platform] = SessionStatus(
+        platform=platform,
+        state=LoginState.UNKNOWN,
+        detail="无法解密 Chrome 的 Cookie（App-Bound Encryption）",
+        origin=SessionOrigin(LoginSource.BROWSER, "YTDLP_COOKIES_FROM_BROWSER"),
+    )
+    prompts: list[str] = []
+
+    def _ask(*args: object, **kwargs: object) -> int:
+        prompts.append(str(args[2]))
+        return int(gui.QMessageBox.StandardButton.Yes)
+
+    monkeypatch.setattr(gui.QMessageBox, "question", _ask)
+    monkeypatch.setattr(
+        gui.QMessageBox,
+        "information",
+        lambda *a, **k: pytest.fail("配置了回退就不该落到「没有可退出的内容」"),
+    )
+    monkeypatch.setattr(window, "refresh_login_status", lambda: None)
+    monkeypatch.setattr(
+        browser_cookies,
+        "extract_cookies",
+        lambda *a, **k: pytest.fail("禁用回退不得读取或删除浏览器 Cookie"),
+    )
+
+    window._on_login_button(window.login_adapters[platform])
+
+    assert "YTDLP_COOKIES_FROM_BROWSER" in prompts[0]
+    assert fallback_policy.is_disabled(settings, platform) is True
+    assert fallback_policy.is_disabled(settings, Platform.BILIBILI) is False
+    assert "YTDLP_COOKIES_FROM_BROWSER" in window.login_message.text()
+    # Persisted: a later run reads the same switch from the session directory.
+    later = Settings(
+        _env_file=None,
+        session_dir=settings.resolve_path(settings.session_dir),
+        native_host_dir=tmp_path / "native_host",
+        chrome_profile_dir=tmp_path / "chrome-profile",
+        ytdlp_cookiefile=None,
+        ytdlp_cookies_from_browser="chrome",
+    )
+    assert fallback_policy.is_disabled(later, platform) is True
+
+
+def test_logout_disables_the_browser_cookie_fallback(
+    window: gui.MainWindow, settings: Settings, monkeypatch
+) -> None:
+    """Logout must disable that fallback - and touch nothing else."""
+
+    settings.ytdlp_cookiefile = None
+    settings.ytdlp_cookies_from_browser = "chrome"
+    window.login_status[Platform.INSTAGRAM] = SessionStatus(
+        platform=Platform.INSTAGRAM,
+        state=LoginState.LOGGED_IN,
+        account="bosco.slash",
+        origin=SessionOrigin(LoginSource.BROWSER, "YTDLP_COOKIES_FROM_BROWSER"),
+    )
+    prompts: list[str] = []
+
+    def _ask(*args: object, **kwargs: object) -> int:
+        prompts.append(str(args[2]))
+        return int(gui.QMessageBox.StandardButton.Yes)
+
+    monkeypatch.setattr(gui.QMessageBox, "question", _ask)
+    monkeypatch.setattr(
+        gui.QMessageBox,
+        "information",
+        lambda *a, **k: pytest.fail("浏览器回退必须可禁用，不应落到「没有可退出的内容」"),
+    )
+    monkeypatch.setattr(window, "refresh_login_status", lambda: None)
+    monkeypatch.setattr(
+        browser_cookies,
+        "extract_cookies",
+        lambda *a, **k: pytest.fail("退出登录不得读取或删除浏览器 Cookie"),
+    )
+
+    window._logout(window.login_adapters[Platform.INSTAGRAM])
+
+    assert "YTDLP_COOKIES_FROM_BROWSER" in prompts[0]
+    assert "浏览器" in prompts[0], "确认框必须说明浏览器登录不受影响"
+    assert fallback_policy.is_disabled(settings, Platform.INSTAGRAM) is True
+    assert fallback_policy.is_disabled(settings, Platform.BILIBILI) is False
+    assert "YTDLP_COOKIES_FROM_BROWSER" in window.login_message.text()
+
+
+def test_the_browser_cookie_fallback_stays_disabled_after_a_restart(
+    settings: Settings, tmp_path: Path, monkeypatch
+) -> None:
+    """The flag is on disk, so a later task - or a restart - keeps ignoring it."""
+
+    settings.ytdlp_cookiefile = None
+    settings.ytdlp_cookies_from_browser = "chrome"
+    fallback_policy.set_disabled(settings, Platform.INSTAGRAM, disabled=True)
+
+    later = Settings(
+        _env_file=None,
+        session_dir=settings.resolve_path(settings.session_dir),
+        native_host_dir=tmp_path / "native_host",
+        chrome_profile_dir=tmp_path / "chrome-profile",
+        ytdlp_cookiefile=None,
+        ytdlp_cookies_from_browser="chrome",
+    )
+    monkeypatch.setattr(
+        browser_cookies,
+        "extract_cookies",
+        lambda *a, **k: pytest.fail("禁用后不得再读取浏览器 Cookie"),
+    )
+
+    client = httpx.AsyncClient()
+    try:
+        adapter = build_registry(later, client).get(Platform.INSTAGRAM)
+        assert adapter.engine.browser_cookie_source is None
+        status = asyncio.run(gui.LoginWorker(later, adapter, gui.LoginAction.STATUS)._run())
+    finally:
+        asyncio.run(client.aclose())
+
+    assert status.state is LoginState.LOGGED_OUT
+
+
+def test_reenable_restores_the_browser_cookie_fallback(
+    window: gui.MainWindow, settings: Settings, monkeypatch
+) -> None:
+    settings.ytdlp_cookiefile = None
+    settings.ytdlp_cookies_from_browser = "chrome"
+    fallback_policy.set_disabled(settings, Platform.INSTAGRAM, disabled=True)
+    monkeypatch.setattr(
+        gui.QMessageBox,
+        "question",
+        lambda *args, **kwargs: int(gui.QMessageBox.StandardButton.Yes),
+    )
+    monkeypatch.setattr(window, "refresh_login_status", lambda: None)
+
+    window._reenable_fallback(window.login_adapters[Platform.INSTAGRAM])
+
+    assert fallback_policy.is_disabled(settings, Platform.INSTAGRAM) is False
+    assert window.login_adapters[Platform.INSTAGRAM].engine.browser_cookie_source == "chrome"
 
 
 def test_status_refresh_labels_the_bilibili_fallback_origin(

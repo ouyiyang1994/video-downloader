@@ -20,7 +20,7 @@ import respx
 from httpx import Response
 
 from config.settings import Settings
-from core import browser_cookies, session_store
+from core import browser_cookies, fallback_policy, session_store
 from core.browser_cookies import BrowserFailure, browser_from_progid, classify_failure
 from core.exceptions import BrowserCookieError, SessionValueError
 from core.http import load_cookie_header
@@ -645,6 +645,62 @@ async def test_instagram_reports_no_source_without_any_session(settings: Setting
 
     assert origin.source is LoginSource.NONE
     assert adapter.fallback_config_keys() == ()
+
+
+async def test_instagram_names_the_browser_cookie_fallback(settings: Settings) -> None:
+    """Only ``YTDLP_COOKIES_FROM_BROWSER`` configured: that *is* the source.
+
+    Reporting "no source" here made the row say 未登录 and hid 「退出登录」, even
+    though the browser's own session is what downloads use.
+    """
+
+    settings.ytdlp_cookiefile = None
+    settings.ytdlp_cookies_from_browser = "chrome"
+
+    async with httpx.AsyncClient() as client:
+        adapter = InstagramAdapter(settings, client)
+        origin = adapter.session_origin()
+        header = adapter.session_cookie_header()
+
+    assert header is None, "来源解析本身不得读浏览器（读取发生在线程里）"
+    assert origin.source is LoginSource.BROWSER
+    assert origin.key == "YTDLP_COOKIES_FROM_BROWSER"
+    assert adapter.fallback_config_keys() == ("YTDLP_COOKIES_FROM_BROWSER",)
+
+
+async def test_instagram_lists_both_env_fallbacks(settings: Settings, tmp_path: Path) -> None:
+    """A configured file wins, but the browser fallback must still be named."""
+
+    settings.ytdlp_cookiefile = str(_write_instagram_cookie_file(tmp_path / "env-cookies.txt"))
+    settings.ytdlp_cookies_from_browser = "chrome"
+
+    async with httpx.AsyncClient() as client:
+        adapter = InstagramAdapter(settings, client)
+        origin = adapter.session_origin()
+
+    assert origin.source is LoginSource.ENV_COOKIEFILE
+    assert adapter.fallback_config_keys() == ("YTDLP_COOKIEFILE", "YTDLP_COOKIES_FROM_BROWSER")
+
+
+async def test_instagram_browser_fallback_disappears_when_disabled(
+    settings: Settings,
+) -> None:
+    """The switch must silence the browser source, and only for that platform."""
+
+    settings.ytdlp_cookiefile = None
+    settings.ytdlp_cookies_from_browser = "chrome"
+
+    fallback_policy.set_disabled(settings, Platform.INSTAGRAM, disabled=True)
+
+    async with httpx.AsyncClient() as client:
+        adapter = InstagramAdapter(settings, client)
+        origin = adapter.session_origin()
+
+    assert adapter.engine.browser_cookie_source is None
+    assert origin.source is LoginSource.NONE
+    assert adapter.fallback_config_keys() == ("YTDLP_COOKIES_FROM_BROWSER",), (
+        "恢复入口必须仍能列出被禁用的键"
+    )
 
 
 async def test_bilibili_names_the_env_cookie_file_fallback(
