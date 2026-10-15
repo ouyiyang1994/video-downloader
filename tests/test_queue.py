@@ -694,7 +694,13 @@ def test_a_running_task_is_marked_as_held(queues: Callable[..., DownloadQueue]) 
 
     release.set()
     _wait_until(lambda: task.state is QueueState.COMPLETED, message="任务未完成")
-    assert task.claimed is False, "worker 结束后没有释放任务"
+    # The terminal state is written by ``_run`` and ``claimed`` is cleared by the
+    # worker's ``finally`` immediately afterwards, so the two are ordered but
+    # not simultaneous: asserting it the instant the state reads COMPLETED
+    # reads a flag the worker has not cleared yet.  Waiting is also the stronger
+    # check - a flag that is never cleared now fails instead of depending on
+    # scheduling.
+    _wait_until(lambda: task.claimed is False, message="worker 结束后没有释放任务")
 
 
 def test_removing_a_task_a_run_still_holds_is_refused(
