@@ -1372,8 +1372,11 @@ def test_the_bundle_check_rejects_a_foreign_toc_source(tmp_path: Path) -> None:
 
     build = tmp_path / "build"
     build.mkdir()
+    # A source outside every trusted root. Deliberately not under a user
+    # profile: ci_guard treats "X:\Users\<name>" as a leaked local path, and
+    # this fixture only needs to be somewhere foreign.
     polluted = (
-        r"C:\\Users\\someone\\.cache\\codex-runtimes"
+        r"D:\\build-cache\\codex-runtimes"
         r"\\poppler\\Library\\bin\\icuuc.dll"
     )
     (build / "Analysis-00.toc").write_text(
