@@ -89,13 +89,39 @@ def _trusted_binary_roots() -> tuple[Path, ...]:
     return tuple(dict.fromkeys(roots))
 
 
+def _trusted_replacement(name: str, trusted: tuple[Path, ...]) -> Path | None:
+    """A trusted file with the same basename, if the interpreter ships one.
+
+    PyInstaller resolves a bare DLL import against whatever ``PATH`` offers
+    first. When that turns out to be an unrelated runtime (a JDK, a MySQL
+    install) the module still needs the DLL, so the interpreter's own copy has
+    to take its place - simply dropping the entry would leave ``_ssl`` without
+    ``libssl-3-x64.dll``.
+
+    OS-owned names (``api-ms-win-*``, ``ucrtbase.dll``) have no trusted copy,
+    and for those dropping *is* correct: the loader must take them from
+    System32, never from the application folder.
+    """
+
+    for root in trusted:
+        for sub in ("", "DLLs", "Scripts", "Library\\bin"):
+            candidate = (root / sub / name) if sub else (root / name)
+            if candidate.is_file():
+                return candidate
+    return None
+
+
 def _drop_foreign_binaries(binaries: list) -> tuple[list, list]:
     """Split ``binaries`` into (kept, dropped-abroad).
 
     ``binaries`` entries are ``(destination, source, type)``. An entry is kept
     when its source is unknown (empty - a synthetic entry) or lives under one
-    of :func:`_trusted_binary_roots`. Everything else is a DLL some unrelated
-    runtime on ``PATH`` happened to provide, and it is dropped.
+    of :func:`_trusted_binary_roots`. Anything else is a DLL some unrelated
+    runtime on ``PATH`` happened to provide.
+
+    A foreign entry whose basename the interpreter also ships is *replaced* by
+    the trusted copy rather than dropped; only names with no trusted
+    counterpart (the OS-owned apiset stubs and the UCRT) are dropped outright.
     """
 
     trusted = _trusted_binary_roots()
@@ -115,7 +141,26 @@ def _drop_foreign_binaries(binaries: list) -> tuple[list, list]:
             kept.append(entry)
         else:
             dropped.append(entry)
-    return kept, dropped
+
+    rescued: list = []
+    truly_dropped: list = []
+    for dest, source, kind in dropped:
+        replacement = _trusted_replacement(Path(str(dest)).name, trusted)
+        if replacement is None:
+            truly_dropped.append((dest, source, kind))
+        else:
+            rescued.append((dest, replacement))
+            kept.append((dest, str(replacement), kind))
+
+    if rescued:
+        print(
+            "[spec] 已用解释器自带的副本替换 %d 个被 PATH 污染的 DLL："
+            % len(rescued)
+        )
+        for dest, replacement in sorted(rescued, key=lambda row: str(row[0])):
+            print("        %s  <-  %s" % (dest, replacement))
+
+    return kept, truly_dropped
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -147,7 +192,7 @@ a = Analysis(
 a.binaries, _foreign_binaries = _drop_foreign_binaries(list(a.binaries))
 if _foreign_binaries:
     print(
-        "[spec] 已从产物中剔除 %d 个来源不受信任的 DLL（PATH 污染防护）:"
+        "[spec] 已剔除 %d 个来源不受信任且无解释器副本的 DLL（交由系统解析）:"
         % len(_foreign_binaries)
     )
     for _dest, _src, _kind in sorted(_foreign_binaries, key=lambda row: str(row[0])):

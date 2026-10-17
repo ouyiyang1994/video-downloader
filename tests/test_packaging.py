@@ -1403,6 +1403,79 @@ def test_the_bundle_check_reports_a_missing_payload(tmp_path: Path) -> None:
     assert failures and "找不到载荷目录" in failures[0]
 
 
+def test_the_bundle_check_reads_the_final_collect_toc(tmp_path: Path) -> None:
+    """Only COLLECT describes what shipped; Analysis is the pre-filter view.
+
+    The spec's provenance guard runs *after* Analysis, so an Analysis entry can
+    name a source that never reached ``_internal``. Reporting it would fail a
+    build whose payload is actually clean - exactly what happened on the v1.31
+    release run, where the guard dropped 45 polluted DLLs and the check then
+    complained about all 45 of them.
+    """
+
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / "Analysis-00.toc").write_text(
+        "a.binaries = [\n"
+        "('libssl-3-x64.dll',\n"
+        " 'C:\\\\Program Files\\\\MySQL\\\\bin\\\\libssl-3-x64.dll',\n"
+        " 'BINARY'),\n"
+        "]\n",
+        encoding="utf-8",
+    )
+    (build / "COLLECT-00.toc").write_text(
+        "coll = [\n"
+        "('libssl-3-x64.dll',\n"
+        " 'C:\\\\Python312\\\\libssl-3-x64.dll',\n"
+        " 'BINARY'),\n"
+        "]\n",
+        encoding="utf-8",
+    )
+
+    sources = bundle_check.toc_sources(build)
+
+    assert "Python312" in sources["libssl-3-x64.dll"]
+    assert "MySQL" not in sources["libssl-3-x64.dll"]
+
+
+def test_the_bundle_check_falls_back_to_analysis_without_a_collect(tmp_path: Path) -> None:
+    """A onefile-style build has no COLLECT TOC, so Analysis is all there is."""
+
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / "Analysis-00.toc").write_text(
+        "a.binaries = [\n"
+        "('libssl-3-x64.dll',\n"
+        " 'C:\\\\Program Files\\\\MySQL\\\\bin\\\\libssl-3-x64.dll',\n"
+        " 'BINARY'),\n"
+        "]\n",
+        encoding="utf-8",
+    )
+
+    sources = bundle_check.toc_sources(build)
+
+    assert "MySQL" in sources["libssl-3-x64.dll"]
+
+
+def test_the_spec_replaces_a_polluted_dll_with_the_interpreters_copy() -> None:
+    """A foreign DLL the interpreter also ships must be substituted, not dropped.
+
+    ``_ssl`` needs ``libssl-3-x64.dll``. If the only entry came from MySQL and
+    the guard merely dropped it, the frozen app would fail to import ssl. Names
+    with no trusted counterpart (``api-ms-win-*``, ``ucrtbase.dll``) are still
+    dropped, because those must come from System32.
+    """
+
+    spec = _spec_text()
+
+    assert "def _trusted_replacement(" in spec
+    assert "_trusted_replacement(Path(str(dest)).name, trusted)" in spec
+    # The substitution happens before EXE/COLLECT consume a.binaries.
+    assert spec.index("_trusted_replacement(Path(str(dest)).name, trusted)") < spec.index(
+        "pyz = PYZ("
+    )
+
+
 def test_the_build_script_scrubs_dll_pollution_from_path() -> None:
     """A foreign runtime on PATH is what caused the whole incident."""
 

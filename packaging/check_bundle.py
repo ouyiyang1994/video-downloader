@@ -113,6 +113,25 @@ def forbidden_files(dist: Path) -> list[tuple[Path, str]]:
     return found
 
 
+def _final_tocs(build_dir: Path) -> list[Path]:
+    """The TOC files that describe the *shipped* bundle.
+
+    PyInstaller writes ``Analysis-00.toc`` before the spec's provenance guard
+    runs and ``COLLECT-00.toc`` after it, so only the latter reflects what
+    actually lands in ``_internal``. Reading both would report every DLL the
+    guard filtered out as if it had shipped - a false failure that hides the
+    real state of the payload.
+    """
+
+    tocs = [
+        toc
+        for toc in build_dir.rglob("*.toc")
+        if "native_host" not in {part.casefold() for part in toc.parts}
+    ]
+    collect = [toc for toc in tocs if toc.name.casefold().startswith("collect-")]
+    return sorted(collect) if collect else sorted(tocs)
+
+
 def toc_sources(build_dir: Path) -> dict[str, str]:
     """Map ``_internal`` dest name -> absolute source path, from the TOCs.
 
@@ -124,15 +143,13 @@ def toc_sources(build_dir: Path) -> dict[str, str]:
     ``<workpath>/<spec name>/`` - not directly in the directory the build
     script passes. So the search recurses, and it skips the ``native_host``
     sub-tree, which is a separate bundle with its own (equally irrelevant)
-    sources.
+    sources. Only the final COLLECT pass is read - see :func:`_final_tocs`.
     """
 
     mapping: dict[str, str] = {}
     if not build_dir.is_dir():
         return mapping
-    for toc in sorted(build_dir.rglob("*.toc")):
-        if "native_host" in {part.casefold() for part in toc.parts}:
-            continue
+    for toc in _final_tocs(build_dir):
         text = toc.read_text(encoding="utf-8", errors="replace")
         for match in _TOC_ENTRY.finditer(text):
             if match.group("kind") != "BINARY":
