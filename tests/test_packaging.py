@@ -18,6 +18,7 @@ from config import settings as settings_module
 SCANNER_PATH = Path(__file__).resolve().parent.parent / "packaging" / "scan_secrets.py"
 PORTABLE_PATH = Path(__file__).resolve().parent.parent / "packaging" / "make_portable_zip.py"
 SYNC_VERSION_PATH = Path(__file__).resolve().parent.parent / "packaging" / "sync_version.py"
+BUNDLE_CHECK_PATH = Path(__file__).resolve().parent.parent / "packaging" / "check_bundle.py"
 
 
 def _load_scanner():
@@ -50,9 +51,20 @@ def _load_sync_version():
     return module
 
 
+def _load_bundle_check():
+    """Load packaging/check_bundle.py the same way."""
+
+    spec = importlib.util.spec_from_file_location("check_bundle_under_test", BUNDLE_CHECK_PATH)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 scan = _load_scanner()
 portable = _load_portable()
 sync_version = _load_sync_version()
+bundle_check = _load_bundle_check()
 
 # --- app root ---------------------------------------------------------------
 
@@ -1258,3 +1270,381 @@ def test_single_file_scan_catches_a_real_credential(tmp_path: Path) -> None:
 def test_single_file_scan_reports_a_missing_artefact(tmp_path: Path) -> None:
     failures, _ = scan.scan_single_file(tmp_path / "nope.exe", tmp_path)
     assert failures and "找不到文件" in failures[0]
+
+
+# --- bundled system DLLs (the v1.31 Qt crash) -------------------------------
+#
+# On 2026-10-16 the release build ran in a shell whose PATH also held a Poppler
+# runtime, so PyInstaller resolved Qt6Core's ``icuuc.dll`` import to Poppler's
+# ICU 78 and copied it into ``_internal\``. There it shadowed the Windows ICU
+# shim Qt 6.11 links against, and every frozen build died with
+# ``ImportError: DLL load failed while importing QtCore`` - before logging was
+# configured, i.e. with no log to look at. These tests pin the two defences:
+# the spec's provenance filter and the post-build ``check_bundle.py`` gate.
+
+
+def _spec_text() -> str:
+    spec = Path(__file__).resolve().parent.parent / "packaging" / "VideoDownloader.spec"
+    return spec.read_text(encoding="utf-8")
+
+
+def test_the_spec_filters_binaries_by_provenance() -> None:
+    """The build must not bundle a DLL that came from outside the venv."""
+
+    spec = _spec_text()
+
+    assert "def _drop_foreign_binaries(" in spec
+    assert "def _trusted_binary_roots(" in spec
+    # Applied to a.binaries *before* the EXE/COLLECT consume it.
+    assert "a.binaries, _foreign_binaries = _drop_foreign_binaries(list(a.binaries))" in spec
+    assert spec.index("_drop_foreign_binaries(list(a.binaries))") < spec.index("pyz = PYZ(")
+
+
+def test_the_spec_trusts_the_virtualenv_and_the_interpreter() -> None:
+    spec = _spec_text()
+    assert "sys.prefix" in spec
+    assert "sys.base_prefix" in spec
+
+
+def test_the_bundle_check_flags_a_shadowing_system_dll(tmp_path: Path) -> None:
+    """``_internal\\icuuc.dll`` is exactly what broke Qt - it must fail the build."""
+
+    dist = tmp_path / "dist" / "VideoDownloader"
+    internal = dist / "_internal"
+    internal.mkdir(parents=True)
+    (dist / "VideoDownloader.exe").write_bytes(b"MZ")
+    (internal / "icuuc.dll").write_bytes(b"poppler icu 78")
+
+    failures, _ = bundle_check.build_report(dist, None)
+
+    assert any("icuuc.dll" in failure for failure in failures)
+
+
+def test_the_bundle_check_flags_ucrt_and_api_set_stubs(tmp_path: Path) -> None:
+    dist = tmp_path / "dist" / "VideoDownloader"
+    internal = dist / "_internal"
+    internal.mkdir(parents=True)
+    (dist / "VideoDownloader.exe").write_bytes(b"MZ")
+    for name in ("ucrtbase.dll", "api-ms-win-crt-runtime-l1-1-0.dll", "icudt78.dll"):
+        (internal / name).write_bytes(b"x")
+
+    failures, _ = bundle_check.build_report(dist, None)
+
+    for name in ("ucrtbase.dll", "api-ms-win-crt-runtime-l1-1-0.dll", "icudt78.dll"):
+        assert any(name in failure for failure in failures), name
+
+
+def test_the_bundle_check_leaves_a_wheels_private_runtime_alone(tmp_path: Path) -> None:
+    """PySide6 vendors MSVCP140/VCRUNTIME140 in its own folder on purpose."""
+
+    dist = tmp_path / "dist" / "VideoDownloader"
+    internal = dist / "_internal"
+    internal.mkdir(parents=True)
+    (dist / "VideoDownloader.exe").write_bytes(b"MZ")
+    (internal / "PySide6").mkdir()
+    (internal / "PySide6" / "MSVCP140.dll").write_bytes(b"wheel payload")
+    (internal / "shiboken6").mkdir()
+    (internal / "shiboken6" / "VCRUNTIME140.dll").write_bytes(b"wheel payload")
+
+    failures, notes = bundle_check.build_report(dist, None)
+
+    assert failures == []
+    assert any("未发现" in note for note in notes)
+
+
+def test_the_bundle_check_accepts_a_clean_payload(tmp_path: Path) -> None:
+    dist = tmp_path / "dist" / "VideoDownloader"
+    internal = dist / "_internal"
+    (internal / "PySide6").mkdir(parents=True)
+    (dist / "VideoDownloader.exe").write_bytes(b"MZ")
+    (internal / "PySide6" / "Qt6Core.dll").write_bytes(b"qt")
+
+    failures, _ = bundle_check.build_report(dist, None)
+    assert failures == []
+
+
+def test_the_bundle_check_rejects_a_foreign_toc_source(tmp_path: Path) -> None:
+    """Provenance comes from the TOC, and it is the general detector."""
+
+    dist = tmp_path / "dist" / "VideoDownloader"
+    (dist / "_internal").mkdir(parents=True)
+    (dist / "VideoDownloader.exe").write_bytes(b"MZ")
+
+    build = tmp_path / "build"
+    build.mkdir()
+    polluted = (
+        r"C:\\Users\\someone\\.cache\\codex-runtimes"
+        r"\\poppler\\Library\\bin\\icuuc.dll"
+    )
+    (build / "Analysis-00.toc").write_text(
+        "a.binaries = [\n"
+        "('icuuc.dll',\n"
+        f" '{polluted}',\n"
+        " 'BINARY'),\n"
+        "('PySide6\\\\Qt6Core.dll',\n"
+        " r'C:\\\\project\\\\.venv\\\\Lib\\\\site-packages\\\\PySide6\\\\Qt6Core.dll',\n"
+        " 'BINARY'),\n"
+        "]\n",
+        encoding="utf-8",
+    )
+
+    sources = bundle_check.toc_sources(build)
+    offenders = bundle_check.foreign_sources(sources, bundle_check.trusted_roots())
+
+    assert any(name == "icuuc.dll" for name, _src in offenders)
+    assert all(name != "qt6core.dll" for name, _src in offenders)
+
+
+def test_the_bundle_check_reports_a_missing_payload(tmp_path: Path) -> None:
+    failures, _ = bundle_check.build_report(tmp_path / "dist" / "VideoDownloader", None)
+    assert failures and "找不到载荷目录" in failures[0]
+
+
+def test_the_build_script_scrubs_dll_pollution_from_path() -> None:
+    """A foreign runtime on PATH is what caused the whole incident."""
+
+    script = _build_script_text()
+
+    assert "function Remove-DllPollutionFromPath" in script
+    assert "$DllPollutionMarkers = @('codex-runtimes', 'poppler', 'libheif')" in script
+    # Called before PyInstaller starts, not after.
+    scrub = script.index("Remove-DllPollutionFromPath\n")
+    pyinstaller = script.index("$pyiArgs = @(")
+    assert scrub < pyinstaller
+    # Only the process PATH is touched - never the user's persisted one.
+    assert "$env:PATH = ($kept -join ';')" in script
+    assert "SetEnvironmentVariable" not in script
+
+
+def test_the_build_script_runs_the_bundle_check() -> None:
+    """The second gate must run in build.ps1, after the sensitive scan."""
+
+    script = _build_script_text()
+
+    assert "$BundleCheck = Join-Path $PackagingDir 'check_bundle.py'" in script
+    assert "'--build', $BuildDir" in script
+    assert "打包产物检查" in script
+
+
+def test_the_installer_script_runs_the_bundle_check() -> None:
+    """And again right before Inno Setup packs the folder."""
+
+    script = _build_script()
+    assert "$BundleCheck = Join-Path $PackagingDir 'check_bundle.py'" in script
+    assert "$BundleCheck, '--dist', $AppDir" in script
+
+
+def test_the_bundle_check_cannot_be_skipped_by_the_secret_scan_switch() -> None:
+    """``-SkipScan`` skips the *secret* scan; the DLL gate is not optional."""
+
+    script = _build_script()
+    invocation = script.index("$BundleCheck, '--dist', $AppDir")
+    # The gate call sits outside the ``if ($SkipScan) { ... } else { ... }``
+    # block, so ``-SkipScan`` cannot silence it.
+    assert script.index("if ($SkipScan)") < invocation
+    before = script[:invocation]
+    assert before.count("}") >= before.count("{"), "调用必须落在 else 块之外"
+
+
+# --- upgrade leftovers ------------------------------------------------------
+#
+# Inno Setup's ``[Files]`` only *adds and overwrites*; it never deletes a file
+# that a previous version installed but the new payload no longer ships. v1.31
+# proved the cost: a broken package whose ``_internal\`` carried an
+# incompatible ICU 78 was replaced by a fixed one, yet the upgrade left 88
+# orphaned DLLs behind - and a leftover ``_internal\icuuc.dll`` shadows the OS
+# shim, so Qt still refused to load and the app died with no log. The
+# ``[InstallDelete]`` section is the cure, and these tests keep it honest.
+
+
+def _installer_text() -> str:
+    """``installer.iss`` as text."""
+
+    return (
+        Path(__file__).resolve().parent.parent / "packaging" / "installer.iss"
+    ).read_text(encoding="utf-8")
+
+
+def _installer_section(name: str) -> list[str]:
+    """The non-comment directive lines of one Inno Setup ``[section]``.
+
+    A real section parser, not a ``split``: the prose *above* an entry may
+    mention other sections by name (ours does), so the only reliable signal is
+    a line whose first character is ``[``.
+    """
+
+    directives: list[str] = []
+    in_section = False
+    for raw in _installer_text().splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("["):
+            in_section = stripped.casefold() == f"[{name.casefold()}]"
+            continue
+        if not in_section or not stripped or stripped.startswith(";"):
+            continue
+        directives.append(stripped)
+    return directives
+
+
+def _install_delete_lines() -> list[str]:
+    """The ``[InstallDelete]`` entries, comments and blanks stripped.
+
+    Parsed out of the real file so the tests see exactly what Inno Setup will
+    run rather than a hand-copied duplicate that can drift.
+    """
+
+    return _installer_section("InstallDelete")
+
+
+def _inno_wildcard_to_regex(pattern: str) -> str:
+    """Translate an Inno ``Name:`` wildcard to a regex ``^...$``.
+
+    Only ``*`` and ``?`` are meaningful here; both are escaped first so a
+    literal ``.`` in ``icuuc.dll`` stays literal.
+    """
+
+    import re as _re
+
+    out = _re.escape(pattern)
+    out = out.replace(r"\*", ".*").replace(r"\?", ".")
+    return "^" + out + "$"
+
+
+def _install_delete_names() -> list[tuple[str, str]]:
+    """``(directory, filename)`` for every ``Type: files`` entry.
+
+    Raises if the section holds something the app did not author, so a future
+    edit that quietly widens the scope fails loudly instead of shipping.
+    """
+
+    entries: list[tuple[str, str]] = []
+    for line in _install_delete_lines():
+        assert line.casefold().startswith("type: files;"), f"只允许 Type: files 条目: {line}"
+        name = line.split("Name:", 1)[1].strip().strip('"')
+        assert name.startswith("{app}\\"), f"清理必须限定在 {{app}} 内: {line}"
+        assert "\\_internal\\" in name, f"只清理 _internal 目录: {line}"
+        directory, filename = name.rsplit("\\", 1)
+        entries.append((directory, filename))
+    return entries
+
+
+def test_the_upgrade_cleanup_covers_every_forbidden_dll() -> None:
+    """Each pattern the bundle check rejects must also be cleaned on upgrade.
+
+    Both directions matter, so both are asserted:
+
+    * every cleanup rule names a *specific* forbidden pattern - never a broad
+      ``*.dll`` that could delete something the payload needs;
+    * every forbidden pattern has a rule that covers it in each bundle - a
+      missing rule is precisely the v1.31 bug (a leftover that survives and
+      shadows the OS copy).
+
+    Sourced from ``check_bundle.FORBIDDEN_DLL_PATTERNS`` so the two lists
+    cannot drift apart silently.
+    """
+
+    import re as _re
+
+    expected = {
+        _re.escape(pattern).replace(r"\*", ".*")
+        for pattern in bundle_check.FORBIDDEN_DLL_PATTERNS
+    }
+    rules = {filename for _directory, filename in _install_delete_names()}
+
+    # (1) No rule is broader than the forbidden set.
+    for filename in rules:
+        assert any(_re.fullmatch(pat, filename.casefold()) for pat in expected), (
+            f"清理规则 {filename} 不对应任何禁用名（可能误删 payload 需要的文件）"
+        )
+
+    # (2) Every forbidden pattern has a covering rule in *each* bundle folder.
+    directories = {directory for directory, _ in _install_delete_names()}
+    assert directories, "没有任何清理规则"
+    for pattern in bundle_check.FORBIDDEN_DLL_PATTERNS:
+        wanted = pattern.casefold()
+        # ``icu*.dll`` is covered by the narrower explicit rules; treat a
+        # pattern as satisfied when a rule matches it *or* it is a superset of
+        # a rule (the narrower rule does the work).
+        covered = any(
+            _re.fullmatch(_inno_wildcard_to_regex(filename), wanted)
+            or _re.fullmatch(_re.escape(wanted).replace(r"\*", ".*"), filename.casefold())
+            for filename in rules
+        )
+        assert covered, f"禁用名 {pattern} 没有任何 InstallDelete 规则覆盖"
+    assert len(directories) == 2, f"两个 payload 目录都应各有一份规则，实为 {directories}"
+
+
+def test_the_upgrade_cleanup_targets_both_payload_folders() -> None:
+    """The main bundle and the native host bundle both carry ``_internal``.
+
+    Neither may be left out: the native host is a second ``--onedir`` tree with
+    its own ``_internal``, and it is the process Chrome starts - a poisoned copy
+    there breaks sign-in just as surely.
+    """
+
+    by_directory: dict[str, set[str]] = {}
+    for directory, filename in _install_delete_names():
+        by_directory.setdefault(directory.casefold(), set()).add(filename.casefold())
+
+    main = "{app}\\_internal".casefold()
+    host = "{app}\\native_host\\videodownloadernativehost\\_internal".casefold()
+
+    assert main in by_directory, "主 bundle 的 _internal 没有被清理"
+    assert host in by_directory, "原生消息宿主也有一份 _internal，必须一并清理"
+    # Same rules for both, so neither bundle can quietly fall behind.
+    assert by_directory[main] == by_directory[host], "两个 _internal 的清理规则必须一致"
+
+
+def test_the_upgrade_cleanup_never_deletes_what_the_payload_ships() -> None:
+    """The safety invariant: no cleanup rule may match a file we actually ship.
+
+    Proven the same way for both bundles: build a *representative* payload (the
+    files the build legitimately produces, plus a couple of names the forbidden
+    list must never hit) and assert no cleanup rule touches any of them. Doing
+    it against a synthetic tree rather than the on-disk ``dist/`` keeps the
+    test meaningful whatever state a developer's working copy is in - the same
+    reason ``check_bundle`` is exercised with ``tmp_path`` fixtures.
+    """
+
+    import fnmatch
+
+    # Names the payload really contains: the executable, the Qt/ICU-free
+    # runtime files, and - critically - files whose names merely *resemble* the
+    # forbidden set without matching it.
+    keep = (
+        "VideoDownloader.exe",
+        "PySide6/Qt6Core.dll",
+        "PySide6/MSVCP140.dll",
+        "python312.dll",
+        "libcrypto-3-x64.dll",  # Python's own OpenSSL - must survive
+        "icu.dll",  # the OS shim's name is *not* on the forbidden list
+        "ucrtbased.dll",  # the debug CRT is a different name
+        "api-ms-win-crt-runtime-l1-1-0.deps.json",  # not a .dll
+    )
+
+    for _directory, filename in _install_delete_names():
+        for relative in keep:
+            leaf = relative.rsplit("/", 1)[-1]
+            assert not fnmatch.fnmatch(leaf.casefold(), filename.casefold()), (
+                f"清理规则 {filename} 会命中产物自带的 {relative}"
+            )
+
+
+def test_the_upgrade_cleanup_never_touches_user_data_or_the_uninstaller() -> None:
+    """Scoped to the app folder, and blind to everything we must preserve."""
+
+    directives = _install_delete_lines()
+    body = "\n".join(directives).casefold()
+
+    # Never a per-user or system location.
+    assert "localappdata" not in body
+    assert "%" not in body
+    assert "{app}" in body
+
+    # Never the files that must survive an upgrade.
+    for protected in (".env", "unins"):
+        assert protected not in body, f"清理段不该清理 {protected}"
+
+    # And every entry is a plain ``Type: files`` - no directory nukes.
+    for line in directives:
+        assert "filesandordirs" not in line.casefold()

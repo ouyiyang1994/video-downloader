@@ -14,6 +14,20 @@
 ;   they live in %LOCALAPPDATA%\VideoDownloader anyway). The one exception is
 ;   the generated login-helper folder, see below.
 ;
+; Stale-DLL cleanup on upgrade
+; ----------------------------
+; [Files] only *adds and overwrites*; it never removes a file that a previous
+; version installed but the new one no longer ships. v1.31 shipped a broken
+; payload whose _internal\ carried an incompatible ICU 78 (via a PATH-polluted
+; build); the fixed package drops it, but an upgrade would leave those files
+; behind - and a leftover _internal\icuuc.dll shadows the system one, so Qt
+; refuses to load and the app dies at import with no log. [InstallDelete] below
+; is scoped to exactly ``{app}`` and to the specific filenames that must never
+; exist in a current payload (ICU, the UCRT, and the api-ms-win-* apiset
+; forwarders), verified against ``VideoDownloader.spec``/``check_bundle.py``
+; which now reject them at build time. It never touches .env, unins*.exe/dat,
+; user data, or anything outside the application folder.
+;
 ; The Chrome sign-in helper
 ; -------------------------
 ; ``recursesubdirs`` already carries the two folders the helper needs, and both
@@ -98,6 +112,27 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; \
     GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
+
+[InstallDelete]
+; Remove files a *previous* version may have installed into {app}\_internal that
+; the current payload must not contain. Scoped to the two _internal folders the
+; app owns; never touches {app}\.env, {app}\unins*.exe/dat, or user data (which
+; lives under %LOCALAPPDATA%). Kept in sync with packaging/VideoDownloader.spec
+; and packaging/check_bundle.py, whose forbidden-name lists drive this.
+;   * ICU: icuuc.dll / icuin.dll / icudt*.dll  (an out-of-tree ICU shadows the
+;     OS shim -> Qt fails to load).
+;   * ucrtbase.dll and the api-ms-win-* apiset forwarders: OS-owned, must come
+;     from System32, never from the app folder.
+Type: files; Name: "{app}\_internal\icuuc.dll"
+Type: files; Name: "{app}\_internal\icuin.dll"
+Type: files; Name: "{app}\_internal\icudt*.dll"
+Type: files; Name: "{app}\_internal\ucrtbase.dll"
+Type: files; Name: "{app}\_internal\api-ms-win-*.dll"
+Type: files; Name: "{app}\native_host\VideoDownloaderNativeHost\_internal\icuuc.dll"
+Type: files; Name: "{app}\native_host\VideoDownloaderNativeHost\_internal\icuin.dll"
+Type: files; Name: "{app}\native_host\VideoDownloaderNativeHost\_internal\icudt*.dll"
+Type: files; Name: "{app}\native_host\VideoDownloaderNativeHost\_internal\ucrtbase.dll"
+Type: files; Name: "{app}\native_host\VideoDownloaderNativeHost\_internal\api-ms-win-*.dll"
 
 [Files]
 ; Excludes is defence in depth: the staging folder is scanned before this runs.

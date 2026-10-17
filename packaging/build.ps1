@@ -70,6 +70,7 @@ $Spec = Join-Path $PackagingDir 'VideoDownloader.spec'
 $EnvTemplate = Join-Path $ProjectRoot '.env.example'
 $ReadmeFirst = Join-Path $PackagingDir 'README-FIRST.txt'
 $Scanner = Join-Path $PackagingDir 'scan_secrets.py'
+$BundleCheck = Join-Path $PackagingDir 'check_bundle.py'
 $NativeHostScript = Join-Path $PackagingDir 'build-native-host.ps1'
 $NativeHostOut = Join-Path $AppDir 'native_host'
 #: Kept under build\ on purpose: the host's PyInstaller workpath must not end
@@ -126,6 +127,40 @@ function Remove-BuildDirectory([string]$Path) {
     Remove-Item -LiteralPath (Resolve-Path -LiteralPath $Path).Path -Recurse -Force
 }
 
+#: Directories that must never be reachable while PyInstaller resolves DLL
+#: imports. They belong to unrelated runtimes that happen to also ship ICU,
+#: OpenSSL and UCRT. On 2026-10-16 one of these on PATH made PyInstaller bundle
+#: Poppler's ICU 78 in place of the Windows ICU shim Qt 6.11 needs, and every
+#: frozen v1.31 build died on ``import PySide6.QtCore`` before it could log.
+$DllPollutionMarkers = @('codex-runtimes', 'poppler', 'libheif')
+
+function Remove-DllPollutionFromPath {
+    <#
+    .SYNOPSIS
+        Drop DLL-polluting directories from PATH for the current process.
+    .NOTES
+        Only $env:PATH is touched (process scope). The user's persisted PATH is
+        never modified. A directory is dropped when any path segment matches
+        $DllPollutionMarkers, which is deliberately broad: relying on another
+        runtime's native libraries at build time is never correct here.
+    #>
+    $kept = New-Object System.Collections.Generic.List[string]
+    $removed = New-Object System.Collections.Generic.List[string]
+    foreach ($entry in ($env:PATH -split ';')) {
+        if (-not $entry) { continue }
+        $match = $false
+        foreach ($marker in $DllPollutionMarkers) {
+            if ($entry -match [regex]::Escape($marker)) { $match = $true; break }
+        }
+        if ($match) { $removed.Add($entry) } else { $kept.Add($entry) }
+    }
+    if ($removed.Count -gt 0) {
+        $env:PATH = ($kept -join ';')
+        Write-Warning "已从构建进程 PATH 中移除 $($removed.Count) 个可能污染 DLL 解析的目录："
+        foreach ($entry in $removed) { Write-Warning "  $entry" }
+    }
+}
+
 Write-Host "项目根目录: $ProjectRoot" -ForegroundColor Green
 Write-Host "控制台模式: $Console"
 
@@ -133,7 +168,7 @@ if (-not (Test-Path $Python)) {
     throw "找不到虚拟环境解释器: $Python  请先运行 uv sync"
 }
 
-Write-Step '1/8 同步依赖'
+Write-Step '1/9 同步依赖'
 $Uv = $null
 foreach ($candidate in @("$env:USERPROFILE\.local\bin\uv.exe", 'uv')) {
     if ($candidate -and (Get-Command $candidate -ErrorAction SilentlyContinue)) {
@@ -170,10 +205,10 @@ if (-not $hasPyInstaller) {
 }
 
 if ($SkipTests) {
-    Write-Step '2/8 跳过测试（-SkipTests）'
+    Write-Step '2/9 跳过测试（-SkipTests）'
 }
 else {
-    Write-Step '2/8 运行测试'
+    Write-Step '2/9 运行测试'
     # 独立的 basetemp + 关闭缓存插件：避免与沙箱进程早先创建的
     # %TEMP%\pytest-of-Maple 和 .pytest_cache 发生属主冲突。
     $testBase = Join-Path $env:TEMP ("vd-pytest-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -191,7 +226,7 @@ else {
     }
 }
 
-Write-Step '3/8 清理 build\ 与 dist\'
+Write-Step '3/9 清理 build\ 与 dist\'
 # Never delete a directory that still holds something without an explicit
 # confirmation: dist\ may hold a released installer, and a silent wipe is how a
 # working release disappears. -OutputRoot avoids the question entirely.
@@ -206,8 +241,12 @@ foreach ($dir in @($BuildDir, $DistDir)) {
     Remove-BuildDirectory $dir
 }
 
-Write-Step '4/8 运行 PyInstaller（--onedir）'
+Write-Step '4/9 运行 PyInstaller（--onedir）'
 $env:VIDEO_DOWNLOADER_CONSOLE = $Console
+# Resolve DLL imports from PySide6/Python only: an unrelated runtime's ICU or
+# OpenSSL on PATH gets bundled instead of the system copy, which bricks the
+# frozen app (see $DllPollutionMarkers). Scrub before PyInstaller starts.
+Remove-DllPollutionFromPath
 # 杀软实时扫描偶尔会短暂锁住刚生成的 exe（set_exe_build_timestamp 报
 # PermissionError），所以失败后清理再重试一次。
 $pyiArgs = @(
@@ -238,7 +277,7 @@ foreach ($attempt in 1, 2) {
 if (-not $built) { throw 'PyInstaller 未产出结果' }
 if (-not (Test-Path $AppDir)) { throw "未生成 $AppDir" }
 
-Write-Step '5/8 组装外部文件（.env.example / 说明 / ffmpeg / Chrome 登录助手）'
+Write-Step '5/9 组装外部文件（.env.example / 说明 / ffmpeg / Chrome 登录助手）'
 
 # .env 与 secrets\ 一律不放进 dist —— 那里可能有真实凭据。
 Copy-Item -LiteralPath $EnvTemplate -Destination $AppDir -Force
@@ -312,16 +351,24 @@ if (-not (Test-Path -LiteralPath $NativeHostExe)) {
 Write-Host "  已生成宿主程序：$NativeHostExe"
 
 if ($SkipSensitiveScan) {
-    Write-Step '6/8 跳过敏感信息扫描（-SkipSensitiveScan）'
+    Write-Step '6/9 跳过敏感信息扫描（-SkipSensitiveScan）'
 }
 else {
-    Write-Step '6/8 敏感信息扫描'
+    Write-Step '6/9 敏感信息扫描'
     Invoke-Native -Exe $Python -Arguments @(
         $Scanner, '--dist', $AppDir, '--project', $ProjectRoot
     ) -What '敏感信息扫描'
 }
 
-Write-Step '7/8 产物概览'
+Write-Step '7/9 打包产物检查（系统 DLL / 来源可信）'
+# Second gate, independent of the spec filter: a wrong ICU/OpenSSL/UCRT copy in
+# _internal\ shadows the system one and the frozen app fails on QtCore import
+# before it can write a log. Fail the build instead of shipping that.
+Invoke-Native -Exe $Python -Arguments @(
+    $BundleCheck, '--dist', $AppDir, '--build', $BuildDir
+) -What '打包产物检查'
+
+Write-Step '8/9 产物概览'
 $files = Get-ChildItem -LiteralPath $AppDir -Recurse -File
 $sum = ($files | Measure-Object -Property Length -Sum).Sum
 $sizeMb = [math]::Round($sum / 1MB, 1)
@@ -336,6 +383,6 @@ foreach ($entry in Get-ChildItem -LiteralPath $AppDir) {
     }
 }
 
-Write-Step '8/8 完成'
+Write-Step '9/9 完成'
 Write-Host "可分发目录: $AppDir" -ForegroundColor Green
 Write-Host '下一步：把整个 VideoDownloader 文件夹拷到用户可写的目录，双击 exe 验证。'

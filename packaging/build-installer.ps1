@@ -29,6 +29,7 @@ $OutDir = Join-Path $ProjectRoot 'dist\installer'
 $Python = Join-Path $ProjectRoot '.venv\Scripts\python.exe'
 $Script = Join-Path $PackagingDir 'installer.iss'
 $Scanner = Join-Path $PackagingDir 'scan_secrets.py'
+$BundleCheck = Join-Path $PackagingDir 'check_bundle.py'
 # The setup name carries the version (e.g. "video DL_1.03.exe"), so it is read
 # back from the compiler output instead of being duplicated here.
 
@@ -57,7 +58,7 @@ function Invoke-Native {
 
 Write-Host "项目根目录: $ProjectRoot" -ForegroundColor Green
 
-Write-Step '1/6 定位 Inno Setup 编译器'
+Write-Step '1/7 定位 Inno Setup 编译器'
 $Iscc = $null
 foreach ($candidate in @(
         'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
@@ -68,7 +69,7 @@ foreach ($candidate in @(
 if (-not $Iscc) { throw '找不到 ISCC.exe，请先安装 Inno Setup 6' }
 Write-Host "  $Iscc"
 
-Write-Step '2/6 检查待打包目录'
+Write-Step '2/7 检查待打包目录'
 if (-not (Test-Path $AppDir)) { throw "缺少 $AppDir，请先运行 build.ps1" }
 
 # installer.iss 用 recursesubdirs 把整个目录搬进 {app}，所以这里只确认
@@ -98,9 +99,9 @@ $files = Get-ChildItem -LiteralPath $AppDir -Recurse -File
 $sizeMb = [math]::Round((($files | Measure-Object -Property Length -Sum).Sum) / 1MB, 1)
 Write-Host ("  {0} 个文件, {1} MB" -f $files.Count, $sizeMb)
 
-Write-Step '3/6 打包含前的敏感信息检查'
+Write-Step '3/7 打包前的产物检查'
 if ($SkipScan) {
-    Write-Warning '  已跳过（-SkipScan）'
+    Write-Warning '  已跳过敏捷扫描（-SkipScan）'
 }
 else {
     Invoke-Native -Exe $Python -Arguments @($Scanner, '--dist', $AppDir, '--project', $ProjectRoot) `
@@ -123,7 +124,12 @@ else {
     Write-Host '  未发现 .env / cookies.txt / secrets / 数据库 / 日志'
 }
 
-Write-Step '4/6 编译安装包'
+# Last gate before Inno copies the folder: a wrong ICU/OpenSSL/UCRT in
+# _internal\ shadows the system copy and the installed app fails on start.
+Invoke-Native -Exe $Python -Arguments @($BundleCheck, '--dist', $AppDir) `
+    -What '打包产物检查（系统 DLL）'
+
+Write-Step '4/7 编译安装包'
 if (Test-Path -LiteralPath $OutDir) {
     $existingOutput = @(Get-ChildItem -LiteralPath $OutDir -Force -ErrorAction SilentlyContinue)
     if ($existingOutput.Count -gt 0 -and -not $OverwriteExisting) {
@@ -152,7 +158,7 @@ if (-not $setupFile) { throw "未生成安装包（$OutDir 下没有 .exe）" }
 $setup = $setupFile.FullName
 $setupMb = [math]::Round($setupFile.Length / 1MB, 1)
 
-Write-Step '5/6 安装包敏感信息扫描（补充手段）'
+Write-Step '5/7 安装包敏感信息扫描（补充手段）'
 if ($SkipScan) {
     Write-Warning '  已跳过（-SkipScan）'
 }
@@ -161,7 +167,7 @@ else {
         -What '安装包扫描'
 }
 
-Write-Step '6/6 完成'
+Write-Step '7/7 完成'
 Write-Host "安装包: $setup" -ForegroundColor Green
 Write-Host "大小: $setupMb MB"
 Write-Host "默认安装目录: C:\Program Files\VideoDownloader"
