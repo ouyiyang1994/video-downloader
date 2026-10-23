@@ -71,6 +71,7 @@ $EnvTemplate = Join-Path $ProjectRoot '.env.example'
 $ReadmeFirst = Join-Path $PackagingDir 'README-FIRST.txt'
 $Scanner = Join-Path $PackagingDir 'scan_secrets.py'
 $BundleCheck = Join-Path $PackagingDir 'check_bundle.py'
+$SelfTestRunner = Join-Path $PackagingDir 'self_test_frozen.py'
 $NativeHostScript = Join-Path $PackagingDir 'build-native-host.ps1'
 $NativeHostOut = Join-Path $AppDir 'native_host'
 #: Kept under build\ on purpose: the host's PyInstaller workpath must not end
@@ -108,6 +109,65 @@ function Invoke-Native {
     }
 }
 
+#: Proxy variables pytest must not inherit. ``Settings`` copies a proxy from the
+#: environment, so a host that exports one changes what the proxy tests observe
+#: and they fail for reasons that have nothing to do with the build. ``ci.yml``
+#: clears them for exactly this reason; doing it here keeps a local build and CI
+#: behaving identically.
+$ProxyEnvNames = @('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy')
+
+function Invoke-WithCleanProxyEnvironment {
+    <#
+    .SYNOPSIS
+        Run a block with the proxy variables removed, restoring them afterwards.
+    .NOTES
+        Process scope only, and restored in ``finally`` so a failing test run
+        cannot leak a modified environment into the rest of the build. A
+        variable that was absent before stays absent afterwards.
+
+        Uses the ``Env:`` provider to clear, and .NET to read and restore: in
+        this host ``Set-Item Env:`` silently fails and
+        ``[Environment]::SetEnvironmentVariable`` does not reach the provider,
+        so each direction uses the one that works. Clearing through the
+        provider is what the child process actually inherits - a build that
+        thinks it cleared a proxy while pytest still sees it would fail for the
+        wrong reason. Reading goes through .NET because a host that exports
+        both ``HTTP_PROXY`` and ``http_proxy`` makes ``Get-Item Env:`` report a
+        duplicate key.
+    #>
+    param([Parameter(Mandatory)][scriptblock]$Action)
+
+    # The four names are two logical variables on Windows (lookups ignore case),
+    # so they are deduplicated before saving. Without that, restoring
+    # ``HTTP_PROXY`` and then "removing" the absent ``http_proxy`` would delete
+    # the value that was just put back.
+    $savedNames = @()
+    $savedValues = @()
+    $seen = @{}
+    foreach ($name in $ProxyEnvNames) {
+        $key = $name.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $value = [Environment]::GetEnvironmentVariable($name)
+        if ($null -eq $value) { continue }  # the other casing may hold it
+        $seen[$key] = $true
+        $savedNames += $name
+        $savedValues += $value
+    }
+    foreach ($name in $ProxyEnvNames) {
+        Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+    }
+    try {
+        & $Action
+    }
+    finally {
+        for ($index = 0; $index -lt $savedNames.Count; $index++) {
+            [Environment]::SetEnvironmentVariable(
+                $savedNames[$index], $savedValues[$index], 'Process'
+            )
+        }
+    }
+}
+
 function Assert-SafeToRemove([string]$Path) {
     $resolved = (Resolve-Path -LiteralPath $Path).Path.TrimEnd('\', '/')
     $parent = Split-Path -Parent $resolved
@@ -127,38 +187,109 @@ function Remove-BuildDirectory([string]$Path) {
     Remove-Item -LiteralPath (Resolve-Path -LiteralPath $Path).Path -Recurse -Force
 }
 
-#: Directories that must never be reachable while PyInstaller resolves DLL
-#: imports. They belong to unrelated runtimes that happen to also ship ICU,
-#: OpenSSL and UCRT. On 2026-10-16 one of these on PATH made PyInstaller bundle
-#: Poppler's ICU 78 in place of the Windows ICU shim Qt 6.11 needs, and every
-#: frozen v1.31 build died on ``import PySide6.QtCore`` before it could log.
-$DllPollutionMarkers = @('codex-runtimes', 'poppler', 'libheif')
-
-function Remove-DllPollutionFromPath {
+#: The PATH a build is allowed to see. PyInstaller resolves a bare DLL import by
+#: walking PATH, so any directory that merely *contains* icuuc.dll,
+#: libssl-3-x64.dll or ucrtbase.dll can end up inside the bundle. That is how
+#: v1.31 shipped Poppler's ICU 78 and died on ``import PySide6.QtCore`` before
+#: it could write a log.
+#:
+#: A denylist of directory names can only ever cover the runtimes already met -
+#: codex-runtimes/poppler/libheif on the development machine, Temurin JDK and
+#: MySQL on the GitHub runner - so the rule is inverted: keep the few
+#: directories the build actually needs and drop everything else. An unknown
+#: runtime is then excluded by construction rather than by being named.
+function Get-TrustedPathEntries {
     <#
     .SYNOPSIS
-        Drop DLL-polluting directories from PATH for the current process.
+        The complete PATH the build is allowed to see.
     .NOTES
-        Only $env:PATH is touched (process scope). The user's persisted PATH is
-        never modified. A directory is dropped when any path segment matches
-        $DllPollutionMarkers, which is deliberately broad: relying on another
-        runtime's native libraries at build time is never correct here.
+        Every entry is derived from the environment (SystemRoot, the venv, the
+        interpreter's base install) instead of from a list of known-bad names.
+        Nonexistent directories are skipped, so a machine without uv still
+        builds.
     #>
-    $kept = New-Object System.Collections.Generic.List[string]
-    $removed = New-Object System.Collections.Generic.List[string]
+    $entries = New-Object System.Collections.Generic.List[string]
+    $seen = New-Object System.Collections.Generic.HashSet[string]
+
+    function Add-TrustedEntry([string]$Candidate) {
+        if (-not $Candidate) { return }
+        if (-not (Test-Path -LiteralPath $Candidate -PathType Container)) { return }
+        $resolved = (Resolve-Path -LiteralPath $Candidate).Path.TrimEnd('\')
+        if ($seen.Add($resolved.ToLowerInvariant())) {
+            $entries.Add($resolved)
+        }
+    }
+
+    # Windows' own DLLs. System32 must stay reachable: it holds the ICU shim,
+    # the UCRT and the apiset forwarders the frozen app loads at run time.
+    Add-TrustedEntry $env:SystemRoot
+    foreach ($name in @('System32', 'System32\Wbem', 'System32\WindowsPowerShell\v1.0')) {
+        Add-TrustedEntry (Join-Path $env:SystemRoot $name)
+    }
+
+    # The interpreter doing the packaging. ``Scripts`` has python.exe; the base
+    # install and its ``DLLs`` folder hold python3*.dll, libssl/libcrypto and
+    # sqlite3.dll - the exact files ``_ssl``/``_hashlib`` link against.
+    Add-TrustedEntry (Split-Path -Parent $Python)
+    Add-TrustedEntry $BasePython
+    Add-TrustedEntry (Join-Path $BasePython 'DLLs')
+
+    # uv, so a later step could still call it.
+    Add-TrustedEntry (Join-Path $env:USERPROFILE '.local\bin')
+
+    return $entries
+}
+
+function Set-BuildPath {
+    <#
+    .SYNOPSIS
+        Replace the process PATH with the trusted set.
+    .NOTES
+        Only $env:PATH is touched (process scope); the user's persisted PATH is
+        never modified. Every dropped entry is printed, so a machine that
+        genuinely needs another tool shows up in the build log instead of
+        failing three steps later.
+    #>
+    $trusted = Get-TrustedPathEntries
+    if ($trusted.Count -eq 0) {
+        throw '白名单 PATH 为空，拒绝继续构建'
+    }
+
+    $trustedKeys = @{}
+    foreach ($entry in $trusted) { $trustedKeys[$entry.ToLowerInvariant()] = $true }
+
+    $dropped = New-Object System.Collections.Generic.List[string]
     foreach ($entry in ($env:PATH -split ';')) {
         if (-not $entry) { continue }
-        $match = $false
-        foreach ($marker in $DllPollutionMarkers) {
-            if ($entry -match [regex]::Escape($marker)) { $match = $true; break }
-        }
-        if ($match) { $removed.Add($entry) } else { $kept.Add($entry) }
+        $normalised = $entry.TrimEnd('\').ToLowerInvariant()
+        if (-not $trustedKeys.ContainsKey($normalised)) { $dropped.Add($entry) }
     }
-    if ($removed.Count -gt 0) {
-        $env:PATH = ($kept -join ';')
-        Write-Warning "已从构建进程 PATH 中移除 $($removed.Count) 个可能污染 DLL 解析的目录："
-        foreach ($entry in $removed) { Write-Warning "  $entry" }
+
+    $env:PATH = ($trusted -join ';')
+    Write-Host "构建 PATH 已白名单化：保留 $($trusted.Count) 项，移除 $($dropped.Count) 项"
+    foreach ($entry in $trusted) { Write-Host "  [保留] $entry" }
+    foreach ($entry in $dropped) { Write-Host "  [移除] $entry" -ForegroundColor DarkGray }
+}
+
+function Assert-BuildPathTools {
+    <#
+    .SYNOPSIS
+        Prove the whitelist did not take a tool the build still needs.
+    .NOTES
+        PyInstaller, the secret scan, the bundle check and the frozen self-test
+        all run through $Python, so ``python`` has to resolve to *this*
+        virtualenv. A system Python that survived the scrub would silently use
+        a different site-packages tree.
+    #>
+    $command = Get-Command 'python' -ErrorAction SilentlyContinue
+    if (-not $command) {
+        throw '白名单 PATH 中找不到 python，后续 PyInstaller / 扫描步骤无法运行'
     }
+    $expected = (Resolve-Path -LiteralPath $Python).Path
+    if ($command.Source -ne $expected) {
+        throw "PATH 中的 python 不是本项目的虚拟环境：$($command.Source)（期望 $expected）"
+    }
+    Write-Host "  必需命令可用：python -> $expected"
 }
 
 Write-Host "项目根目录: $ProjectRoot" -ForegroundColor Green
@@ -168,7 +299,15 @@ if (-not (Test-Path $Python)) {
     throw "找不到虚拟环境解释器: $Python  请先运行 uv sync"
 }
 
-Write-Step '1/9 同步依赖'
+# The base install - not the venv - is where CPython keeps libssl/libcrypto and
+# the CRT it links against, so the PATH whitelist has to include it or
+# PyInstaller cannot resolve those imports at all.
+$BasePython = (& $Python -c 'import sys; print(sys.base_prefix)').Trim()
+if (-not $BasePython -or -not (Test-Path -LiteralPath $BasePython -PathType Container)) {
+    throw "无法确定 Python 基础安装目录（来自 $Python）"
+}
+
+Write-Step '1/10 同步依赖'
 $Uv = $null
 foreach ($candidate in @("$env:USERPROFILE\.local\bin\uv.exe", 'uv')) {
     if ($candidate -and (Get-Command $candidate -ErrorAction SilentlyContinue)) {
@@ -205,19 +344,25 @@ if (-not $hasPyInstaller) {
 }
 
 if ($SkipTests) {
-    Write-Step '2/9 跳过测试（-SkipTests）'
+    Write-Step '2/10 跳过测试（-SkipTests）'
 }
 else {
-    Write-Step '2/9 运行测试'
+    Write-Step '2/10 运行测试'
     # 独立的 basetemp + 关闭缓存插件：避免与沙箱进程早先创建的
     # %TEMP%\pytest-of-Maple 和 .pytest_cache 发生属主冲突。
     $testBase = Join-Path $env:TEMP ("vd-pytest-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
     try {
-        Invoke-Native -Exe $Python -Arguments @(
-            '-m', 'pytest', '-q',
-            '-p', 'no:cacheprovider',
-            '--basetemp', $testBase
-        ) -What 'pytest'
+        # Clear the proxy variables for the test run only: a host-exported
+        # proxy is picked up by Settings() and changes what the proxy tests
+        # observe. The guard restores them in its own finally, so a failing
+        # run still leaves the rest of the build with the caller's environment.
+        Invoke-WithCleanProxyEnvironment {
+            Invoke-Native -Exe $Python -Arguments @(
+                '-m', 'pytest', '-q',
+                '-p', 'no:cacheprovider',
+                '--basetemp', $testBase
+            ) -What 'pytest'
+        }
     }
     finally {
         if (Test-Path -LiteralPath $testBase) {
@@ -226,7 +371,7 @@ else {
     }
 }
 
-Write-Step '3/9 清理 build\ 与 dist\'
+Write-Step '3/10 清理 build\ 与 dist\'
 # Never delete a directory that still holds something without an explicit
 # confirmation: dist\ may hold a released installer, and a silent wipe is how a
 # working release disappears. -OutputRoot avoids the question entirely.
@@ -241,12 +386,14 @@ foreach ($dir in @($BuildDir, $DistDir)) {
     Remove-BuildDirectory $dir
 }
 
-Write-Step '4/9 运行 PyInstaller（--onedir）'
+Write-Step '4/10 运行 PyInstaller（--onedir）'
 $env:VIDEO_DOWNLOADER_CONSOLE = $Console
-# Resolve DLL imports from PySide6/Python only: an unrelated runtime's ICU or
-# OpenSSL on PATH gets bundled instead of the system copy, which bricks the
-# frozen app (see $DllPollutionMarkers). Scrub before PyInstaller starts.
-Remove-DllPollutionFromPath
+# Resolve DLL imports from System32 and the interpreter only. A whitelist
+# rather than a list of known-bad names: the polluter may be a runtime this
+# machine has never seen (the CI runner's is a JDK plus MySQL). Then prove the
+# scrub did not take python with it.
+Set-BuildPath
+Assert-BuildPathTools
 # 杀软实时扫描偶尔会短暂锁住刚生成的 exe（set_exe_build_timestamp 报
 # PermissionError），所以失败后清理再重试一次。
 $pyiArgs = @(
@@ -277,7 +424,7 @@ foreach ($attempt in 1, 2) {
 if (-not $built) { throw 'PyInstaller 未产出结果' }
 if (-not (Test-Path $AppDir)) { throw "未生成 $AppDir" }
 
-Write-Step '5/9 组装外部文件（.env.example / 说明 / ffmpeg / Chrome 登录助手）'
+Write-Step '5/10 组装外部文件（.env.example / 说明 / ffmpeg / Chrome 登录助手）'
 
 # .env 与 secrets\ 一律不放进 dist —— 那里可能有真实凭据。
 Copy-Item -LiteralPath $EnvTemplate -Destination $AppDir -Force
@@ -351,16 +498,16 @@ if (-not (Test-Path -LiteralPath $NativeHostExe)) {
 Write-Host "  已生成宿主程序：$NativeHostExe"
 
 if ($SkipSensitiveScan) {
-    Write-Step '6/9 跳过敏感信息扫描（-SkipSensitiveScan）'
+    Write-Step '6/10 跳过敏感信息扫描（-SkipSensitiveScan）'
 }
 else {
-    Write-Step '6/9 敏感信息扫描'
+    Write-Step '6/10 敏感信息扫描'
     Invoke-Native -Exe $Python -Arguments @(
         $Scanner, '--dist', $AppDir, '--project', $ProjectRoot
     ) -What '敏感信息扫描'
 }
 
-Write-Step '7/9 打包产物检查（系统 DLL / 来源可信）'
+Write-Step '7/10 打包产物检查（系统 DLL / 来源可信）'
 # Second gate, independent of the spec filter: a wrong ICU/OpenSSL/UCRT copy in
 # _internal\ shadows the system one and the frozen app fails on QtCore import
 # before it can write a log. Fail the build instead of shipping that.
@@ -368,7 +515,17 @@ Invoke-Native -Exe $Python -Arguments @(
     $BundleCheck, '--dist', $AppDir, '--build', $BuildDir
 ) -What '打包产物检查'
 
-Write-Step '8/9 产物概览'
+Write-Step '8/10 冻结版自检（Qt / OpenSSL / SQLite / yt-dlp）'
+# Third gate, and the only one that starts the program: the checks above only
+# look at files. The runner asserts exit code 2 *and* the dependency marker, so
+# a payload that cannot import a native library fails here instead of at a
+# user's first download. It also removes the .env/logs a first run leaves in
+# the staging folder, which the packaging scan would otherwise reject.
+Invoke-Native -Exe $Python -Arguments @(
+    $SelfTestRunner, '--exe', (Join-Path $AppDir 'VideoDownloader.exe'), '--clean-first-run'
+) -What '冻结版自检'
+
+Write-Step '9/10 产物概览'
 $files = Get-ChildItem -LiteralPath $AppDir -Recurse -File
 $sum = ($files | Measure-Object -Property Length -Sum).Sum
 $sizeMb = [math]::Round($sum / 1MB, 1)
@@ -383,6 +540,6 @@ foreach ($entry in Get-ChildItem -LiteralPath $AppDir) {
     }
 }
 
-Write-Step '9/9 完成'
+Write-Step '10/10 完成'
 Write-Host "可分发目录: $AppDir" -ForegroundColor Green
 Write-Host '下一步：把整个 VideoDownloader 文件夹拷到用户可写的目录，双击 exe 验证。'

@@ -14,12 +14,14 @@ Run with::
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 import sys
 import threading
 import traceback
 import types
 import webbrowser
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -3063,6 +3065,68 @@ class MainWindow(QMainWindow):
 
 SELF_TEST_FLAG = "--self-test"
 
+#: Modules a frozen build cannot work without. Each one is either backed by a
+#: native library (Qt, OpenSSL, SQLite) or imported lazily on the first
+#: download (``yt_dlp``), so a packaging mistake would otherwise stay invisible
+#: until a user hit it. ``selectolax``/``aiofiles``/``tenacity`` are declared in
+#: pyproject but never imported, so they are deliberately not listed.
+SELF_TEST_DEPENDENCIES: tuple[str, ...] = (
+    "PySide6.QtCore",
+    "PySide6.QtGui",
+    "PySide6.QtWidgets",
+    "asyncio",
+    "hashlib",
+    "httpx",
+    "pydantic",
+    "sqlite3",
+    "ssl",
+    "yt_dlp",
+)
+
+#: Exit code for "the frozen build could not load one of its runtime modules".
+#: Distinct from 2 - which means the build is healthy and the URL is simply
+#: unsupported - so a build script can tell a broken payload from the expected
+#: answer without parsing text.
+SELF_TEST_DEPENDENCY_FAILED = 3
+
+#: Marker printed only after every dependency imported successfully. Build
+#: scripts assert it, because an exit code alone cannot distinguish "all good"
+#: from "the check never ran".
+SELF_TEST_DEPS_OK = "[self-test] 依赖检查通过"
+
+
+def check_runtime_dependencies(
+    importer: Callable[[str], Any] = importlib.import_module,
+) -> list[str]:
+    """Import every module a frozen build needs and report each outcome.
+
+    Returns one line per dependency, either ``dep <name> ok`` or
+    ``dep <name> FAILED <type>: <message>``. A missing or mismatched native
+    library raises at import time, so this turns "the payload is broken" into a
+    build failure instead of a crash on a user's machine.
+
+    ``importer`` is a parameter so tests can simulate a broken module without
+    touching the real one.
+    """
+
+    lines: list[str] = []
+    for name in SELF_TEST_DEPENDENCIES:
+        try:
+            module = importer(name)
+        except Exception as error:  # noqa: BLE001 - a broken DLL can raise anything
+            lines.append(f"dep {name} FAILED {type(error).__name__}: {error}")
+            continue
+        if name == "ssl":
+            # The version string only exists once libssl/libcrypto really
+            # loaded, which is the exact failure this gate guards against.
+            # ``getattr`` keeps the probe itself from raising on a stub module.
+            version = getattr(module, "OPENSSL_VERSION", "")
+            detail = f" ({version})" if version else ""
+            lines.append(f"dep {name} ok{detail}")
+        else:
+            lines.append(f"dep {name} ok")
+    return lines
+
 
 def emit(text: str) -> None:
     """Write to stdout, falling back to the log file in a windowed build.
@@ -3226,6 +3290,19 @@ def _run_app(argv: list[str] | None) -> int:
     except ValueError as error:
         emit(str(error))
         return 2
+
+    if self_test is not None:
+        # Prove the payload before anything else runs. ``get_settings`` and the
+        # window both come later, so a missing native library stops here with a
+        # dedicated exit code instead of a half-started GUI.
+        report = check_runtime_dependencies()
+        for line in report:
+            emit(f"[self-test] {line}")
+        failed = [line for line in report if "FAILED" in line]
+        if failed:
+            emit(f"[self-test] 依赖检查失败：{len(failed)} 项无法加载")
+            return SELF_TEST_DEPENDENCY_FAILED
+        emit(f"{SELF_TEST_DEPS_OK}（{len(report)}/{len(SELF_TEST_DEPENDENCIES)}）")
 
     settings = get_settings()
     setup_logging(settings)

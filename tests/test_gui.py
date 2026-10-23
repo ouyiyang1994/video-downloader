@@ -747,6 +747,72 @@ def test_emit_survives_a_windowed_build_without_stdout(monkeypatch, capsys) -> N
     gui.emit("无控制台输出")  # must not raise AttributeError
 
 
+# --- runtime dependency probe ----------------------------------------------
+
+
+def test_check_runtime_dependencies_reports_every_module() -> None:
+    class _Ssl:
+        OPENSSL_VERSION = "OpenSSL 3.5.9"
+
+    def importer(name: str):
+        return _Ssl() if name == "ssl" else object()
+
+    lines = gui.check_runtime_dependencies(importer)
+
+    assert len(lines) == len(gui.SELF_TEST_DEPENDENCIES)
+    assert all("FAILED" not in line for line in lines)
+    # The version string only exists once libssl really loaded, which is what
+    # the build gate is looking for.
+    assert any("OpenSSL 3.5.9" in line for line in lines)
+
+
+def test_check_runtime_dependencies_names_the_module_that_failed() -> None:
+    def importer(name: str):
+        if name == "sqlite3":
+            raise ImportError("DLL load failed while importing _sqlite3")
+        return object()
+
+    lines = gui.check_runtime_dependencies(importer)
+
+    failed = [line for line in lines if "FAILED" in line]
+    assert failed == [
+        "dep sqlite3 FAILED ImportError: DLL load failed while importing _sqlite3"
+    ]
+
+
+def test_check_runtime_dependencies_covers_the_lazily_imported_engine() -> None:
+    """``yt_dlp`` is imported inside a function, so nothing else proves it ships."""
+
+    assert "yt_dlp" in gui.SELF_TEST_DEPENDENCIES
+    assert {"ssl", "sqlite3", "PySide6.QtCore"} <= set(gui.SELF_TEST_DEPENDENCIES)
+
+
+def test_the_dependency_failure_code_is_not_the_unsupported_url_code() -> None:
+    """A build script has to tell "payload broken" from "URL not supported"."""
+
+    assert gui.SELF_TEST_DEPENDENCY_FAILED == 3
+    assert gui.SELF_TEST_DEPENDENCY_FAILED != 2
+    assert "依赖检查通过" in gui.SELF_TEST_DEPS_OK
+
+
+def test_run_app_stops_with_its_own_code_when_a_dependency_is_missing(
+    monkeypatch, capsys
+) -> None:
+    """Exit 3 has to come back before settings or a window are touched."""
+
+    monkeypatch.setattr(gui, "parse_self_test", lambda argv: ("https://x", "best", False))
+    monkeypatch.setattr(
+        gui,
+        "check_runtime_dependencies",
+        lambda: ["dep ssl FAILED ImportError: DLL load failed"],
+    )
+
+    code = gui._run_app(["VideoDownloader.exe", "--self-test", "https://x"])
+
+    assert code == gui.SELF_TEST_DEPENDENCY_FAILED
+    assert "依赖检查失败" in capsys.readouterr().out
+
+
 # --- sign-in panel ----------------------------------------------------------
 
 

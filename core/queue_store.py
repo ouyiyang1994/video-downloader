@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS queue_items (
     title        TEXT,
     video_id     TEXT,
     state        TEXT    NOT NULL DEFAULT 'pending',
+    -- Orders concurrent writes: a row is only overwritten by one whose revision
+    -- is at least as new, so a slow snapshot cannot resurrect an older state.
+    state_rev    INTEGER NOT NULL DEFAULT 0,
     attempts     INTEGER NOT NULL DEFAULT 0,
     max_attempts INTEGER NOT NULL DEFAULT 2,
     position     INTEGER NOT NULL DEFAULT 0,
@@ -58,10 +61,22 @@ CREATE INDEX IF NOT EXISTS idx_queue_items_position ON queue_items(position);
 #: as. ``CREATE TABLE IF NOT EXISTS`` cannot introduce a column into a table
 #: that already exists, so a database written by an earlier build is brought
 #: forward here instead of failing on the first query.
-_ADDED_COLUMNS: dict[str, str] = {"output_dir": "TEXT", "video_id": "TEXT"}
+_ADDED_COLUMNS: dict[str, str] = {
+    "output_dir": "TEXT",
+    "video_id": "TEXT",
+    "state_rev": "INTEGER NOT NULL DEFAULT 0",
+}
 
 #: States that mean "this row still has work to do".
 UNFINISHED_STATES = ("pending", "running", "paused")
+
+#: States that mean "this row is finished" - the only ones :meth:`QueueStore.prune`
+#: may drop. Deliberately a whitelist rather than "not in UNFINISHED_STATES": a
+#: state written by a newer version (or edited by hand) is something this build
+#: cannot interpret, and silently deleting it after the retention window would
+#: throw away work the user still has. Kept in step with ``QueueState.finished``
+#: by tests/test_queue_store.py.
+FINISHED_STATES = ("completed", "skipped", "failed", "cancelled")
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -96,6 +111,10 @@ class QueueRow:
     #: Bilibili video share one bvid.
     video_id: str | None = None
     state: str = "pending"
+    #: Monotonic revision of ``state``. A write whose revision is older than the
+    #: stored one is ignored, which is what stops two threads from landing their
+    #: snapshots out of order.
+    state_rev: int = 0
     attempts: int = 0
     max_attempts: int = 2
     position: int = 0
@@ -219,6 +238,7 @@ class QueueStore:
             row.title,
             row.video_id,
             row.state,
+            row.state_rev,
             row.attempts,
             row.max_attempts,
             row.position,
@@ -234,16 +254,17 @@ class QueueStore:
                 connection.execute(
                     """
                     INSERT INTO queue_items (
-                        task_id, url, quality, title, video_id, state, attempts,
+                        task_id, url, quality, title, video_id, state, state_rev, attempts,
                         max_attempts, position, error, file_path, file_size,
                         output_dir, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(task_id) DO UPDATE SET
                         url          = excluded.url,
                         quality      = excluded.quality,
                         title        = excluded.title,
                         video_id     = excluded.video_id,
                         state        = excluded.state,
+                        state_rev    = excluded.state_rev,
                         attempts     = excluded.attempts,
                         max_attempts = excluded.max_attempts,
                         position     = excluded.position,
@@ -252,6 +273,7 @@ class QueueStore:
                         file_size    = excluded.file_size,
                         output_dir   = excluded.output_dir,
                         updated_at   = excluded.updated_at
+                    WHERE excluded.state_rev >= queue_items.state_rev
                     """,
                     payload,
                 )
@@ -266,29 +288,39 @@ class QueueStore:
             connection.commit()
 
     def delete_finished(self) -> int:
-        """Drop every row that is no longer pending. Returns how many went."""
+        """Drop every row in a *known* terminal state. Returns how many went.
+
+        Same whitelist as :meth:`prune`: "clear finished" must not reach into
+        rows this build cannot interpret, which never appeared in the listing
+        the user was looking at when they asked to clear it.
+        """
 
         connection = self.connect()
-        placeholders = ", ".join("?" for _ in UNFINISHED_STATES)
+        placeholders = ", ".join("?" for _ in FINISHED_STATES)
         with self._lock:
             cursor = connection.execute(
-                f"DELETE FROM queue_items WHERE state NOT IN ({placeholders})",
-                UNFINISHED_STATES,
+                f"DELETE FROM queue_items WHERE state IN ({placeholders})",
+                FINISHED_STATES,
             )
             connection.commit()
         return int(cursor.rowcount or 0)
 
     def prune(self, *, days: int = FINISHED_RETENTION_DAYS) -> int:
-        """Forget finished rows older than ``days``."""
+        """Forget finished rows older than ``days``.
+
+        Only known terminal states are eligible. A row whose state this build
+        does not recognise is kept: it may be real pending work written by a
+        newer version, and dropping it on a timer would be silent data loss.
+        """
 
         connection = self.connect()
         cutoff = _iso(datetime.now(UTC) - timedelta(days=days))
-        placeholders = ", ".join("?" for _ in UNFINISHED_STATES)
+        placeholders = ", ".join("?" for _ in FINISHED_STATES)
         with self._lock:
             cursor = connection.execute(
-                f"DELETE FROM queue_items WHERE state NOT IN ({placeholders}) "
+                f"DELETE FROM queue_items WHERE state IN ({placeholders}) "
                 "AND updated_at < ?",
-                (*UNFINISHED_STATES, cutoff),
+                (*FINISHED_STATES, cutoff),
             )
             connection.commit()
         return int(cursor.rowcount or 0)
@@ -303,6 +335,7 @@ class QueueStore:
             title=row["title"],
             video_id=row["video_id"],
             state=row["state"],
+            state_rev=int(row["state_rev"]),
             attempts=int(row["attempts"]),
             max_attempts=int(row["max_attempts"]),
             position=int(row["position"]),

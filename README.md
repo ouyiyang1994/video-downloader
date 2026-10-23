@@ -635,10 +635,10 @@ git push origin v1.03
 
 1. 校验 Tag 版本号与 `pyproject.toml`、`packaging/installer.iss`、`packaging/version_info.txt`、`uv.lock` 完全一致；
 2. 运行完整测试、代码风格 / 类型检查与敏感信息扫描；
-3. 在 Windows Runner 上用 PyInstaller 构建，再用 Inno Setup 生成安装包，并生成 Portable ZIP；
-4. 计算 SHA-256，创建 Release **`Video Downloader v1.03`**，上传 `VideoDownloader-1.03-Setup.exe` 与 `VideoDownloader-1.03-portable-win64.zip`。
+3. 在 Windows Runner 上用 PyInstaller 构建，启动冻结版程序做运行依赖自检，再用 Inno Setup 生成安装包并生成 Portable ZIP；
+4. 计算 SHA-256，创建 Release **`Video Downloader v1.03`**，上传 `VideoDownloader-1.03-Setup.exe`、`VideoDownloader-1.03-portable-win64.zip` 与 `SHA256SUMS.txt`。
 
-**任一环节失败都不会发布。** 测试失败、构建失败、打包失败、敏感信息扫描失败、版本号不一致、安装包或 Portable 包缺失，都会直接中止发布。
+**任一环节失败都不会发布。** 测试失败、构建失败、冻结版自检失败、打包失败、敏感信息扫描失败、校验文件缺失或与产物不符、版本号不一致，都会直接中止发布。
 
 > 普通 `push` 或 Pull Request **不会**创建 Release，只会跑 CI 测试。
 
@@ -648,12 +648,20 @@ git push origin v1.03
 
 **<https://github.com/ouyiyang1994/video-downloader/releases>**
 
-下载最新版本中的两个文件之一即可，二者都已内置 `ffmpeg` / `ffprobe`：
+下载最新版本中的两个安装文件之一即可，二者都已内置 `ffmpeg` / `ffprobe`
+（同页的 `SHA256SUMS.txt` 是校验文件，不是程序）：
 
 | 文件 | 适用人群 | 说明 |
 | --- | --- | --- |
 | `VideoDownloader-<版本>-Setup.exe` | 普通用户 | 双击安装，自动创建开始菜单与桌面快捷方式 |
-| `VideoDownloader-<版本>-portable-win64.zip` | 免安装用户 | 解压到任意可写目录，双击 `VideoDownloader.exe` 运行 |
+| `VideoDownloader-<版本>-portable-win64.zip` | 免安装用户 | 解压到**新目录**，双击 `VideoDownloader.exe` 运行（升级时不要覆盖旧目录，见下） |
+
+> **升级请勿覆盖旧目录。** 新版不再提供的文件（例如 `_internal\icuuc.dll`、
+> `_internal\ucrtbase.dll`）如果留在原目录，会遮蔽系统的同名 DLL，程序会**启动即退出**。
+>
+> - **安装包**：直接运行新版 Setup 覆盖安装即可 —— 安装程序会在复制文件前清理这类旧文件。
+> - **Portable**：请解压到**全新目录**，或先完整删除旧目录。**不要**把新包解压到旧目录上。
+>   注意 Portable 版的 `.env`、`downloads\`、`logs\` 就在程序目录内，删除旧目录前请先备份。
 
 > 直接下载源码（Code → Download ZIP）只会得到源代码，**无法直接运行**。
 

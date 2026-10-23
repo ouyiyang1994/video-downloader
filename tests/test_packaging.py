@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import sysconfig
 import textwrap
 from pathlib import Path
 
@@ -1476,20 +1477,276 @@ def test_the_spec_replaces_a_polluted_dll_with_the_interpreters_copy() -> None:
     )
 
 
-def test_the_build_script_scrubs_dll_pollution_from_path() -> None:
-    """A foreign runtime on PATH is what caused the whole incident."""
+def _load_spec_filters() -> dict[str, object]:
+    """Exec the spec's provenance helpers without running PyInstaller.
+
+    The spec is a build script, not an importable module, so the four functions
+    are sliced out and executed with only the names they use. That exercises the
+    real replacement/drop decisions instead of grepping for their text.
+    """
+
+    text = _spec_text()
+    start = text.index("def _trusted_binary_roots")
+    end = text.index("\n\na = Analysis(")
+    namespace: dict[str, object] = {
+        "Path": Path,
+        "sys": sys,
+        "sysconfig": sysconfig,
+        "print": print,
+    }
+    exec(compile(text[start:end], "<spec>", "exec"), namespace)
+    return namespace
+
+
+def test_the_spec_rescues_a_foreign_dll_the_interpreter_also_ships() -> None:
+    """Dropping MySQL's libssl outright would leave ``_ssl`` unimportable."""
+
+    filters = _load_spec_filters()
+    drop_foreign = filters["_drop_foreign_binaries"]
+
+    kept, dropped = drop_foreign(
+        [("libssl-3-x64.dll", r"D:\build-cache\mysql\libssl-3-x64.dll", "BINARY")]
+    )
+
+    assert [entry[0] for entry in kept] == ["libssl-3-x64.dll"]
+    # Nothing is dropped: the interpreter's copy takes the foreign entry's place.
+    assert dropped == []
+    replacement = kept[0][1].lower()
+    assert "build-cache" not in replacement, "必须换成解释器自带的副本"
+    assert replacement.startswith(str(Path(sys.base_prefix).resolve()).lower())
+
+
+def test_the_spec_drops_a_foreign_dll_with_no_trusted_copy() -> None:
+    """OS-owned names must come from System32, never from the app folder."""
+
+    filters = _load_spec_filters()
+    drop_foreign = filters["_drop_foreign_binaries"]
+
+    kept, dropped = drop_foreign(
+        [
+            ("ucrtbase.dll", r"D:\build-cache\jdk\ucrtbase.dll", "BINARY"),
+            (
+                "api-ms-win-core-file-l1-1-0.dll",
+                r"D:\build-cache\jdk\api-ms-win-core-file-l1-1-0.dll",
+                "BINARY",
+            ),
+        ]
+    )
+
+    assert kept == []
+    assert len(dropped) == 2
+
+
+def test_the_spec_keeps_a_dll_that_comes_from_the_interpreter() -> None:
+    filters = _load_spec_filters()
+    drop_foreign = filters["_drop_foreign_binaries"]
+    trusted_copy = Path(sys.base_prefix) / "DLLs" / "libssl-3-x64.dll"
+    if not trusted_copy.is_file():
+        pytest.skip("当前解释器不自带 libssl-3-x64.dll")
+
+    entry = ("libssl-3-x64.dll", str(trusted_copy), "BINARY")
+    kept, dropped = drop_foreign([entry])
+
+    assert kept == [entry]
+    assert dropped == []
+
+
+def _build_path_functions() -> str:
+    """The PATH-whitelist functions, taken from build.ps1 itself."""
+
+    script = _build_script_text()
+    return "\n\n".join(
+        _extract_powershell_block(script, f"function {name}")
+        for name in ("Get-TrustedPathEntries", "Set-BuildPath", "Assert-BuildPathTools")
+    )
+
+
+def _run_powershell_file(tmp_path: Path, body: str) -> subprocess.CompletedProcess[str]:
+    """Run a probe as a real ``.ps1`` file, UTF-8 with BOM.
+
+    A file instead of ``-Command`` keeps Chinese inside the extracted code off
+    the command line, where the console code page could mangle it - the same
+    trap this project already hit with BOM-less scripts.
+    """
+
+    interpreter = shutil.which("powershell") or shutil.which("pwsh")
+    assert interpreter, "构建脚本是 PowerShell，这个测试需要它的解释器"
+    script = tmp_path / "probe.ps1"
+    script.write_text(body, encoding="utf-8-sig", newline="\r\n")
+    return subprocess.run(
+        [
+            interpreter,
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=180,
+    )
+
+
+def test_the_build_script_uses_a_path_whitelist_not_a_name_denylist() -> None:
+    """Naming the polluter only ever covers the runtimes already met.
+
+    The development machine polluted with codex-runtimes/poppler/libheif; the
+    GitHub runner does it with a Temurin JDK and MySQL. A whitelist excludes
+    both, and any future one, without knowing their names.
+    """
 
     script = _build_script_text()
 
-    assert "function Remove-DllPollutionFromPath" in script
-    assert "$DllPollutionMarkers = @('codex-runtimes', 'poppler', 'libheif')" in script
-    # Called before PyInstaller starts, not after.
-    scrub = script.index("Remove-DllPollutionFromPath\n")
-    pyinstaller = script.index("$pyiArgs = @(")
-    assert scrub < pyinstaller
-    # Only the process PATH is touched - never the user's persisted one.
-    assert "$env:PATH = ($kept -join ';')" in script
-    assert "SetEnvironmentVariable" not in script
+    assert "$DllPollutionMarkers" not in script
+    assert "function Remove-DllPollutionFromPath" not in script
+    assert "function Get-TrustedPathEntries" in script
+    assert "function Set-BuildPath" in script
+    assert "$env:PATH = ($trusted -join ';')" in script
+    # Only process scope is touched - never the user's persisted environment.
+    # (The proxy guard does use SetEnvironmentVariable, but always with
+    # 'Process'; Machine/User would outlive the build.)
+    assert "'Machine'" not in script
+    assert "'User'" not in script
+    # The scrub runs before PyInstaller starts, not after.
+    assert script.index("\nSet-BuildPath\n") < script.index("$pyiArgs = @(")
+
+
+def test_the_build_path_whitelist_drops_unknown_directories(tmp_path: Path) -> None:
+    """The rule has to hold for a runtime nobody has named yet."""
+
+    unknown = tmp_path / "unheard-of-runtime" / "bin"
+    unknown.mkdir(parents=True)
+    venv_scripts = Path(sys.executable).resolve().parent
+    system32 = Path(os.environ["SYSTEMROOT"]) / "System32"
+    result_file = tmp_path / "path.txt"
+    body = "\n".join(
+        [
+            f"$Python = '{venv_scripts / 'python.exe'}'",
+            f"$BasePython = '{Path(sys.base_prefix).resolve()}'",
+            _build_path_functions(),
+            f"$env:PATH = '{system32};{unknown}'",
+            "Set-BuildPath",
+            f"[System.IO.File]::WriteAllText('{result_file}', $env:PATH)",
+        ]
+    )
+
+    completed = _run_powershell_file(tmp_path, body)
+
+    assert completed.returncode == 0, completed.stderr
+    entries = [
+        entry.lower()
+        for entry in result_file.read_text(encoding="utf-8").split(";")
+        if entry.strip()
+    ]
+    assert not any("unheard-of-runtime" in entry for entry in entries)
+    assert any(entry.endswith("system32") for entry in entries)
+    assert str(venv_scripts).lower() in entries
+
+
+def test_the_build_path_keeps_python_usable_after_scrubbing(tmp_path: Path) -> None:
+    """A whitelist that takes python with it would break every later step."""
+
+    unknown = tmp_path / "unrelated-runtime"
+    unknown.mkdir()
+    venv_python = Path(sys.executable).resolve()
+    result_file = tmp_path / "python.txt"
+    body = "\n".join(
+        [
+            f"$Python = '{venv_python}'",
+            f"$BasePython = '{Path(sys.base_prefix).resolve()}'",
+            _build_path_functions(),
+            f"$env:PATH = '{unknown}'",
+            "Set-BuildPath",
+            "Assert-BuildPathTools",
+            f"[System.IO.File]::WriteAllText('{result_file}', (Get-Command python).Source)",
+        ]
+    )
+
+    completed = _run_powershell_file(tmp_path, body)
+
+    assert completed.returncode == 0, completed.stderr
+    resolved = Path(result_file.read_text(encoding="utf-8").strip()).resolve()
+    assert str(resolved).lower() == str(venv_python).lower()
+
+
+def _proxy_guard_block() -> str:
+    """The proxy-clearing helper and its variable list, taken from build.ps1."""
+
+    script = _build_script_text()
+    names = next(
+        line for line in script.splitlines() if line.startswith("$ProxyEnvNames = ")
+    )
+    return names + "\n" + _extract_powershell_block(
+        script, "function Invoke-WithCleanProxyEnvironment"
+    )
+
+
+def test_the_build_script_clears_proxy_variables_around_pytest() -> None:
+    """A host-exported proxy would otherwise fail the proxy tests."""
+
+    script = _build_script_text()
+
+    assert "function Invoke-WithCleanProxyEnvironment" in script
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        assert f"'{name}'" in script
+
+    block = _extract_powershell_block(script, "function Invoke-WithCleanProxyEnvironment")
+    assert "finally {" in block, "变量必须在 finally 中恢复"
+    assert 'Remove-Item -LiteralPath "Env:$name"' in block
+    assert "[Environment]::SetEnvironmentVariable(" in block
+    # The four names are two logical variables on Windows; they must be
+    # deduplicated or restoring one casing deletes the other.
+    assert "$seen = @{}" in block
+    assert "ToLowerInvariant()" in block
+
+    # And it wraps the pytest call, not the whole build.
+    pytest_at = script.index("'-m', 'pytest'")
+    assert script.rindex("Invoke-WithCleanProxyEnvironment {", 0, pytest_at) > 0
+
+
+def test_the_proxy_guard_clears_and_restores_the_environment(tmp_path: Path) -> None:
+    inside = tmp_path / "inside.txt"
+    after = tmp_path / "after.txt"
+    after_fail = tmp_path / "after_fail.txt"
+    observed = (
+        '"[$($env:HTTP_PROXY)]|[$($env:https_proxy)]|[$($env:HTTPS_PROXY)]"'
+    )
+    body = "\n".join(
+        [
+            # Start from a known state: the parent may have proxies of its own.
+            "foreach ($n in @('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy')) {",
+            '  Remove-Item -LiteralPath "Env:$n" -ErrorAction SilentlyContinue',
+            "}",
+            # Set through .NET so the process block and the Env: provider agree
+            # (a provider-only assignment is not visible to .NET in every host).
+            # Only HTTP_PROXY is set: its lowercase twin staying absent is what
+            # catches a restore that deletes what it just put back.
+            "[Environment]::SetEnvironmentVariable("
+            "'HTTP_PROXY', 'http://127.0.0.1:9141', 'Process')",
+            _proxy_guard_block(),
+            "Invoke-WithCleanProxyEnvironment {",
+            f"  [System.IO.File]::WriteAllText('{inside}', {observed})",
+            "}",
+            f"[System.IO.File]::WriteAllText('{after}', {observed})",
+            "try { Invoke-WithCleanProxyEnvironment { throw 'boom' } } catch { }",
+            f"[System.IO.File]::WriteAllText('{after_fail}', \"[$($env:HTTP_PROXY)]\")",
+        ]
+    )
+
+    completed = _run_powershell_file(tmp_path, body)
+
+    assert completed.returncode == 0, completed.stderr
+    assert inside.read_text(encoding="utf-8") == "[]|[]|[]", "测试进程内不应看到代理变量"
+    assert after.read_text(encoding="utf-8") == (
+        "[http://127.0.0.1:9141]|[]|[]"
+    ), "必须恢复原值，且原本不存在的变量保持不存在"
+    assert after_fail.read_text(encoding="utf-8") == "[http://127.0.0.1:9141]", (
+        "失败路径也必须恢复原值"
+    )
 
 
 def test_the_build_script_runs_the_bundle_check() -> None:
@@ -1724,3 +1981,299 @@ def test_the_upgrade_cleanup_never_touches_user_data_or_the_uninstaller() -> Non
     # And every entry is a plain ``Type: files`` - no directory nukes.
     for line in directives:
         assert "filesandordirs" not in line.casefold()
+
+
+# --- frozen-build self test -------------------------------------------------
+
+SELF_TEST_RUNNER_PATH = (
+    Path(__file__).resolve().parent.parent / "packaging" / "self_test_frozen.py"
+)
+README_PATH = Path(__file__).resolve().parent.parent / "README.md"
+BUILD_WORKFLOW_PATH = (
+    Path(__file__).resolve().parent.parent / ".github" / "workflows" / "build.yml"
+)
+RELEASE_WORKFLOW_PATH = (
+    Path(__file__).resolve().parent.parent / ".github" / "workflows" / "release.yml"
+)
+RELEASE_NOTES_PATH = (
+    Path(__file__).resolve().parent.parent / "packaging" / "make_release_notes.py"
+)
+
+
+def _load_self_test_runner():
+    """Load packaging/self_test_frozen.py without importing a 'packaging' package."""
+
+    spec = importlib.util.spec_from_file_location(
+        "self_test_frozen_under_test", SELF_TEST_RUNNER_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_release_notes():
+    spec = importlib.util.spec_from_file_location(
+        "make_release_notes_under_test", RELEASE_NOTES_PATH
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+self_test_runner = _load_self_test_runner()
+
+
+def _payload_dir(tmp_path: Path) -> Path:
+    """A directory shaped like a PyInstaller ``--onedir`` payload."""
+
+    app = tmp_path / "VideoDownloader"
+    (app / "_internal").mkdir(parents=True)
+    (app / "VideoDownloader.exe").write_bytes(b"MZ")
+    return app
+
+
+def _stub_self_test(monkeypatch, result: tuple[int, str]) -> None:
+    monkeypatch.setattr(
+        self_test_runner, "run_self_test", lambda exe, timeout=None: result
+    )
+
+
+def test_the_self_test_runner_accepts_a_healthy_build(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = _payload_dir(tmp_path)
+    marker = self_test_runner.SUCCESS_MARKER
+    _stub_self_test(monkeypatch, (2, f"[self-test] dep ssl ok (OpenSSL 3.5.9)\n{marker}（10/10）"))
+
+    problems, removed, output = self_test_runner.verify(app / "VideoDownloader.exe")
+
+    assert problems == []
+    assert removed == []
+    assert marker in output
+
+
+def test_the_self_test_runner_rejects_a_wrong_exit_code(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Exit 1 is a crash; a build that "passes" with it would ship nothing."""
+
+    app = _payload_dir(tmp_path)
+    marker = self_test_runner.SUCCESS_MARKER
+    _stub_self_test(monkeypatch, (1, f"{marker}（10/10）"))
+
+    problems, _, _ = self_test_runner.verify(app / "VideoDownloader.exe")
+
+    assert any("退出码 1" in problem for problem in problems)
+
+
+def test_the_self_test_runner_requires_the_dependency_marker(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Exit 2 alone is not enough: the dependency probe has to have run."""
+
+    app = _payload_dir(tmp_path)
+    _stub_self_test(monkeypatch, (2, "[self-test] 平台识别失败: 暂不支持该平台"))
+
+    problems, _, _ = self_test_runner.verify(app / "VideoDownloader.exe")
+
+    assert any("不能只凭退出码" in problem for problem in problems)
+
+
+def test_the_self_test_runner_reports_a_dependency_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = _payload_dir(tmp_path)
+    failure = self_test_runner.FAILURE_MARKER
+    _stub_self_test(
+        monkeypatch,
+        (3, f"[self-test] dep ssl FAILED ImportError: DLL load failed\n{failure}：1 项无法加载"),
+    )
+
+    problems, _, _ = self_test_runner.verify(app / "VideoDownloader.exe")
+
+    assert any("依赖加载失败" in problem for problem in problems)
+    assert any("退出码 3" in problem for problem in problems)
+
+
+def test_the_self_test_runner_treats_a_timeout_as_a_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = _payload_dir(tmp_path)
+
+    def _timeout(exe, timeout=None):
+        raise subprocess.TimeoutExpired(cmd=str(exe), timeout=timeout or 1)
+
+    monkeypatch.setattr(self_test_runner, "run_self_test", _timeout)
+
+    problems, _, _ = self_test_runner.verify(app / "VideoDownloader.exe", timeout=1)
+
+    assert any("超时" in problem for problem in problems)
+
+
+def test_the_self_test_runner_removes_what_a_first_run_creates(
+    tmp_path: Path,
+) -> None:
+    """``.env``/``logs`` would make the packaging scan reject the folder."""
+
+    app = _payload_dir(tmp_path)
+    (app / ".env").write_text("PROXY=\n", encoding="utf-8")
+    (app / "logs").mkdir()
+    (app / "logs" / "downloader.log").write_text("x", encoding="utf-8")
+
+    removed = self_test_runner.remove_first_run_artefacts(app)
+
+    assert not (app / ".env").exists()
+    assert not (app / "logs").exists()
+    assert set(removed) == {".env", "logs/"}
+
+
+def test_the_self_test_runner_never_cleans_a_source_checkout(tmp_path: Path) -> None:
+    """In a checkout those same names are real user data, not first-run residue."""
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / ".env").write_text("SECRET=1", encoding="utf-8")
+
+    assert self_test_runner.remove_first_run_artefacts(checkout) == []
+    assert (checkout / ".env").is_file()
+
+
+def test_the_self_test_runner_leaves_user_data_alone_by_default(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Pointed at an installed folder, the gate must not delete the real .env."""
+
+    app = _payload_dir(tmp_path)
+    (app / ".env").write_text("PROXY=\n", encoding="utf-8")
+    _stub_self_test(monkeypatch, (2, self_test_runner.SUCCESS_MARKER))
+
+    _, removed, _ = self_test_runner.verify(app / "VideoDownloader.exe")
+
+    assert removed == []
+    assert (app / ".env").is_file()
+
+
+def test_the_self_test_runner_cleans_the_staging_folder_when_asked(
+    tmp_path: Path, monkeypatch
+) -> None:
+    app = _payload_dir(tmp_path)
+    (app / ".env").write_text("PROXY=\n", encoding="utf-8")
+    _stub_self_test(monkeypatch, (2, self_test_runner.SUCCESS_MARKER))
+
+    _, removed, _ = self_test_runner.verify(
+        app / "VideoDownloader.exe", clean_first_run=True
+    )
+
+    assert removed == [".env"]
+    assert not (app / ".env").exists()
+
+
+def test_the_build_script_runs_the_frozen_self_test() -> None:
+    """The gate must start the program, not just inspect the file list."""
+
+    script = _build_script_text()
+
+    assert "$SelfTestRunner = Join-Path $PackagingDir 'self_test_frozen.py'" in script
+    assert "冻结版自检" in script
+    assert "'--clean-first-run'" in script
+    bundle = script.index("$BundleCheck, '--dist', $AppDir, '--build', $BuildDir")
+    gate = script.index("$SelfTestRunner, '--exe'")
+    overview = script.index("产物概览")
+    assert bundle < gate < overview, "自检必须排在产物检查之后、产物概览之前"
+
+
+def test_the_ci_workflow_runs_the_frozen_self_test() -> None:
+    workflow = BUILD_WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    assert "packaging/self_test_frozen.py" in workflow
+    assert "--exe dist/VideoDownloader/VideoDownloader.exe" in workflow
+    assert "--clean-first-run" in workflow
+    build = workflow.index("Build with PyInstaller")
+    gate = workflow.index("Self-test the frozen application")
+    installer = workflow.index("Build installer")
+    assert build < gate < installer, "自检必须在 PyInstaller 之后、打安装包之前"
+
+
+def test_the_release_uploads_the_checksum_file_as_an_asset() -> None:
+    """Without it a user has to copy hashes out of the release notes by hand."""
+
+    workflow = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    assert '"release-assets/SHA256SUMS.txt"' in workflow
+    # One array feeds both publish paths, so the file ships on create *and* on
+    # a re-run that only uploads.
+    publish = workflow[workflow.index("Publish release") :]
+    assert 'gh release create "$TAG" "${flags[@]}" "${assets[@]}"' in publish
+    assert 'gh release upload "$TAG" "${assets[@]}" --clobber' in publish
+
+
+def test_the_release_verifies_checksums_before_publishing() -> None:
+    workflow = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    verify = workflow.index("Verify artefacts and checksums")
+    publish = workflow.index("Publish release")
+    assert verify < publish, "校验必须在发布之前"
+    assert "sha256sum -c SHA256SUMS.txt" in workflow
+    # The file has to name exactly the two binaries. `sha256sum -c` alone would
+    # pass a checksum file that omits the portable ZIP, publishing an asset
+    # nobody verified.
+    assert "awk 'NF { print $2 }'" in workflow
+    assert "tr -d '\\r' < release-assets/SHA256SUMS.txt" in workflow
+    assert "SHA256SUMS.txt 覆盖的文件与发布资产不一致" in workflow
+
+
+def test_the_release_ships_the_checksum_file_with_lf_endings() -> None:
+    """PowerShell writes CRLF; coreutils < 9 then looks for ``file.exe\\r``."""
+
+    workflow = RELEASE_WORKFLOW_PATH.read_text(encoding="utf-8")
+
+    normalise = workflow.index("SHA256SUMS.txt.lf")
+    verify = workflow.index("sha256sum -c SHA256SUMS.txt")
+    assert normalise < verify, "必须先规范行尾，再对将要发布的那份文件做校验"
+    assert "mv -f release-assets/SHA256SUMS.txt.lf" in workflow
+
+
+def test_the_release_notes_tell_users_about_the_checksum_file() -> None:
+    notes = _load_release_notes()
+
+    body = notes.render(
+        version="1.31",
+        reference="deadbeef",
+        sections={},
+        checksums=[("aa" * 32, "VideoDownloader-1.31-Setup.exe")],
+        setup_name="VideoDownloader-1.31-Setup.exe",
+        portable_name="VideoDownloader-1.31-portable-win64.zip",
+        build_os="Windows",
+        build_arch="x64",
+    )
+
+    assert "`SHA256SUMS.txt` 也随本 Release 提供" in body
+    assert "sha256sum -c SHA256SUMS.txt" in body
+
+
+def test_the_release_notes_tell_users_not_to_overwrite_the_old_folder() -> None:
+    notes = _load_release_notes()
+
+    body = notes.render(
+        version="1.31",
+        reference="deadbeef",
+        sections={},
+        checksums=[],
+        setup_name="VideoDownloader-1.31-Setup.exe",
+        portable_name="VideoDownloader-1.31-portable-win64.zip",
+        build_os="Windows",
+        build_arch="x64",
+    )
+
+    assert "## 升级说明" in body
+    assert "不要覆盖旧目录" in body
+    assert "全新目录" in body
+
+
+def test_the_readme_tells_users_not_to_overwrite_the_old_folder() -> None:
+    readme = README_PATH.read_text(encoding="utf-8")
+
+    assert "升级请勿覆盖旧目录" in readme
+    assert "全新目录" in readme

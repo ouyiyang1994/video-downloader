@@ -138,6 +138,11 @@ class QueueTask:
     #: 保存位置 field has always meant.
     output_dir: str | None = None
     state: QueueState = QueueState.PENDING
+    #: Monotonic revision of ``state``, bumped on every transition while the
+    #: queue lock is held. ``_persist`` sends it to the store, which ignores a
+    #: write whose revision is older than the one already stored - that is what
+    #: stops two threads from landing their snapshots out of order.
+    state_rev: int = 0
     attempts: int = 0
     max_attempts: int = 2
     position: int = 0
@@ -181,6 +186,17 @@ class QueueTask:
         if self.result is not None and self.result.video_path is not None:
             return str(self.result.video_path)
         return None
+
+    def advance_state(self, state: QueueState) -> None:
+        """Move to ``state`` and bump the revision that orders persisted writes.
+
+        Callers hold the queue lock, so revisions are handed out in the same
+        order the decisions were made. That is what makes an older snapshot
+        harmless even when its SQL reaches SQLite last.
+        """
+
+        self.state = state
+        self.state_rev += 1
 
     def update_progress(self, update: ProgressUpdate) -> None:
         """Called by the download core on the worker thread, about twice a second."""
@@ -236,6 +252,7 @@ class QueueTask:
             title=self.title,
             video_id=self.video_id,
             state=self.state.value,
+            state_rev=self.state_rev,
             attempts=self.attempts,
             max_attempts=self.max_attempts,
             position=self.position,
@@ -257,6 +274,7 @@ class QueueTask:
             video_id=row.video_id,
             output_dir=row.output_dir,
             state=QueueState(row.state),
+            state_rev=row.state_rev,
             attempts=row.attempts,
             max_attempts=row.max_attempts,
             position=row.position,
@@ -506,7 +524,7 @@ class DownloadQueue:
                 task.cancel_event.set()
                 persist = False
             else:
-                task.state = QueueState.PAUSED
+                task.advance_state(QueueState.PAUSED)
                 persist = True
             self._condition.notify_all()
         if persist:
@@ -515,40 +533,58 @@ class DownloadQueue:
         return True
 
     def resume(self, task_id: str) -> bool:
-        """Put a paused task back in the queue; the partial file makes it continue."""
+        """Put a paused task back in the queue; the partial file makes it continue.
 
-        task = self.get(task_id)
-        if task is None or task.state is not QueueState.PAUSED:
-            return False
-        task.pause_requested = False
-        task.cancel_event.clear()
-        task.not_before = 0.0
-        task.state = QueueState.PENDING
-        task.error = None
-        self._persist(task)
+        The transition is taken under the queue lock, like every other state
+        change: that is what hands out the revision that orders persisted
+        writes. A paused task cannot be claimed, so this is not the cancel race,
+        but the revision still has to be allocated in decision order.
+        """
+
         with self._condition:
+            task = self._tasks.get(task_id)
+            if task is None or task.state is not QueueState.PAUSED:
+                return False
+            task.pause_requested = False
+            task.cancel_event.clear()
+            task.not_before = 0.0
+            task.advance_state(QueueState.PENDING)
+            task.error = None
             self._condition.notify_all()
+        self._persist(task)
         logger.info("已继续队列任务 %s", task_id)
         return True
 
     def cancel(self, task_id: str) -> bool:
-        """Drop a task. Whatever it already downloaded is kept on disk."""
+        """Drop a task. Whatever it already downloaded is kept on disk.
 
-        task = self.get(task_id)
-        if task is None or task.state.finished:
-            return False
-        task.pause_requested = False
-        task.cancel_event.set()
-        if task.state is QueueState.RUNNING:
-            # Marked now; the worker will confirm when the transfer unwinds.
-            task.state = QueueState.CANCELLED
-            task.finished_at = _now()
-        else:
-            task.state = QueueState.CANCELLED
-            task.finished_at = _now()
-        self._persist(task)
+        The state is read, decided on and written inside one critical section -
+        the same rule :meth:`pause` follows, and it matters more here. A worker
+        claims a task by flipping it to ``RUNNING`` **and clearing its cancel
+        event** while holding this lock. A decision taken outside it can be
+        undone by a claim that lands in between: the event ``cancel()`` had just
+        raised would be cleared, the transfer would run to completion, and a
+        task the user cancelled would settle as ``completed`` - or, if the
+        process died first, come back as ``pending`` after a restart.
+
+        Persisting happens *after* the lock is released: it touches the disk,
+        and a slow write must not stall the workers waiting to schedule.
+        """
+
         with self._condition:
+            task = self._tasks.get(task_id)
+            if task is None or task.state.finished:
+                return False
+            task.pause_requested = False
+            task.cancel_event.set()
+            # A running task is marked now; the worker confirms when the
+            # transfer unwinds. The run token is deliberately *not* bumped -
+            # this run still owns the task, so its own conclusion (cancelled)
+            # is the one that lands.
+            task.advance_state(QueueState.CANCELLED)
+            task.finished_at = _now()
             self._condition.notify_all()
+        self._persist(task)
         logger.info("已取消队列任务 %s", task_id)
         return True
 
@@ -576,7 +612,7 @@ class DownloadQueue:
             # worker clears it when it claims the retried run.
             task.pause_requested = False
             task.not_before = 0.0
-            task.state = QueueState.PENDING
+            task.advance_state(QueueState.PENDING)
             task.finished_at = None
             self._condition.notify_all()
         self._persist(task)
@@ -630,8 +666,19 @@ class DownloadQueue:
         return None
 
     def _persist(self, task: QueueTask) -> None:
+        """Write the task's current state; the newest revision wins.
+
+        The row is snapshotted while holding the queue lock, so ``state`` and
+        ``state_rev`` always belong to the same decision. The write itself stays
+        outside the lock - it touches the disk - and ``QueueStore.upsert``
+        ignores a row whose revision is older than the stored one, so a slow
+        write cannot resurrect a state that a later transition replaced.
+        """
+
+        with self._lock:
+            row = task.to_row()
         try:
-            self.store.upsert(task.to_row())
+            self.store.upsert(row)
         except Exception:  # noqa: BLE001 - persistence must not kill a download
             logger.warning("写入队列记录失败（%s）", task.task_id, exc_info=True)
 
@@ -645,15 +692,33 @@ class DownloadQueue:
             logger.warning("读取队列记录失败，本次从空队列开始", exc_info=True)
             return
 
+        skipped = 0
         with self._lock:
             for row in rows:
                 if row.task_id in self._tasks:
                     continue  # already submitted in this session; leave it alone
-                task = QueueTask.from_row(row)
+                try:
+                    task = QueueTask.from_row(row)
+                except (TypeError, ValueError):
+                    # One unreadable row must not cost the user the whole queue.
+                    # A database written by a newer version (unknown state) or
+                    # edited by hand used to raise out of ``start()`` before a
+                    # single worker existed - and the window marks the queue as
+                    # started *before* calling it, so nothing retried and
+                    # nothing was shown. Skip the row, keep the rest, and leave
+                    # the record untouched so a newer version can still read it.
+                    skipped += 1
+                    logger.warning(
+                        "跳过无法恢复的队列记录 %s（state=%r）",
+                        row.task_id,
+                        row.state,
+                        exc_info=True,
+                    )
+                    continue
                 if task.state is QueueState.RUNNING:
                     # The process died mid-download. The .part file is still
                     # there, so re-queue rather than call it a failure.
-                    task.state = QueueState.PENDING
+                    task.advance_state(QueueState.PENDING)
                 # PAUSED is left paused: the user asked for it, and a restart is
                 # not a reason to overrule them.
                 if task.state is QueueState.PENDING:
@@ -661,6 +726,8 @@ class DownloadQueue:
                 self._tasks[task.task_id] = task
                 self._order.append(task.task_id)
         restored = sum(1 for task in self.tasks() if task.state is QueueState.PENDING)
+        if skipped:
+            logger.warning("已跳过 %d 条无法恢复的队列记录（记录本身保留）", skipped)
         if restored:
             logger.info("已从数据库恢复 %d 个未完成任务", restored)
 
@@ -694,7 +761,7 @@ class DownloadQueue:
                 if task is None:
                     continue
                 self._active += 1
-                task.state = QueueState.RUNNING
+                task.advance_state(QueueState.RUNNING)
                 task.attempts += 1
                 # Claiming the task starts a new run, and only that run may
                 # write the task's conclusion. ``claimed`` keeps the task out of
@@ -833,7 +900,7 @@ class DownloadQueue:
         with self._condition:
             stale = not self._owns_run(task, token)
             if not stale:
-                task.state = state
+                task.advance_state(state)
                 task.error = error
                 if not_before is not None:
                     task.not_before = not_before

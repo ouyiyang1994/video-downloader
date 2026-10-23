@@ -53,6 +53,19 @@ COMPLIANCE_NOTE = (
     "无法公开访问的内容会直接报错退出。请遵守当地法律与各平台服务条款。"
 )
 
+#: Shown in every release: the one upgrade mistake that breaks startup. A
+#: previous version's ``_internal\icuuc.dll`` / ``ucrtbase.dll`` survives an
+#: over-extraction and shadows the system copy, so the app exits before it can
+#: even write a log. The installer deletes those names before copying; the
+#: portable ZIP cannot, because extracting over a folder is a plain file copy.
+UPGRADE_NOTE = (
+    "**升级时不要覆盖旧目录。** 新版不再提供的文件（例如 `_internal\\icuuc.dll`、"
+    "`_internal\\ucrtbase.dll`）如果留在原目录，会遮蔽系统的同名 DLL，程序将**启动即退出**。"
+    "安装包会在复制文件前清理这类旧文件，直接运行新版 Setup 即可；"
+    "Portable 版请解压到**全新目录**，或先完整删除旧目录，**不要**覆盖解压。"
+    "Portable 的 `.env` 与 `downloads\\` 就在程序目录内，删除前请先备份。"
+)
+
 
 def use_utf8_output() -> None:
     """Make the Chinese diagnostics safe on a legacy Windows code page."""
@@ -176,6 +189,10 @@ def render(
         "",
         "> 系统要求：Windows 10 / 11（x64）。两者均已内置 `ffmpeg` / `ffprobe`，无需另行安装。",
         "",
+        "## 升级说明",
+        "",
+        UPGRADE_NOTE,
+        "",
     ]
 
     for section in SECTION_ORDER:
@@ -197,7 +214,16 @@ def render(
         lines.extend(f"{digest}  {name}" for name, digest in checksums)
     else:
         lines.append("（未生成校验文件）")
-    lines.extend(["```", ""])
+    lines.extend(
+        [
+            "```",
+            "",
+            "`SHA256SUMS.txt` 也随本 Release 提供：下载后在同一目录执行 "
+            "`sha256sum -c SHA256SUMS.txt` 即可机器校验（Windows 可用 "
+            "`Get-FileHash` 对照上表）。",
+            "",
+        ]
+    )
 
     lines.extend(["## 合规声明", "", COMPLIANCE_NOTE, ""])
 

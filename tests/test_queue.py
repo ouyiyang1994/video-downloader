@@ -7,6 +7,7 @@ what a restart rebuilds - not the HTTP engine, which has its own tests.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -443,6 +444,141 @@ def test_cancel_stops_a_running_task(queues: Callable[..., DownloadQueue]) -> No
     _wait_until(lambda: task.state is QueueState.CANCELLED, message="任务未被取消")
 
 
+class _BlockingSetEvent(threading.Event):
+    """An event whose ``set()`` blocks once, to force the claim interleaving.
+
+    It reproduces the exact window ``cancel()`` used to leave open: the cancel
+    flag is raised, but the task's state has not been written yet. The hook runs
+    inside ``cancel()``, so a correct implementation still holds the queue lock
+    while it blocks and a worker cannot claim the task in the meantime.
+    """
+
+    def __init__(self, during: Callable[[], None]) -> None:
+        super().__init__()
+        self._during = during
+        self.entered = threading.Event()
+
+    def set(self) -> None:
+        super().set()
+        self.entered.set()
+        self._during()
+
+
+def test_a_worker_claim_cannot_undo_a_cancel(
+    queues: Callable[..., DownloadQueue],
+) -> None:
+    """Cancel raises the flag, then a worker gets the chance to claim.
+
+    Without the lock the claim's ``cancel_event.clear()`` wipes the signal, the
+    transfer runs to completion and the task settles as ``completed``. With it,
+    the claim cannot happen until the cancel has written the state, so the task
+    is never handed out at all.
+    """
+
+    fake = FakeDownload()
+    fake.gate = threading.Event()
+    queue = queues(fake)
+    queue.set_max_concurrent(1)
+    queue.start()
+
+    blocker = queue.submit(URL)
+    _wait_until(lambda: blocker.state is QueueState.RUNNING, message="第一个任务未开始")
+    # The only slot is taken, so this one has to stay pending.
+    target = queue.submit(URL + "?second")
+
+    def free_the_slot_and_look_again() -> None:
+        # Hand the slot back, then give the worker a real chance to claim the
+        # target while cancel is still deciding. This is the interleaving.
+        fake.gate.set()
+        time.sleep(0.2)
+
+    event = _BlockingSetEvent(free_the_slot_and_look_again)
+    target.cancel_event = event
+
+    canceller = threading.Thread(target=queue.cancel, args=(target.task_id,))
+    canceller.start()
+    assert event.entered.wait(5), "cancel() 没有走到设置取消标志那一步"
+    canceller.join(10)
+    assert not canceller.is_alive(), "cancel() 没有在限期内返回"
+
+    assert target.state is QueueState.CANCELLED
+    assert target.task_id not in fake.calls, "已取消的任务被 worker 认领并执行了"
+
+
+def test_a_cancelled_waiting_task_is_stored_as_cancelled(
+    queues: Callable[..., DownloadQueue],
+) -> None:
+    """The row has to say cancelled, or a restart would re-queue the task."""
+
+    fake = FakeDownload()
+    fake.gate = threading.Event()
+    queue = queues(fake)
+    queue.set_max_concurrent(1)
+    queue.start()
+
+    blocker = queue.submit(URL)
+    _wait_until(lambda: blocker.state is QueueState.RUNNING, message="第一个任务未开始")
+    target = queue.submit(URL + "?second")
+
+    assert queue.cancel(target.task_id) is True
+
+    rows = {row.task_id: row for row in queue.store.load_all()}
+    assert rows[target.task_id].state == "cancelled", "取消状态没有落盘"
+
+
+def test_cancelling_a_running_task_is_stored_as_cancelled(
+    queues: Callable[..., DownloadQueue],
+) -> None:
+    fake = FakeDownload()
+    fake.gate = threading.Event()
+    queue = queues(fake)
+    queue.start()
+    task = queue.submit(URL)
+    _wait_until(lambda: task.state is QueueState.RUNNING)
+
+    assert queue.cancel(task.task_id) is True
+    _wait_until(lambda: task.state is QueueState.CANCELLED)
+    # The worker writes the row again when the transfer unwinds; wait for it to
+    # let go, otherwise the assertion races that final persist.
+    _wait_until(lambda: not task.claimed, message="worker 没有释放已取消的任务")
+
+    rows = {row.task_id: row for row in queue.store.load_all()}
+    assert rows[task.task_id].state == "cancelled"
+
+
+def test_a_cancelled_task_does_not_come_back_after_a_restart(
+    queues: Callable[..., DownloadQueue],
+) -> None:
+    """A cancelled row must not be restored as pending work."""
+
+    fake = FakeDownload()
+    fake.gate = threading.Event()
+    first = queues(fake)
+    first.set_max_concurrent(1)
+    first.start()
+
+    blocker = first.submit(URL)
+    _wait_until(lambda: blocker.state is QueueState.RUNNING, message="第一个任务未开始")
+    target = first.submit(URL + "?second")
+    assert first.cancel(target.task_id) is True
+    first.stop()
+
+    second_fake = FakeDownload()
+    second = queues(second_fake)
+    second.start()
+
+    # Finished rows are still loaded so the window can list them - what must not
+    # happen is the cancelled one coming back as work.
+    restored = second.get(target.task_id)
+    assert restored is not None, "已完成/已取消的行仍应加载用于展示"
+    assert restored.state is QueueState.CANCELLED, "已取消的任务在重启后被改回可执行状态"
+    # Sanity: restore itself still works - the interrupted task comes back.
+    _wait_until(
+        lambda: blocker.task_id in second_fake.calls, message="未完成任务没有被恢复"
+    )
+    assert target.task_id not in second_fake.calls
+
+
 def test_pausing_a_finished_task_is_refused(queues: Callable[..., DownloadQueue]) -> None:
     queue = queues(FakeDownload())
     queue.start()
@@ -822,6 +958,59 @@ def test_a_row_left_running_comes_back_as_pending(
     assert task is not None
     _wait_until(lambda: task.state.finished, message="中断的任务未被重新执行")
     assert task.attempts == 2, "重试次数应当延续，而不是从零开始"
+
+
+@pytest.mark.parametrize("bad_state", ["verifying", "", "PENDING "])
+def test_an_unreadable_row_does_not_take_the_whole_queue_down(
+    settings: Settings, queues: Callable[..., DownloadQueue], bad_state: str
+) -> None:
+    """A row the current version cannot interpret must not abort ``start()``.
+
+    ``QueueState(row.state)`` raises on anything it does not know - a state a
+    newer version wrote, or a value a user edited by hand. ``start()`` used to
+    let that escape, and the window flags the queue as started *before* calling
+    it, so the session ended up with no workers, an empty queue and no retry.
+    """
+
+    with QueueStore(settings) as store:
+        store.upsert(
+            QueueRow(task_id="from-the-future", url=URL, state=bad_state, position=0)
+        )
+        store.upsert(
+            QueueRow(task_id="normal", url=f"{URL}&p=2", state="pending", position=1)
+        )
+
+    fake = FakeDownload()
+    queue = queues(fake)
+    queue.start()  # must not raise
+
+    assert queue.get("from-the-future") is None, "无法解析的记录不应进入队列"
+    _wait_until(lambda: "normal" in fake.calls, message="一条坏记录拖垮了其余任务的恢复")
+
+    with QueueStore(settings) as store:
+        kept = {row.task_id: row for row in store.load_all()}
+    assert kept["from-the-future"].state == bad_state, "跳过的记录必须原样保留，不能删改"
+
+
+def test_a_skipped_row_is_reported_in_the_log(
+    settings: Settings,
+    queues: Callable[..., DownloadQueue],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Silently dropping work would be worse than the crash it replaces."""
+
+    with QueueStore(settings) as store:
+        store.upsert(
+            QueueRow(task_id="weird-row", url=URL, state="verifying", position=0)
+        )
+
+    queue = queues(FakeDownload())
+    with caplog.at_level(logging.WARNING, logger="core.queue"):
+        queue.start()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("weird-row" in message for message in messages), "跳过的记录必须留日志"
+    assert any("无法恢复" in message for message in messages), "必须说明跳过原因"
 
 
 def test_finished_rows_are_loaded_for_display_only(
@@ -1266,6 +1455,72 @@ def test_stopping_while_a_retried_task_is_still_held_keeps_it_pending(
     restored = resumed.get(task.task_id)
     assert restored is not None, "重启后没有恢复任务"
     _wait_until(lambda: restored.state is QueueState.COMPLETED, message="重启后没有继续下载")
+
+
+def test_a_stale_write_cannot_overwrite_a_retry(
+    queues: Callable[..., DownloadQueue], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cancel that precedes a retry must not land after it.
+
+    ``_persist`` snapshots a row and then writes it, so two threads can reach
+    SQLite in the opposite order. This test forces that order: the cancelled
+    row is held before its write while the retry stores the newer one. The
+    revision guard must drop the stale write - without it the row would come
+    back as ``cancelled`` after a restart and the task would never run again.
+    """
+
+    release = threading.Event()
+
+    def executor(task, progress: dict, cancel_event: threading.Event) -> DownloadResult:
+        # Deliberately ignores the cancel event: the run has to stay claimed,
+        # otherwise a worker could claim the retried task and write ``running``
+        # between the retry and the assertion below.
+        release.wait(10)
+        return _completed_result()
+
+    queue = queues(executor)
+    queue.set_max_concurrent(1)
+    queue.start()
+
+    task = queue.submit(URL)
+    _wait_until(lambda: task.state is QueueState.RUNNING, message="任务未开始")
+
+    holding = threading.Event()
+    blocked = threading.Event()
+    original = QueueStore.upsert
+
+    def upsert(self, row: QueueRow) -> None:
+        # Block the stale snapshot *before* it reaches the store lock, so the
+        # retry's newer row is definitely written first.
+        if row.state == "cancelled" and not holding.is_set():
+            blocked.set()
+            holding.wait(5)
+        return original(self, row)
+
+    monkeypatch.setattr(QueueStore, "upsert", upsert)
+
+    canceller = threading.Thread(target=queue.cancel, args=(task.task_id,))
+    canceller.start()
+    assert blocked.wait(5), "cancel 的持久化没有被拦住"
+    assert queue.retry(task.task_id) is True, "取消后应允许重试"
+    holding.set()
+    canceller.join(10)
+    assert not canceller.is_alive()
+
+    rows = {row.task_id: row for row in queue.store.load_all()}
+    assert rows[task.task_id].state == "pending", "旧状态覆盖了重试结果"
+
+    # Stop first, then let the blocked transfer return: the shutdown keeps the
+    # worker from claiming the retried task in the meantime.
+    queue.stop()
+    release.set()
+
+    second_fake = FakeDownload()
+    second = queues(second_fake)
+    second.start()
+    _wait_until(
+        lambda: task.task_id in second_fake.calls, message="重启后任务没有继续执行"
+    )
 
 
 def test_cancelling_exactly_as_the_run_completes_keeps_the_completion(

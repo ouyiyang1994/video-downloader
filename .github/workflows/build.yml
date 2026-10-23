@@ -159,6 +159,16 @@ jobs:
       - name: Build with PyInstaller
         run: ./packaging/build.ps1 -Console false -SkipTests
 
+      # Starts the frozen program, not just the files. The runner asserts exit
+      # code 2 *and* the dependency marker, so a payload that cannot import Qt,
+      # OpenSSL, SQLite or yt-dlp fails the release here instead of at a user's
+      # first download. It also deletes the .env/logs a first run leaves in the
+      # staging folder, which the packaging scan below would reject.
+      - name: Self-test the frozen application
+        run: |
+          uv run --no-sync python packaging/self_test_frozen.py `
+            --exe dist/VideoDownloader/VideoDownloader.exe --clean-first-run
+
       - name: Verify the login helper is in the bundle
         run: |
           $ErrorActionPreference = 'Stop'

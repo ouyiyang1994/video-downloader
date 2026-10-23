@@ -124,6 +124,29 @@ jobs:
               exit 1
             fi
           done
+          # Normalise line endings before anything reads the file. The build
+          # writes it with PowerShell on Windows, which emits CRLF; `sha256sum
+          # -c` on coreutils < 9 (Ubuntu 22.04 and older, macOS) then treats the
+          # trailing CR as part of the file name and reports every entry as
+          # missing. The asset exists for exactly that command, so it ships LF.
+          # Unconditional: rewriting an already-LF file changes nothing, and a
+          # `grep '\r'` guard is unreliable across shells.
+          tr -d '\r' < release-assets/SHA256SUMS.txt > release-assets/SHA256SUMS.txt.lf
+          mv -f release-assets/SHA256SUMS.txt.lf release-assets/SHA256SUMS.txt
+          # The checksum file must cover exactly the two binaries that ship.
+          # `sha256sum -c` alone would pass a file that lists only the Setup,
+          # leaving the portable ZIP published but unverified.
+          expected=$(printf '%s\n' "$SETUP_NAME" "$PORTABLE_NAME" | sort)
+          actual=$(tr -d '\r' < release-assets/SHA256SUMS.txt \
+            | awk 'NF { print $2 }' | sed 's/^\*//' | sort)
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::SHA256SUMS.txt 覆盖的文件与发布资产不一致，放弃发布"
+            echo "期望："
+            echo "$expected"
+            echo "实际："
+            echo "$actual"
+            exit 1
+          fi
           ( cd release-assets && sha256sum -c SHA256SUMS.txt )
 
       - name: Generate release notes
@@ -152,7 +175,13 @@ jobs:
         run: |
           set -euo pipefail
           title="Video Downloader $TAG"
-          assets=("release-assets/$SETUP_NAME" "release-assets/$PORTABLE_NAME")
+          # The checksum file ships as an asset too: it is the only way a user
+          # can run `sha256sum -c` instead of copying hashes out of the notes.
+          assets=(
+            "release-assets/$SETUP_NAME"
+            "release-assets/$PORTABLE_NAME"
+            "release-assets/SHA256SUMS.txt"
+          )
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             # Re-running a failed job must be idempotent, not an error.

@@ -10,8 +10,16 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from config.settings import Settings
-from core.queue_store import QueueRow, QueueStore
+from core.queue import QueueState
+from core.queue_store import (
+    FINISHED_STATES,
+    UNFINISHED_STATES,
+    QueueRow,
+    QueueStore,
+)
 
 
 def _row(task_id: str, url: str, **overrides: object) -> QueueRow:
@@ -150,6 +158,22 @@ def test_delete_finished_keeps_the_pending_work(settings: Settings) -> None:
     assert remaining == ["a"]
 
 
+def test_delete_finished_keeps_a_row_it_cannot_read(settings: Settings) -> None:
+    """Clearing the list must not reach rows that were never in the list."""
+
+    store = QueueStore(settings)
+    try:
+        store.upsert(_row("future", "u1", position=1, state="verifying"))
+        store.upsert(_row("done", "u2", position=2, state="completed"))
+        removed = store.delete_finished()
+        remaining = [row.task_id for row in store.load_all()]
+    finally:
+        store.close()
+
+    assert removed == 1
+    assert remaining == ["future"]
+
+
 def test_prune_forgets_old_finished_rows_only(settings: Settings) -> None:
     store = QueueStore(settings)
     old = datetime.now(UTC) - timedelta(days=30)
@@ -164,6 +188,93 @@ def test_prune_forgets_old_finished_rows_only(settings: Settings) -> None:
 
     assert removed == 1
     assert sorted(remaining) == ["new", "pending"]
+
+
+@pytest.mark.parametrize("state", ["verifying", "", "PENDING"])
+def test_prune_keeps_a_row_whose_state_it_cannot_read(
+    settings: Settings, state: str
+) -> None:
+    """A state this build does not know must never be treated as "finished".
+
+    ``prune`` used to delete everything outside ``UNFINISHED_STATES``, so a row
+    written by a newer version (or edited by hand) was silently dropped after
+    the retention window - exactly the work the user would want to keep.
+    """
+
+    store = QueueStore(settings)
+    old = datetime.now(UTC) - timedelta(days=30)
+    try:
+        store.upsert(_row("future", "u1", position=1, state=state, updated_at=old))
+        removed = store.prune(days=7)
+        remaining = [row.task_id for row in store.load_all()]
+    finally:
+        store.close()
+
+    assert removed == 0, "无法解析的状态不能被自动清理"
+    assert remaining == ["future"]
+
+
+@pytest.mark.parametrize("state", FINISHED_STATES)
+def test_prune_drops_old_rows_in_every_terminal_state(
+    settings: Settings, state: str
+) -> None:
+    store = QueueStore(settings)
+    old = datetime.now(UTC) - timedelta(days=30)
+    try:
+        store.upsert(_row("done", "u1", position=1, state=state, updated_at=old))
+        removed = store.prune(days=7)
+        remaining = store.load_all()
+    finally:
+        store.close()
+
+    assert removed == 1, f"终态 {state!r} 的旧记录应当被清理"
+    assert remaining == []
+
+
+@pytest.mark.parametrize("state", UNFINISHED_STATES)
+def test_prune_never_touches_unfinished_rows(settings: Settings, state: str) -> None:
+    store = QueueStore(settings)
+    old = datetime.now(UTC) - timedelta(days=365)
+    try:
+        store.upsert(_row("waiting", "u1", position=1, state=state, updated_at=old))
+        removed = store.prune(days=7)
+        remaining = [row.task_id for row in store.load_all()]
+    finally:
+        store.close()
+
+    assert removed == 0
+    assert remaining == ["waiting"]
+
+
+def test_prune_stops_at_the_retention_boundary(settings: Settings) -> None:
+    """One hour inside the window is kept, one hour outside is dropped."""
+
+    now = datetime.now(UTC)
+    inside = now - timedelta(days=7) + timedelta(hours=1)
+    outside = now - timedelta(days=7) - timedelta(hours=1)
+
+    store = QueueStore(settings)
+    try:
+        store.upsert(_row("inside", "u1", position=1, state="completed", updated_at=inside))
+        store.upsert(_row("outside", "u2", position=2, state="completed", updated_at=outside))
+        removed = store.prune(days=7)
+        remaining = [row.task_id for row in store.load_all()]
+    finally:
+        store.close()
+
+    assert removed == 1
+    assert remaining == ["inside"]
+
+
+def test_the_state_lists_cover_the_enum_exactly() -> None:
+    """The two literals here mirror ``QueueState``; drift would be silent."""
+
+    every = {state.value for state in QueueState}
+    finished = {state.value for state in QueueState if state.finished}
+
+    assert set(FINISHED_STATES) == finished, "FINISHED_STATES 与 QueueState.finished 不一致"
+    assert set(UNFINISHED_STATES) == every - finished
+    assert not set(FINISHED_STATES) & set(UNFINISHED_STATES)
 
 
 def test_delete_removes_a_row(settings: Settings) -> None:
