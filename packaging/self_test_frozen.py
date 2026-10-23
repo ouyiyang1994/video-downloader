@@ -36,7 +36,12 @@ from pathlib import Path
 EXPECTED_EXIT_CODE = 2
 
 #: Printed by the frozen build only after every runtime module imported.
-SUCCESS_MARKER = "依赖检查通过"
+#:
+#: Deliberately ASCII: the text is captured from a child process whose stdout
+#: encoding follows the host console. On a Western runner a non-ASCII marker
+#: cannot be encoded at all - ``print`` raises and ``emit`` diverts the line to
+#: the log - so the gate would never see it and a healthy build would fail.
+SUCCESS_MARKER = "[self-test] deps ok"
 
 #: Printed instead when at least one module could not be imported (exit 3).
 FAILURE_MARKER = "依赖检查失败"

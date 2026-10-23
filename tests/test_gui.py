@@ -792,7 +792,21 @@ def test_the_dependency_failure_code_is_not_the_unsupported_url_code() -> None:
 
     assert gui.SELF_TEST_DEPENDENCY_FAILED == 3
     assert gui.SELF_TEST_DEPENDENCY_FAILED != 2
-    assert "依赖检查通过" in gui.SELF_TEST_DEPS_OK
+    assert "deps ok" in gui.SELF_TEST_DEPS_OK
+
+
+def test_the_dependency_marker_survives_a_foreign_console() -> None:
+    """The marker has to be printable on a runner whose code page is not ours.
+
+    ``emit`` writes with ``print``; when the console cannot encode the text it
+    raises ``UnicodeEncodeError`` (a ``ValueError``) and the line is diverted to
+    the log, so the build gate - which reads the child's stdout - never sees it
+    and rejects a healthy payload. Pure ASCII is what keeps that from happening.
+    """
+
+    assert gui.SELF_TEST_DEPS_OK.isascii(), (
+        f"成功标记必须是纯 ASCII，否则英文 locale 下会丢失：{gui.SELF_TEST_DEPS_OK!r}"
+    )
 
 
 def test_run_app_stops_with_its_own_code_when_a_dependency_is_missing(

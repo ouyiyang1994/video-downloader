@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -2045,13 +2046,35 @@ def test_the_self_test_runner_accepts_a_healthy_build(
 ) -> None:
     app = _payload_dir(tmp_path)
     marker = self_test_runner.SUCCESS_MARKER
-    _stub_self_test(monkeypatch, (2, f"[self-test] dep ssl ok (OpenSSL 3.5.9)\n{marker}（10/10）"))
+    _stub_self_test(monkeypatch, (2, f"[self-test] dep ssl ok (OpenSSL 3.5.9)\n{marker} (10/10)"))
 
     problems, removed, output = self_test_runner.verify(app / "VideoDownloader.exe")
 
     assert problems == []
     assert removed == []
     assert marker in output
+
+
+def test_the_dependency_marker_is_ascii_and_shared_by_both_ends() -> None:
+    """The gate reads text captured from a child on someone else's console.
+
+    A Western runner cannot encode a non-ASCII marker to that stream: ``print``
+    raises and ``emit`` diverts the line to the log, so the marker never reaches
+    the build script and a healthy payload is rejected. Keeping the marker ASCII
+    is what makes the gate locale-independent - and both ends have to spell it
+    the same way, or the gate can never pass.
+    """
+
+    gui_source = (Path(__file__).resolve().parent.parent / "gui.py").read_text(
+        encoding="utf-8"
+    )
+    produced = re.search(r'SELF_TEST_DEPS_OK = "([^"]+)"', gui_source)
+    assert produced is not None, "gui.py 中找不到 SELF_TEST_DEPS_OK"
+    marker = self_test_runner.SUCCESS_MARKER
+
+    assert marker.isascii(), f"验收端标记必须是纯 ASCII：{marker!r}"
+    assert produced.group(1).isascii(), f"生产端标记必须是纯 ASCII：{produced.group(1)!r}"
+    assert marker in produced.group(1), "两端标记不一致，构建关卡会永远失败"
 
 
 def test_the_self_test_runner_rejects_a_wrong_exit_code(
@@ -2061,7 +2084,7 @@ def test_the_self_test_runner_rejects_a_wrong_exit_code(
 
     app = _payload_dir(tmp_path)
     marker = self_test_runner.SUCCESS_MARKER
-    _stub_self_test(monkeypatch, (1, f"{marker}（10/10）"))
+    _stub_self_test(monkeypatch, (1, f"{marker} (10/10)"))
 
     problems, _, _ = self_test_runner.verify(app / "VideoDownloader.exe")
 

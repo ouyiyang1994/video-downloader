@@ -3092,7 +3092,7 @@ SELF_TEST_DEPENDENCY_FAILED = 3
 #: Marker printed only after every dependency imported successfully. Build
 #: scripts assert it, because an exit code alone cannot distinguish "all good"
 #: from "the check never ran".
-SELF_TEST_DEPS_OK = "[self-test] 依赖检查通过"
+SELF_TEST_DEPS_OK = "[self-test] deps ok"
 
 
 def check_runtime_dependencies(
@@ -3302,7 +3302,7 @@ def _run_app(argv: list[str] | None) -> int:
         if failed:
             emit(f"[self-test] 依赖检查失败：{len(failed)} 项无法加载")
             return SELF_TEST_DEPENDENCY_FAILED
-        emit(f"{SELF_TEST_DEPS_OK}（{len(report)}/{len(SELF_TEST_DEPENDENCIES)}）")
+        emit(f"{SELF_TEST_DEPS_OK} ({len(report)}/{len(SELF_TEST_DEPENDENCIES)})")
 
     settings = get_settings()
     setup_logging(settings)
