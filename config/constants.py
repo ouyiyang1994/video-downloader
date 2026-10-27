@@ -41,6 +41,9 @@ DEFAULT_PROXY_PORT: Final[int] = 8090
 # Download tuning
 DEFAULT_CHUNK_SIZE: Final[int] = 1024 * 1024
 PARTIAL_SUFFIX: Final[str] = ".part"
+#: Sidecar that records what a ``.part`` file actually contains (normalised URL,
+#: format, quality). Resume is only allowed when it matches the current task.
+PARTIAL_META_SUFFIX: Final[str] = ".part.json"
 FILE_EXTENSIONS_VIDEO: Final[tuple[str, ...]] = (".mp4", ".mkv", ".flv", ".webm", ".mov")
 
 #: Upper bound on simultaneous downloads in the queue. Beyond a handful the

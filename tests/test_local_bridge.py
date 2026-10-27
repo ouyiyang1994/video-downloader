@@ -273,6 +273,10 @@ def _status_line(sock: socket.socket, timeout: float = 20.0) -> str:
             if not chunk:
                 break
             data += chunk
+    except TimeoutError:
+        # Not the same as a reset: nothing was cut off, we simply waited and
+        # the server never spoke.
+        return "<timeout>"
     except OSError:
         return "<reset>"
     return data.split(b"\r\n", 1)[0].decode("latin-1")
@@ -359,11 +363,29 @@ def test_a_continuously_sending_peer_is_cut_off_by_the_deadline(
             except OSError:
                 break
         elapsed = time.monotonic() - started
-        assert _status_line(sock) == "HTTP/1.1 413 Request Entity Too Large"
+        status = _status_line(sock)
 
     assert elapsed < local_bridge.DRAIN_TIMEOUT_SECONDS + 2.0, (
         f"排空没有在墙钟截止时间内结束（{elapsed:.1f}s）"
     )
+    if status == "HTTP/1.1 413 Request Entity Too Large":
+        return
+    # The deadline's promise is that the peer gets cut off, not that it wins the
+    # race to read the refusal: a reset may still swallow the response. That is
+    # only acceptable when the connection really is dead - anything else (a
+    # timeout, a half-answer) means the server kept following the upload.
+    assert status in {"<reset>", ""}, f"截止后既没收到 413 也没被切断：{status!r}"
+    try:
+        sock.settimeout(2.0)
+        sock.send(b"x")
+        # A clean FIN shows up as an empty read; a reset shows up as an
+        # exception. Both mean the peer is gone, which is what the deadline
+        # promises - anything readable here means the server kept following it.
+        assert sock.recv(1) == b"", "服务端没有切断仍在发送的 peer"
+    except TimeoutError:
+        raise AssertionError("连接仍然活着：截止后 2 秒内既没有关闭也没有数据") from None
+    except OSError:
+        pass
 
 
 def test_a_silent_peer_with_a_huge_content_length_is_answered_promptly(

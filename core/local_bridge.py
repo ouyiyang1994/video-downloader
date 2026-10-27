@@ -28,6 +28,7 @@ import contextlib
 import http.server
 import json
 import logging
+import socket
 import threading
 import time
 from functools import partial
@@ -36,6 +37,13 @@ from typing import Any
 from config.settings import Settings
 
 logger = logging.getLogger(__name__)
+
+#: How long to keep reading after our last byte when we are the side hanging up.
+#: Closing a socket with unread input in the receive buffer makes Windows answer
+#: with RST, and a peer that is still uploading then loses the response we just
+#: wrote - a 413 that never arrives looks exactly like a dropped connection.
+#: Half-closing and draining for this long lets the refusal land first.
+LINGER_CLOSE_SECONDS = 0.5
 
 #: Fixed, because the extension cannot be told an ephemeral one. If something
 #: else already holds it, :meth:`LocalBridge.start` says so instead of silently
@@ -167,6 +175,27 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         # request's leftovers, and an idle connection gets closed after it.
         self._read_deadline = time.monotonic() + REQUEST_READ_TIMEOUT_SECONDS
         super().handle_one_request()
+
+    def finish(self) -> None:
+        """Close politely when we are the side hanging up.
+
+        A refusal is written while the peer may still be uploading. Closing the
+        socket with that input unread turns the close into a reset, and the peer
+        loses the response it never read. Half-closing and draining for at most
+        :data:`LINGER_CLOSE_SECONDS` gives the response a chance to arrive while
+        still bounding how long the worker thread can be held.
+        """
+
+        if self.close_connection:
+            with contextlib.suppress(OSError):
+                self.wfile.flush()
+                self.connection.shutdown(socket.SHUT_WR)
+                self.connection.settimeout(LINGER_CLOSE_SECONDS)
+                deadline = time.monotonic() + LINGER_CLOSE_SECONDS
+                while time.monotonic() < deadline:
+                    if not self.rfile.read1(64 * 1024):
+                        break
+        super().finish()
 
     def parse_request(self) -> bool:
         try:

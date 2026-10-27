@@ -17,7 +17,20 @@ import pytest
 from config.settings import Settings
 from core import queue as queue_module
 from core.downloader import ProgressUpdate
-from core.exceptions import DownloadCancelled, DownloadError
+from core.exceptions import (
+    AuthRequiredError,
+    DownloadCancelled,
+    DownloadError,
+    IntegrityError,
+    NotDownloadableError,
+    OutputLockError,
+    OutputNameConflictError,
+    PathTooLongError,
+    RateLimitedError,
+    TargetFileConflictError,
+    UnsupportedUrlError,
+    VideoDownloaderError,
+)
 from core.models import DownloadResult, DownloadStatus, Platform
 from core.queue import DownloadQueue, QueueRequest, QueueState, QueueTask, eta_seconds
 from core.queue_store import QueueRow, QueueStore
@@ -41,9 +54,16 @@ class FakeDownload:
     concurrency and pause tests hold a task in the running state.
     """
 
-    def __init__(self, *, behaviour: str = "complete", fail_times: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        behaviour: str = "complete",
+        fail_times: int = 0,
+        error: Exception | None = None,
+    ) -> None:
         self.behaviour = behaviour
         self.fail_times = fail_times
+        self.error = error
         self.calls: list[str] = []
         self.gate: threading.Event | None = None
         self.running = 0
@@ -88,8 +108,12 @@ class FakeDownload:
                 raise DownloadCancelled("已取消")
             if self.behaviour == "cancel":
                 raise DownloadCancelled("已取消")
+            if self.error is not None:
+                raise self.error
             if self.behaviour == "fail" or attempt <= self.fail_times:
                 raise DownloadError("模拟失败")
+            if self.behaviour == "conflict":
+                raise OutputNameConflictError("同名文件过多，无法为「示例视频」分配输出文件名")
             return DownloadResult(
                 status=DownloadStatus.COMPLETED,
                 platform=Platform.BILIBILI,
@@ -641,6 +665,117 @@ def test_a_task_that_keeps_failing_ends_up_failed(
 
     assert len(fake.calls) == 2, "应当恰好尝试 max_attempts 次"
     assert task.error == "模拟失败"
+
+
+def test_a_name_conflict_reaches_the_user_instead_of_an_internal_error(
+    queues: Callable[..., DownloadQueue], no_backoff: None
+) -> None:
+    """A saturated folder is a user-facing situation, not an internal fault."""
+
+    fake = FakeDownload(behaviour="conflict")
+    queue = queues(fake)
+    queue.start()
+    task = queue.submit(URL, max_attempts=1)
+
+    _wait_until(lambda: task.state is QueueState.FAILED, message="任务未判定为失败")
+
+    assert task.error is not None
+    assert "同名文件过多" in task.error
+    assert task.error != "内部错误"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OutputLockError("无法创建输出锁目录"),
+        OutputNameConflictError("同名文件过多"),
+        PathTooLongError("输出路径过长"),
+        NotDownloadableError("不允许下载"),
+        AuthRequiredError("需要登录"),
+        UnsupportedUrlError("不支持的链接"),
+        TargetFileConflictError("目标文件已被其他程序创建，已停止写入：示例视频.mp4"),
+    ],
+)
+def test_a_permanent_error_is_not_retried(
+    queues: Callable[..., DownloadQueue],
+    no_backoff: None,
+    error: Exception,
+) -> None:
+    """Retrying a condition that cannot change only delays the message."""
+
+    fake = FakeDownload(error=error)
+    queue = queues(fake)
+    queue.start()
+    task = queue.submit(URL, max_attempts=3)
+
+    _wait_until(lambda: task.state is QueueState.FAILED, message="任务未判定为失败")
+
+    assert len(fake.calls) == 1, "永久性错误不应重试"
+    assert task.attempts == 1
+    assert task.error == error.message
+
+
+def test_a_destination_conflict_ends_the_task_at_once(
+    queues: Callable[..., DownloadQueue], no_backoff: None
+) -> None:
+    """A stolen file name must not cost another metadata or media request."""
+
+    error = TargetFileConflictError("目标文件已被其他程序创建，已停止写入：示例视频.mp4")
+    fake = FakeDownload(error=error)
+    queue = queues(fake)
+    queue.start()
+    task = queue.submit(URL, max_attempts=3)
+
+    _wait_until(lambda: task.state is QueueState.FAILED, message="任务未判定为失败")
+
+    assert len(fake.calls) == 1, "冲突后不应重跑任务"
+    assert task.error == error.message
+    assert "示例视频.mp4" in task.error
+
+
+def test_a_permanent_io_error_is_not_retried(
+    queues: Callable[..., DownloadQueue], no_backoff: None
+) -> None:
+    """A full disk must not cost a second download of the same file."""
+
+    error = VideoDownloaderError("写入输出文件失败：[Errno 28] 磁盘已满")
+    error.retryable = False
+    fake = FakeDownload(error=error)
+    queue = queues(fake)
+    queue.start()
+    task = queue.submit(URL, max_attempts=3)
+
+    _wait_until(lambda: task.state is QueueState.FAILED, message="任务未判定为失败")
+
+    assert len(fake.calls) == 1, "确定性 I/O 错误不应重跑任务"
+    assert task.attempts == 1
+    assert task.error == error.message
+
+
+def test_a_recoverable_error_uses_every_attempt(
+    queues: Callable[..., DownloadQueue], no_backoff: None
+) -> None:
+    """Transient failures keep their retries; the message survives to the end."""
+
+    fake = FakeDownload(behaviour="fail")
+    queue = queues(fake)
+    queue.start()
+    task = queue.submit(URL, max_attempts=3)
+
+    _wait_until(lambda: task.state is QueueState.FAILED, message="任务未判定为失败")
+
+    assert len(fake.calls) == 3, "可恢复错误应当用满 max_attempts"
+    assert task.attempts == 3
+    assert task.error == "模拟失败"
+
+
+def test_the_retryable_flag_matches_the_error_class() -> None:
+    assert DownloadError("x").retryable is True
+    assert RateLimitedError("x").retryable is True
+    assert IntegrityError("x").retryable is True
+    assert PathTooLongError("x").retryable is False
+    assert OutputLockError("x").retryable is False
+    assert OutputNameConflictError("x").retryable is False
 
 
 def test_retry_requeues_a_failed_task(

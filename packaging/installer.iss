@@ -48,7 +48,7 @@
 ; exactly our host key - never another extension's.
 
 #define AppName "Video Downloader"
-#define AppVersion "1.31"
+#define AppVersion "1.32"
 #define AppPublisher "Video Downloader"
 #define AppExeName "VideoDownloader.exe"
 ; Must equal core.chrome_bridge.HOST_NAME (and core.native_host.HOST_NAME).
@@ -92,7 +92,7 @@ SetupIconFile={#IconFile}
 ; properties and an upgrade compares it, so a stale value would ship an
 ; installer whose file version contradicts the product version.
 ; packaging/sync_version.py keeps it in step.
-VersionInfoVersion=1.31.0.0
+VersionInfoVersion=1.32.0.0
 VersionInfoTextVersion={#AppVersion}
 VersionInfoProductTextVersion={#AppVersion}
 VersionInfoDescription={#AppName} Setup

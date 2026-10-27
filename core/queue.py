@@ -820,7 +820,7 @@ class DownloadQueue:
                 self._finish(task, QueueState.CANCELLED, token=token)
             return
         except VideoDownloaderError as exc:
-            self._retry_or_fail(task, exc.message, token)
+            self._retry_or_fail(task, exc.message, token, retryable=exc.retryable)
             return
 
         with self._condition:
@@ -842,13 +842,21 @@ class DownloadQueue:
             return
         self._finish(task, state, token=token)
 
-    def _retry_or_fail(self, task: QueueTask, message: str, token: int) -> None:
-        """Schedule another attempt when attempts remain, else mark failed."""
+    def _retry_or_fail(
+        self, task: QueueTask, message: str, token: int, *, retryable: bool = True
+    ) -> None:
+        """Schedule another attempt when attempts remain, else mark failed.
+
+        ``retryable`` comes from the error itself: a path that is too long or a
+        folder whose names are exhausted fails identically every time, so the
+        task goes straight to FAILED with the real message instead of burning
+        the remaining attempts on the same wall.
+        """
 
         if task.cancel_event.is_set() and not task.pause_requested:
             self._finish(task, QueueState.CANCELLED, token=token)
             return
-        if task.attempts < task.max_attempts:
+        if retryable and task.attempts < task.max_attempts:
             delay = RETRY_BACKOFF_SECONDS[min(task.attempts - 1, len(RETRY_BACKOFF_SECONDS) - 1)]
             if not self._settle(
                 task,
