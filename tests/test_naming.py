@@ -160,11 +160,24 @@ def test_claim_output_path_gives_up_after_the_limit(tmp_path: Path) -> None:
 
 
 def _deep_base(tmp_path: Path, *, target: int = 150) -> Path:
-    """Create a real nested folder whose absolute path is at least ``target``."""
+    """Create a real nested folder whose absolute path is at least ``target``.
 
+    Padding stops once the folder would leave no room for a file name. CI puts
+    ``tmp_path`` under ``pytest-of-runneradmin``, which is already much longer
+    than a developer's ``%TEMP%``; a fixed target there pushed the folder past
+    the whole-path cap, so the test failed for a reason that had nothing to do
+    with the code under test.
+    """
+
+    # Everything build_output_directory appends after the base is ~30 chars
+    # ("bilibili/<author>/<date>"), so the *base* has to stop that much earlier.
+    # The second bound is the hard one: never pad a folder that already leaves
+    # less than a file name's worth of room.
+    tail = 30
+    limit = MAX_FULL_PATH - 1 - MIN_STEM - LEAF_RESERVE
     base = tmp_path
     index = 0
-    while len(str(base)) < target:
+    while len(str(base)) + tail < target and len(str(base)) + 41 <= limit:
         base = base / (chr(ord("d") + index % 20) * 40)
         base.mkdir()
         index += 1

@@ -40,6 +40,7 @@ from core.models import (
 from core.naming import (
     LEAF_RESERVE,
     MAX_FULL_PATH,
+    MIN_STEM,
     build_output_directory,
     claim_output_path,
     release_output_path,
@@ -179,10 +180,15 @@ async def test_full_download_writes_file_metadata_and_record(
 
     database = DownloadDatabase(settings)
     database.connect()
+    # The folder is named with the date *at download time*; a run that straddles
+    # midnight would otherwise compare against tomorrow and fail for a reason
+    # that has nothing to do with the code under test.
+    before = _today(settings)
     async with httpx.AsyncClient() as client:
         registry = PlatformRegistry([StubAdapter(settings, client, len(payload))])
         service = DownloadService(settings, registry, client, database)
         result = await service.download(PAGE_URL, quality="best")
+    after = _today(settings)
 
     assert result.status is DownloadStatus.COMPLETED
     assert result.video_path is not None
@@ -190,8 +196,8 @@ async def test_full_download_writes_file_metadata_and_record(
     assert result.metadata_path is not None and result.metadata_path.exists()
 
     # Platform / author / date layout, with the raw title preserved but sanitised.
-    assert result.video_path.parent.parts[-3:] == ("youtube", "测试作者", _today(settings))
-    assert result.video_path.parent.name == _today(settings)
+    assert result.video_path.parent.parts[-3:-1] == ("youtube", "测试作者")
+    assert result.video_path.parent.name in {before, after}
     assert "/" not in result.video_path.stem
     assert result.video_path.stem.startswith("Stub")
 
@@ -330,8 +336,18 @@ async def test_a_long_title_in_a_deep_folder_still_downloads(
     payload = b"\x00\x00\x00\x20ftypisom" + b"L" * 3000
     respx.get(MEDIA_URL).mock(return_value=Response(200, content=payload))
 
-    base = tmp_path / ("a" * 40) / ("b" * 40)
-    base.mkdir(parents=True)
+    # Pad only while the folder still leaves room for a file name: CI's
+    # tmp_path is far longer than a developer's, and padding blindly put the
+    # directory past MAX_FULL_PATH before the download even started.
+    limit = MAX_FULL_PATH - 1 - MIN_STEM - LEAF_RESERVE
+    base = tmp_path
+    for segment in ("a" * 40, "b" * 40):
+        # Stop once the folder is deep enough to force a shortened title, and
+        # never pad past the point where a file name no longer fits.
+        if len(str(base)) + 30 >= 150 or len(str(base)) + 41 > limit:
+            break
+        base = base / segment
+    base.mkdir(parents=True, exist_ok=True)
     settings.output_dir = base
 
     long_title = "很长的标题" * 30
